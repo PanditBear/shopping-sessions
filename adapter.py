@@ -1,42 +1,40 @@
-"""adapter.py: the ONLY file filled at kickoff. Maps the contest's data and published metric onto the template.
+"""adapter.py: Shopping Sessions. A case is one input folder run through the pipeline and diffed exactly
+against its expected tables (scripts/compare.py logic). Score per case: 1.0 exact match, else 0.0.
 
-Toy default: upper-case a string; metric = exact-match fraction.
+dev     = the 36 edge-case fixtures from the kit.
+holdout = the 36 fixtures + the 1M-event dev set (seed 1) diffed against dev-answer, when both exist locally.
+Set SHOP_FAST=1 to leave the dev set out (tests do this; it is slow in Python).
+Speed is the contest metric, but only a 100%-correct pipeline scores at all, so the ratchet here is correctness.
 """
-import json
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-DATA = ROOT / "data"
+FIXTURES = ROOT / "fixtures"
+BXDATA = Path(os.environ.get("SHOP_BXDATA", "C:/bxdata/shop"))
+DEVSET = BXDATA / "dev"                       # generate --seed 1 --events 1000000 --clicks 250000 --output dev
+DEVANSWER = BXDATA / "kit" / "dev-answer" / "dev-answer"   # user_daily.csv, campaign_daily.csv
 
-# TODO-KICKOFF: True if a bigger aggregate score is better (accuracy, F1); False for errors/losses.
 HIGHER_IS_BETTER = True
-# TODO-KICKOFF: per-case score that counts as perfect (cases at this score are left out of errors/dev.jsonl).
 PERFECT_SCORE = 1.0
 
 
+def _fixture_cases():
+    return [{"id": d.name, "input": {"data": str(d / "input"), "expected": str(d / "expected")}, "gold": "OK"}
+            for d in sorted(FIXTURES.iterdir()) if (d / "input").is_dir()]
+
+
 def load_cases(split: str) -> list[dict]:
-    """Return the cases of `split` ("dev" or "holdout") as a list of dicts, each with keys
-    id (unique, str-able), input (whatever solve.predict needs), gold (the label).
-    TODO-KICKOFF: read the real files written by tools/split.py (data/dev.*, data/holdout.*) and map the columns."""
-    f = DATA / f"{split}.jsonl"
-    if not f.exists():
-        raise FileNotFoundError(f"{f} missing: run tools/split.py or fix load_cases")
-    cases = []
-    for line in f.read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            r = json.loads(line)
-            cases.append({"id": r["id"], "input": r["input"], "gold": r["gold"]})
+    cases = _fixture_cases()
+    if split == "holdout" and not os.environ.get("SHOP_FAST") and DEVSET.is_dir() and DEVANSWER.is_dir():
+        cases.append({"id": "devset", "input": {"data": str(DEVSET), "expected": str(DEVANSWER)}, "gold": "OK"})
     return cases
 
 
 def metric(preds: dict, cases: list[dict]) -> tuple[float, list[dict]]:
-    """Mirror the PUBLISHED contest metric exactly.
-    preds maps case id -> prediction (None if predict crashed). Returns (aggregate_score, per_case) where per_case is
-    a list of {"id","score","pred","gold"}, one per case, in case order.
-    TODO-KICKOFF: replace the toy exact-match with the real formula (keep the return shape)."""
     per_case = []
     for c in cases:
         p = preds.get(c["id"])
-        per_case.append({"id": c["id"], "score": 1.0 if p == c["gold"] else 0.0, "pred": p, "gold": c["gold"]})
+        per_case.append({"id": c["id"], "score": 1.0 if p == "OK" else 0.0, "pred": p, "gold": c["gold"]})
     agg = sum(r["score"] for r in per_case) / len(per_case) if per_case else 0.0
     return agg, per_case

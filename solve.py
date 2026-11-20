@@ -1,73 +1,49 @@
-"""solve.py: the solver (predict) and the submission writer (CLI)."""
-import argparse
-import json
-import math
+"""solve.py: run the pipeline on one case's input folder and diff its output against the expected tables.
+
+The pipeline command comes from SHOP_IMPL (default: the Python reference, impl/py/pipeline.py). It gets DATA_DIR,
+OUTPUT_DIR and SCRATCH_DIR as env vars, like the scorer's container. predict() returns "OK" on an exact match,
+else a short diff summary (what workers read in errors/dev.jsonl).
+"""
+import io
+import os
+import shlex
+import subprocess
 import sys
+import tempfile
+from contextlib import redirect_stdout
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "scripts"))
+DEFAULT_IMPL = [sys.executable, str(ROOT / "impl" / "py" / "pipeline.py")]
+TIMEOUT_S = int(os.environ.get("SHOP_TIMEOUT", "600"))
+
+
+def _diff(out: Path, expected: Path) -> str:
+    import compare  # scripts/compare.py: exact, order-insensitive, prints what differs
+    buf = io.StringIO()
+    old = sys.argv
+    try:
+        sys.argv = ["compare.py", str(out), str(expected)]
+        with redirect_stdout(buf):
+            rc = compare.main()
+    finally:
+        sys.argv = old
+    return "OK" if rc == 0 else ("DIFF " + buf.getvalue().strip())[:3000]
 
 
 def predict(case: dict):
-    """Return the prediction for one case (dict with id, input, gold; do NOT read gold).
-    Must be a top-level function (score.py runs it in a process pool).
-    Toy baseline: upper-case ASCII strings only (deliberately imperfect, so there is something to improve)."""
-    s = case["input"]
-    return s.upper() if s.isascii() else s
-
-
-def fallback(case: dict):
-    """The prediction written when predict() crashes or returns something unwritable.
-    TODO-KICKOFF: set to the cheapest valid answer for the real task (e.g. the input unchanged, an empty
-    list, the majority class). It must never raise and must be JSON-safe."""
-    return case.get("input")
-
-
-def _finite(x):
-    """Recursively replace NaN/Infinity (invalid JSON) with None so the output always parses."""
-    if isinstance(x, float) and not math.isfinite(x):
-        return None
-    if isinstance(x, dict):
-        return {k: _finite(v) for k, v in x.items()}
-    if isinstance(x, (list, tuple)):
-        return [_finite(v) for v in x]
-    return x
-
-
-def safe_line(case: dict) -> str:
-    """One submission line for a case. Never raises: a crash on one hidden input must not sink the submission."""
-    try:
-        pred = _finite(predict(case))
-        # TODO-KICKOFF: write the contest's real submission format (keep allow_nan=False).
-        return json.dumps({"id": case["id"], "pred": pred}, ensure_ascii=False, allow_nan=False)
-    except Exception as e:  # noqa: BLE001 - deliberate catch-all
-        print(f"predict failed on {case.get('id')!r}: {type(e).__name__}: {e}", file=sys.stderr)
+    # SHOP_IMPL: a command line with forward slashes, e.g. "C:/bxdata/shop/bin/shop.exe".
+    impl = shlex.split(os.environ["SHOP_IMPL"]) if os.environ.get("SHOP_IMPL") else DEFAULT_IMPL
+    with tempfile.TemporaryDirectory() as td:
+        out, scratch = Path(td) / "out", Path(td) / "scratch"
+        out.mkdir(); scratch.mkdir()
+        env = {**os.environ, "DATA_DIR": case["input"]["data"], "OUTPUT_DIR": str(out), "SCRATCH_DIR": str(scratch),
+               "NCPU": os.environ.get("NCPU", "8"), "MEM_GB": os.environ.get("MEM_GB", "24")}
+        p = subprocess.run(impl, env=env, capture_output=True, text=True, timeout=TIMEOUT_S)
+        if p.returncode != 0:
+            return f"EXIT {p.returncode}: {p.stderr[-1500:]}"
         try:
-            return json.dumps({"id": case["id"], "pred": _finite(fallback(case))}, ensure_ascii=False, allow_nan=False)
-        except Exception:  # noqa: BLE001
-            return json.dumps({"id": case.get("id"), "pred": None}, ensure_ascii=False, default=str)
-
-
-def main(argv=None):
-    ap = argparse.ArgumentParser(description="Write the submission file for the given input files")
-    ap.add_argument("inputs", nargs="+", help="input file path(s)")
-    ap.add_argument("--out", default="submission.jsonl")
-    a = ap.parse_args(argv)
-    n = bad = 0
-    with open(a.out, "w", encoding="utf-8") as out:
-        for path in a.inputs:
-            # TODO-KICKOFF: parse the contest's real input format into case dicts (id, input).
-            for lineno, line in enumerate(open(path, encoding="utf-8"), 1):
-                if not line.strip():
-                    continue
-                try:
-                    r = json.loads(line)
-                    case = {"id": r["id"], "input": r["input"]}
-                except Exception as e:  # noqa: BLE001
-                    bad += 1
-                    print(f"{path}:{lineno}: unreadable input line skipped ({type(e).__name__})", file=sys.stderr)
-                    continue
-                out.write(safe_line(case) + "\n")
-                n += 1
-    print(f"wrote {n} predictions to {a.out}" + (f"; skipped {bad} unreadable lines" if bad else ""), file=sys.stderr)
-
-
-if __name__ == "__main__":
-    main()
+            return _diff(out, Path(case["input"]["expected"]))
+        except Exception as e:  # noqa: BLE001 - unreadable output is a wrong answer, not a crash
+            return f"BAD OUTPUT {type(e).__name__}: {e}"[:3000]
