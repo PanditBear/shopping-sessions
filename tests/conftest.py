@@ -1,3 +1,5 @@
+import os
+os.environ.setdefault("SHOP_FAST", "1")  # keep the 1M dev set out of the test suite
 import sys
 from pathlib import Path
 
