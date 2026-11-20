@@ -1,0 +1,12 @@
+{
+ "key": "holdout",
+ "best": 0.5,
+ "scores": {
+  "dev": 0.6428571428571429,
+  "holdout": 0.5,
+  "runtime_s": 0.012
+ },
+ "branch": "main",
+ "commit": "43f1226292",
+ "time": "2026-11-20 17:02:33"
+}
