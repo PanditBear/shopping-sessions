@@ -4,6 +4,7 @@ against its expected tables (scripts/compare.py logic). Score per case: 1.0 exac
 dev     = the 36 edge-case fixtures from the kit.
 holdout = the 36 fixtures + the 1M-event dev set (seed 1) diffed against dev-answer, when both exist locally.
 Set SHOP_FAST=1 to leave the dev set out (tests do this; it is slow in Python).
+Set SHOP_CASE_LIMIT=n to keep only the first n fixtures (tests do this: they check the harness, the ratchet checks correctness).
 Speed is the contest metric, but only a 100%-correct pipeline scores at all, so the ratchet here is correctness.
 """
 import os
@@ -26,6 +27,9 @@ def _fixture_cases():
 
 def load_cases(split: str) -> list[dict]:
     cases = _fixture_cases()
+    limit = os.environ.get("SHOP_CASE_LIMIT", "")
+    if limit.isdigit() and int(limit) > 0:
+        cases = cases[:int(limit)]
     if split == "holdout" and not os.environ.get("SHOP_FAST") and DEVSET.is_dir() and DEVANSWER.is_dir():
         cases.append({"id": "devset", "input": {"data": str(DEVSET), "expected": str(DEVANSWER)}, "gold": "OK"})
     return cases
