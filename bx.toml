@@ -1,4 +1,4 @@
-score_cmd = "D:/factory/buildathon/.venv/Scripts/python.exe score.py --jobs 1"
+score_cmd = "D:/factory/buildathon/.venv/Scripts/python.exe score.py --jobs 8"
 test_cmd = "D:/factory/buildathon/.venv/Scripts/python.exe -m pytest -q"
 ratchet_key = "holdout"
 higher_is_better = true
