@@ -1,5 +1,4 @@
-fixtures/
-dev/
-out/
-*.md
-.git
+*
+!impl/rs/Cargo.toml
+!impl/rs/Cargo.lock
+!impl/rs/src
