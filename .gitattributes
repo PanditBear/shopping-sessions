@@ -1,0 +1,2 @@
+# No line-ending conversion anywhere: fixtures are byte-exact test data and the Dockerfile/scripts run on Linux.
+* -text
