@@ -1,0 +1,6 @@
+score_cmd = "D:/factory/buildathon/.venv/Scripts/python.exe score.py --jobs 1"
+test_cmd = "D:/factory/buildathon/.venv/Scripts/python.exe -m pytest -q"
+ratchet_key = "holdout"
+higher_is_better = true   # TODO-KICKOFF: match adapter.HIGHER_IS_BETTER
+epsilon = 0.0
+timeout_s = 300

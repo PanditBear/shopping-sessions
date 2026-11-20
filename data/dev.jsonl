@@ -1,0 +1,14 @@
+{"id": "c00", "input": "alpha", "gold": "ALPHA"}
+{"id": "c02", "input": "gamma", "gold": "GAMMA"}
+{"id": "c03", "input": "delta", "gold": "DELTA"}
+{"id": "c04", "input": "epsilon", "gold": "EPSILON"}
+{"id": "c05", "input": "zeta", "gold": "ZETA"}
+{"id": "c07", "input": "theta", "gold": "THETA"}
+{"id": "c09", "input": "kappa", "gold": "KAPPA"}
+{"id": "c10", "input": "lambda", "gold": "LAMBDA"}
+{"id": "c11", "input": "mu", "gold": "MU"}
+{"id": "c14", "input": "über", "gold": "ÜBER"}
+{"id": "c16", "input": "crème", "gold": "CRÈME"}
+{"id": "c17", "input": "résumé", "gold": "RÉSUMÉ"}
+{"id": "c18", "input": "garçon", "gold": "GARÇON"}
+{"id": "c19", "input": "jalapeño", "gold": "JALAPEÑO"}
