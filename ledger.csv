@@ -1,2 +1,3 @@
 time,event,ticket,branch,dev,holdout,runtime_s,board,commit,note
 2026-11-20 17:02:33,seed,,,0.6428571428571429,0.5,0.012,,43f1226292,
+2026-11-20 17:14:34,seed,,,0.05555555555555555,0.05555555555555555,135.639,,b0b9a83a88,FORCED RESET (previous best 0.5)
