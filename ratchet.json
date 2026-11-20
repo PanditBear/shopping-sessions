@@ -1,12 +1,12 @@
 {
  "key": "holdout",
- "best": 0.05555555555555555,
+ "best": 1.0,
  "scores": {
-  "dev": 0.05555555555555555,
-  "holdout": 0.05555555555555555,
-  "runtime_s": 135.639
+  "dev": 1.0,
+  "holdout": 1.0,
+  "runtime_s": 29.159
  },
- "branch": "main",
- "commit": "b0b9a83a88",
- "time": "2026-11-20 17:14:34"
+ "branch": "lane/A-pyref",
+ "commit": "050b3edb00",
+ "time": "2026-11-20 17:33:07"
 }
