@@ -1,0 +1,26 @@
+name: image + fixtures (linux/amd64)
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install polars pyarrow
+      - name: build image (scorer platform)
+        run: docker buildx build --platform linux/amd64 --load -t shopping-sessions:latest .
+      - name: image size <= 50 MB
+        run: |
+          bytes=$(docker image inspect shopping-sessions:latest --format '{{.Size}}')
+          echo "image size: $((bytes / 1000000)) MB ($bytes bytes)"
+          test "$bytes" -le 50000000
+      - name: 36 fixtures, run the way the scorer does
+        env:
+          CPUS: "4"
+          MEM: "14g"
+        run: python3 scripts/run_fixtures.py fixtures -- sh scripts/docker_run.sh
