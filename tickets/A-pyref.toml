@@ -1,0 +1,4 @@
+id = "A-pyref"
+files = ["impl/py/pipeline.py", "impl/py/", "tests/"]
+why = "Python reference pipeline (oracle)"
+created = "2026-11-20 17:32:05"
