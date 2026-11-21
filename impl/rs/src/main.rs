@@ -4578,7 +4578,7 @@ fn idx_find(ev_files: &[B], ev_chunks: &[B]) -> Option<IdxCfg> {
             })
         })
     })?;
-    let sh = (64 - (lim / 2048).max(1).leading_zeros()).clamp(10, 15);
+    let sh = (64 - (lim / 2048).max(1).leading_zeros()).clamp(10, 16);
     Some(IdxCfg { key, lim, sh, ndb: (lim >> sh) as usize + 1, lpb: lines as f64 / pos as f64 })
 }
 
