@@ -3970,6 +3970,7 @@ struct SsW<E> {
     cnt: Vec<u32>,
     cl: Vec<ClickRec>,
     ctmp: Vec<ClickRec>,
+    six: SessIx,
 }
 
 impl<E: Ev> SsW<E> {
@@ -3984,6 +3985,7 @@ impl<E: Ev> SsW<E> {
             cnt: vec![],
             cl: vec![],
             ctmp: vec![],
+            six: SessIx::default(),
         }
     }
     /// Collects person bucket p's lines and clicks from every chunk.
@@ -4367,7 +4369,7 @@ fn ev_after_idx<E: Ev>(
     lpt_run(&cost, || SsW::new(ncamp, d0, nd), |p, w: &mut SsW<E>| {
         w.gather(p, &parts, click_out);
         let mut uds = Vec::new();
-        process_runs(&w.evs, &mut w.tmp, &mut w.runs, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut uds, &mut w.cm, ws);
+        process_runs(&w.evs, &mut w.tmp, &mut w.runs, &mut w.six, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut uds, &mut w.cm, ws);
         w.out.push(uds);
     })
     .into_iter()
@@ -4375,14 +4377,44 @@ fn ev_after_idx<E: Ev>(
     .collect()
 }
 
-/// A stretch of one person's lines in a bucket: digit, person key, start, length, ts sorted.
+/// A stretch of one person's lines in a bucket: digit, person key, start, length, ts sorted,
+/// and where its session starts (q) and purchase lines (pq) begin in the SessIx lists.
 #[derive(Clone, Copy)]
 struct Run {
     d: u32,
     k: u64,
     s: u32,
     l: u32,
+    q: u32,
+    pq: u32,
     ok: bool,
+}
+
+/// Line indices found by the run pass: ss = every session start of a sorted run (each run start
+/// included), pl = every purchase line, both ascending and closed by the line count. tss/tpl hold
+/// the same for one gathered person.
+#[derive(Default)]
+struct SessIx {
+    ss: Vec<u32>,
+    pl: Vec<u32>,
+    tss: Vec<u32>,
+    tpl: Vec<u32>,
+}
+
+/// SessIx lists of one person's ts-sorted lines.
+fn sess_ix<E: Ev>(pes: &[E], ss: &mut Vec<u32>, pl: &mut Vec<u32>) {
+    ss.clear();
+    pl.clear();
+    for (j, e) in pes.iter().enumerate() {
+        if j == 0 || e.rts() - pes[j - 1].rts() > GAP as u64 {
+            ss.push(j as u32);
+        }
+        if e.pc().is_some() {
+            pl.push(j as u32);
+        }
+    }
+    ss.push(pes.len() as u32);
+    pl.push(pes.len() as u32);
 }
 
 /// process_bucket for lines that arrive mostly as one ts-sorted run per person: the runs are
@@ -4393,6 +4425,7 @@ fn process_runs<E: Ev>(
     evs: &[E],
     tmp: &mut Vec<E>,
     runs: &mut Vec<Run>,
+    six: &mut SessIx,
     cnt: &mut Vec<u32>,
     clicks: &mut Vec<ClickRec>,
     ctmp: &mut Vec<ClickRec>,
@@ -4405,18 +4438,40 @@ fn process_runs<E: Ev>(
     let mut tm = now();
     runs.clear();
     let n = evs.len();
+    if six.ss.len() <= n {
+        six.ss.resize(n + 1, 0);
+        six.pl.resize(n + 1, 0);
+    }
+    // Session starts and purchase lines are written branch-free: every line stores its index
+    // and the count only moves past it when the line is one (at most one entry per line).
+    let (ss, pl) = (&mut six.ss[..], &mut six.pl[..]);
+    let (mut nss, mut npl) = (0usize, 0usize);
     let mut i = 0;
     while i < n {
         let k = evs[i].key();
+        let (q, pq) = (nss as u32, npl as u32);
+        ss[nss] = i as u32;
+        nss += 1;
+        pl[npl] = i as u32;
+        npl += evs[i].pc().is_some() as usize;
         let mut ok = true;
+        let mut t0 = evs[i].rts();
         let mut j = i + 1;
         while j < n && evs[j].key() == k {
-            ok &= evs[j].rts() >= evs[j - 1].rts();
+            let t = evs[j].rts();
+            ok &= t >= t0;
+            ss[nss] = j as u32;
+            nss += (t.wrapping_sub(t0) > GAP as u64) as usize;
+            pl[npl] = j as u32;
+            npl += evs[j].pc().is_some() as usize;
+            t0 = t;
             j += 1;
         }
-        runs.push(Run { d: dg(k) as u32, k, s: i as u32, l: (j - i) as u32, ok });
+        runs.push(Run { d: dg(k) as u32, k, s: i as u32, l: (j - i) as u32, q, pq, ok });
         i = j;
     }
+    ss[nss] = n as u32;
+    pl[npl] = n as u32;
     runs.sort_unstable_by_key(|r| (r.d, r.k, r.s));
     pt(7, &mut tm);
     sort_clicks(clicks, ctmp, cnt);
@@ -4431,16 +4486,6 @@ fn process_runs<E: Ev>(
         while b < runs.len() && runs[b].k == pid {
             b += 1;
         }
-        let pes: &[E] = if b == a + 1 && runs[a].ok {
-            &evs[runs[a].s as usize..(runs[a].s + runs[a].l) as usize]
-        } else {
-            tmp.clear();
-            for r in &runs[a..b] {
-                tmp.extend_from_slice(&evs[r.s as usize..(r.s + r.l) as usize]);
-            }
-            tmp.sort_by_key(|e| e.rts()); // stable driftsort merges the sorted runs
-            &tmp[..]
-        };
         while ci < clicks.len() && (dg(clicks[ci].key), clicks[ci].key) < (pd, pid) {
             ci += 1;
         }
@@ -4448,7 +4493,20 @@ fn process_runs<E: Ev>(
         while cj < clicks.len() && clicks[cj].key == pid {
             cj += 1;
         }
-        person_sess(pes, pid, &clicks[ci..cj], win, organic, &mut day, uds, cm, base);
+        let cs = &clicks[ci..cj];
+        if b == a + 1 && runs[a].ok {
+            let r = runs[a];
+            let (ss, pl) = (&six.ss[r.q as usize..], &six.pl[r.pq as usize..]);
+            person_sess(evs, ss, pl, (r.s + r.l) as usize, pid, cs, win, organic, &mut day, uds, cm, base);
+        } else {
+            tmp.clear();
+            for r in &runs[a..b] {
+                tmp.extend_from_slice(&evs[r.s as usize..(r.s + r.l) as usize]);
+            }
+            tmp.sort_by_key(|e| e.rts()); // stable driftsort merges the sorted runs
+            sess_ix(tmp, &mut six.tss, &mut six.tpl);
+            person_sess(tmp, &six.tss, &six.tpl, tmp.len(), pid, cs, win, organic, &mut day, uds, cm, base);
+        }
         ci = cj;
         a = b;
     }
@@ -4456,11 +4514,15 @@ fn process_runs<E: Ev>(
 }
 
 /// Sessions of one person (lines sorted by ts, clicks sorted by ts); the loop body of
-/// process_bucket.
+/// process_bucket. Session k is pes[ss[k]..ss[k + 1]] while ss[k] < end (an entry >= end follows
+/// the last one); pl lists the purchase lines in order, closed the same way.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn person_sess<E: Ev>(
     pes: &[E],
+    ss: &[u32],
+    pl: &[u32],
+    end: usize,
     pid: u64,
     cs: &[ClickRec],
     win: &mut Win,
@@ -4473,22 +4535,24 @@ fn person_sess<E: Ev>(
     let (mut lo, mut hi) = (0usize, 0usize);
     day.key = pid;
     day.day = 0;
-    let mut prev = 0i64;
-    let mut first = true;
     let mut s_camp = 0u32;
     let mut s_day = 0i64;
     let mut s_rev = 0u64;
     let mut s_purch = false;
     let mut in_sess = false;
-    for e in pes {
-        let et = e.rts() as i64 + base;
-        if first || et - prev > GAP {
+    let mut kp = 0;
+    for w in ss.windows(2) {
+        let (st, nx) = (w[0] as usize, w[1] as usize);
+        if st >= end {
+            break;
+        }
+        // session start
+        {
             if in_sess {
                 cm.sess(s_camp, s_day, s_purch, s_rev);
             }
-            first = false;
             in_sess = true;
-            let s = et;
+            let s = pes[st].rts() as i64 + base;
             let d = s.div_euclid(DAY);
             s_day = d;
             s_rev = 0;
@@ -4526,16 +4590,18 @@ fn person_sess<E: Ev>(
             }
             day.sessions += 1;
         }
-        prev = et;
-        day.events += 1;
-        if let Some((p, ecat)) = e.pc() {
-            day.rev += p;
-            s_rev += p;
-            s_purch = true;
-            match day.cats.iter_mut().find(|x| x.0 == ecat) {
-                Some(x) => x.1 += p,
-                None => day.cats.push((ecat, p)),
+        day.events += (nx - st) as u32;
+        while (pl[kp] as usize) < nx {
+            if let Some((p, ecat)) = pes[pl[kp] as usize].pc() {
+                day.rev += p;
+                s_rev += p;
+                s_purch = true;
+                match day.cats.iter_mut().find(|x| x.0 == ecat) {
+                    Some(x) => x.1 += p,
+                    None => day.cats.push((ecat, p)),
+                }
             }
+            kp += 1;
         }
     }
     if in_sess {
