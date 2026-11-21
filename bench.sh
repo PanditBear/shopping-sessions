@@ -93,6 +93,21 @@ for im in "${IMGS[@]:1}"; do
   if diff -r -q $W/keep-${IMGS[0]} $W/keep-$im >/dev/null; then echo "$im same"; else echo "$im DIFFERENT"; fi
 done | tee -a ${GITHUB_STEP_SUMMARY:-/dev/null}
 
+echo "== launcher check (empty dataset)"
+for im in "${IMGS[@]}"; do
+  o=$(mktemp -d); s=$(mktemp -d); chmod 777 $o $s
+  echo "-- $im: $(docker run --rm --network none --user 1000:1000 -v $W/empty:/data:ro -v $o:/output -v $s:/scratch -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e NCPU=$CPUS -e SHOP_LAUNCHER_LOG=1 $im 2>&1 >/dev/null | grep -m1 launcher || echo no launcher line)"
+done
+L=$(ls $W/binl-* 2>/dev/null | head -1)
+if [ -n "$L" ]; then
+  echo "== launcher native overhead (empty dataset, 300 runs each, total seconds)"
+  sudo mkdir -p /app; sudo cp $L /app/shop; sudo cp $(ls $W/bin-* | head -1) /app/shop-base; sudo cp $(ls $W/binw-* | head -1) /app/shop-wide
+  o=$(mktemp -d); s=$(mktemp -d)
+  for rep in 1 2 3; do for b in /app/shop /app/shop-base /app/shop-wide; do
+    t=$(date +%s.%N); for k in $(seq 300); do DATA_DIR=$W/empty OUTPUT_DIR=$o SCRATCH_DIR=$s NCPU=1 $b >/dev/null 2>&1; done
+    echo "$b $(echo "($(date +%s.%N) - $t)" | bc)"
+  done; done
+fi
 echo "== last-run phase ticks"
 for im in "${IMGS[@]}"; do echo "-- $im"; cat $W/err-$im.txt; done
 
