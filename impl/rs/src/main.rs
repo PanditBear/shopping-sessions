@@ -2137,19 +2137,30 @@ fn radix_rts<E: Ev>(a: &mut [E], b: &mut [E]) {
 
 #[inline(always)]
 fn click_less(a: &ClickRec, b: &ClickRec) -> bool {
-    match (a.key, a.ts).cmp(&(b.key, b.ts)) {
-        std::cmp::Ordering::Less => true,
-        std::cmp::Ordering::Greater => false,
-        std::cmp::Ordering::Equal => unpack(a.cid) < unpack(b.cid),
-    }
+    (a.key, a.ts) < (b.key, b.ts)
 }
 
-/// Sort clicks by (dg(key), key, ts, click_id bytes): a counting pass on the digit, then a small
-/// sort per range.
+/// Last touch among clicks of one person with one ts that do not all share a campaign: the
+/// campaign of the click with the byte-wise smallest click_id. Copies of a click are equal here.
+#[inline(never)]
+fn min_cid_camp(g: &[ClickRec]) -> u32 {
+    let mut w = &g[0];
+    for c in &g[1..] {
+        if unpack(c.cid) < unpack(w.cid) {
+            w = c;
+        }
+    }
+    w.camp
+}
+
+/// Sort clicks by (dg(key), key, ts): a counting pass on the digit, then a small sort per range.
+/// Clicks of one key with equal ts stay in no particular order: the sessionizer reads them as a
+/// set, and its last-touch choice orders a tie by click_id bytes itself (`min_cid_camp`), so the
+/// sort never touches the click_id bytes.
 fn sort_clicks(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Vec<u32>) {
     let n = cl.len();
     if n < 256 {
-        cl.sort_unstable_by(|a, b| (dg(a.key), a.key, a.ts).cmp(&(dg(b.key), b.key, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid))));
+        cl.sort_unstable_by_key(|c| (dg(c.key), c.key, c.ts));
         return;
     }
     if ck_rdx() && sort_clicks_rdx(cl, tmp, cnt) {
@@ -2171,7 +2182,7 @@ fn sort_clicks(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Vec<u3
             if m <= 32 {
                 isort_by(o, click_less);
             } else {
-                o.sort_unstable_by(|a, b| (a.key, a.ts).cmp(&(b.key, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid))));
+                o.sort_unstable_by_key(|c| (c.key, c.ts));
             }
         }
         st = en;
@@ -2189,8 +2200,8 @@ thread_local! {
 
 /// Bucket-wide click sort without per-range sorts: (dg, ts quantum, index) packed into u64s are
 /// LSD radix sorted (two 11-bit ts passes, one digit pass), the records are gathered once, then
-/// each digit range that is not yet in (key, ts, click_id) order (several keys, or two clicks in
-/// one quantum) is sorted. Returns false (and leaves `cl` alone) when the fields do not fit.
+/// each digit range that is not yet in (key, ts) order (several keys, or two clicks in one
+/// quantum) is sorted. Returns false (and leaves `cl` alone) when the fields do not fit.
 fn sort_clicks_rdx(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Vec<u32>) -> bool {
     let n = cl.len();
     let ib = 64 - ((n - 1) as u64).leading_zeros();
@@ -2264,7 +2275,7 @@ fn sort_clicks_rdx(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Ve
             if r.len() <= 32 {
                 isort_by(r, click_less);
             } else {
-                r.sort_unstable_by(|a, b| (a.key, a.ts).cmp(&(b.key, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid))));
+                r.sort_unstable_by_key(|c| (c.key, c.ts));
             }
         }
         st = en;
@@ -2272,12 +2283,12 @@ fn sort_clicks_rdx(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Ve
     true
 }
 
-/// Insertion sort of one clicker's clicks (already in ts quantum order) by (ts, click_id bytes).
+/// Insertion sort of one clicker's clicks (already in ts quantum order) by ts.
 /// Gives up after about two moves per click and returns false, leaving `r` a permutation.
 fn isort_one(r: &mut [ClickRec]) -> bool {
     #[inline(always)]
     fn less(a: &ClickRec, b: &ClickRec) -> bool {
-        a.ts < b.ts || (a.ts == b.ts && unpack(a.cid) < unpack(b.cid))
+        a.ts < b.ts
     }
     let mut budget = 2 * r.len() + 16;
     for i in 1..r.len() {
@@ -2301,8 +2312,7 @@ fn isort_one(r: &mut [ClickRec]) -> bool {
 }
 
 /// A long digit range is nearly always one heavy clicker. When every click in `src` has the same key,
-/// sort (ts, index) pairs packed into u64s, gather into `out`, then order each run of equal ts by
-/// click_id bytes. Returns false (and leaves `out` alone) for a range with several keys.
+/// sort (ts, index) pairs packed into u64s and gather into `out`. Returns false (and leaves `out` alone) for a range with several keys.
 fn sort_one_clicker(src: &[ClickRec], out: &mut [ClickRec], pk: &mut Vec<u64>) -> bool {
     let m = src.len();
     let k0 = src[0].key;
@@ -2322,17 +2332,6 @@ fn sort_one_clicker(src: &[ClickRec], out: &mut [ClickRec], pk: &mut Vec<u64>) -
     pk.sort_unstable();
     for (o, &u) in out.iter_mut().zip(pk.iter()) {
         *o = src[(u & 0xF_FFFF) as usize];
-    }
-    let mut a = 0;
-    while a < m {
-        let mut b = a + 1;
-        while b < m && out[b].ts == out[a].ts {
-            b += 1;
-        }
-        if b - a > 1 {
-            out[a..b].sort_unstable_by(|x, y| unpack(x.cid).cmp(unpack(y.cid)));
-        }
-        a = b;
     }
     true
 }
@@ -2406,12 +2405,20 @@ fn process_bucket<E: Ev>(
                     lo += 1;
                 }
                 s_camp = if hi > lo {
+                    // the clicks at the latest ts; ties are not in click_id order
                     let t = cs[hi - 1].ts;
+                    let c0 = cs[hi - 1].camp;
                     let mut g = hi - 1;
+                    let mut mixed = false;
                     while g > lo && cs[g - 1].ts == t {
                         g -= 1;
+                        mixed |= cs[g].camp != c0;
                     }
-                    cs[g].camp
+                    if mixed {
+                        min_cid_camp(&cs[g..hi])
+                    } else {
+                        c0
+                    }
                 } else {
                     organic
                 };
@@ -4471,12 +4478,20 @@ fn person_sess<E: Ev>(
                 lo += 1;
             }
             s_camp = if hi > lo {
+                // the clicks at the latest ts; ties are not in click_id order
                 let t = cs[hi - 1].ts;
+                let c0 = cs[hi - 1].camp;
                 let mut g = hi - 1;
+                let mut mixed = false;
                 while g > lo && cs[g - 1].ts == t {
                     g -= 1;
+                    mixed |= cs[g].camp != c0;
                 }
-                cs[g].camp
+                if mixed {
+                    min_cid_camp(&cs[g..hi])
+                } else {
+                    c0
+                }
             } else {
                 organic
             };
@@ -6604,16 +6619,49 @@ mod ck_sort_tests {
                 // one clicker, one quantum, reversed: the insertion sort must give up
                 v.sort_by(|a, b| b.ts.cmp(&a.ts));
             }
+            // the contract: a permutation of the input in (dg, key, ts) order; equal (key, ts) in
+            // any order, so both sides are compared after a full sort that includes click_id and camp
+            let full = |v: &mut Vec<ClickRec>| {
+                v.sort_by(|a, b| (dg(a.key), a.key, a.ts).cmp(&(dg(b.key), b.key, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid))).then(a.camp.cmp(&b.camp)))
+            };
             let mut want = v.clone();
-            want.sort_by(|a, b| (dg(a.key), a.key, a.ts).cmp(&(dg(b.key), b.key, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid))));
-            let f = |v: &[ClickRec]| v.iter().map(|c| (c.key, c.ts, unpack(c.cid).to_vec())).collect::<Vec<_>>();
+            full(&mut want);
+            let f = |v: &[ClickRec]| v.iter().map(|c| (c.key, c.ts, unpack(c.cid).to_vec(), c.camp)).collect::<Vec<_>>();
+            let ord = |v: &[ClickRec]| v.windows(2).all(|w| (dg(w[0].key), w[0].key, w[0].ts) <= (dg(w[1].key), w[1].key, w[1].ts));
             let (mut tmp, mut cnt) = (vec![], vec![]);
             let mut a = v.clone();
             sort_clicks(&mut a, &mut tmp, &mut cnt);
+            assert!(ord(&a), "sort_clicks order case {ci}");
+            full(&mut a);
             assert!(f(&a) == f(&want), "sort_clicks case {ci}");
             let mut b = v.clone();
             assert!(sort_clicks_rdx(&mut b, &mut tmp, &mut cnt), "rdx fits case {ci}");
+            assert!(ord(&b), "sort_clicks_rdx order case {ci}");
+            full(&mut b);
             assert!(f(&b) == f(&want), "sort_clicks_rdx case {ci}");
+        }
+    }
+
+    #[test]
+    fn last_touch_tie_takes_smallest_click_id() {
+        let mut s = 0x0bad_cafe_1234_5678u64;
+        let ids: &'static [Vec<u8>] = Vec::leak((0..64)
+            .map(|_| {
+                let l = 1 + (rnd(&mut s) % 4) as usize;
+                (0..l).map(|_| b"a0\x00\xffz"[(rnd(&mut s) % 5) as usize]).collect()
+            })
+            .collect::<Vec<Vec<u8>>>());
+        for _ in 0..20000 {
+            let n = 2 + (rnd(&mut s) % 6) as usize;
+            // copies of one click share their campaign
+            let g: Vec<ClickRec> = (0..n)
+                .map(|_| {
+                    let i = (rnd(&mut s) % ids.len() as u64) as usize;
+                    mk(7, 0, &ids[i], (i % 3) as u32)
+                })
+                .collect();
+            let want = g.iter().min_by(|a, b| unpack(a.cid).cmp(unpack(b.cid))).unwrap().camp;
+            assert_eq!(min_cid_camp(&g), want);
         }
     }
 }
