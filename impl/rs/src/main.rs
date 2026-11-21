@@ -131,14 +131,17 @@ fn code8(w: u64) -> (u64, bool) {
 fn pack6(b: &[u8]) -> Option<u64> {
     let n = b.len();
     if (8..=10).contains(&n) {
+        // first 8 bytes in one word, the 0-2 bytes after them by table
         let (k0, ok0) = code8(ld8(b, 0));
-        let (k1, ok1) = code8(ld8(b, n - 8));
-        if !(ok0 & ok1) {
+        let t = n - 8;
+        let ca = CODE[b[8.min(n - 1)] as usize] as u64;
+        let cb = CODE[b[n - 1] as usize] as u64;
+        if !(ok0 & ((ca != 0) | (t < 1)) & ((cb != 0) | (t < 2))) {
             return None;
         }
-        let t = 6 * (n - 8) as u32;
-        let tail = k1 & ((1u64 << t) - 1);
-        return Some((k0 << 12) | (tail << (12 - t)));
+        let ma = 0u64.wrapping_sub((t >= 1) as u64);
+        let mb = 0u64.wrapping_sub((t >= 2) as u64);
+        return Some((k0 << 12) | ((ca & ma) << 6) | (cb & mb));
     }
     pack6_slow(b)
 }
@@ -531,6 +534,16 @@ fn leak_file(p: &Path) -> Option<B> {
         let _ = m.advise(memmap2::Advice::Sequential);
     }
     let m: &'static memmap2::Mmap = Box::leak(Box::new(m));
+    if std::env::var_os("SHOP_TOUCH").is_some() {
+        // measurement aid: fault every page in before the timed phases
+        let mut acc = 0u8;
+        let mut i = 0;
+        while i < m.len() {
+            acc ^= m[i];
+            i += 4096;
+        }
+        std::hint::black_box(acc);
+    }
     Some(&m[..])
 }
 
@@ -878,91 +891,170 @@ fn sort_small(v: &mut [EvOut]) {
     }
 }
 
-/// Sort by (key, ts). One counting-sort pass on the key bits below the common prefix of the
-/// packed keys (hashed keys, which sort after all packed keys, go to one extra last range),
-/// then a small sort per range. Equal (key, ts) pairs may end up in any order.
-fn sort_evs(evs: &mut Vec<EvOut>, tmp: &mut Vec<EvOut>, cnt: &mut Vec<u32>) {
-    let n = evs.len();
-    if n < 512 {
-        evs.sort_unstable_by_key(k128);
-        return;
-    }
-    let mut k0 = None;
-    let mut kx = 0u64;
-    for e in evs.iter() {
-        if e.key & HBIT == 0 {
-            let b = *k0.get_or_insert(e.key);
-            kx |= e.key ^ b;
-        }
-    }
-    let bits = 64 - kx.leading_zeros();
-    let w = (usize::BITS - n.leading_zeros()).min(13).min(bits);
-    let sh = bits - w;
-    let mask = (1u64 << w) - 1;
-    let nb = 1usize << w;
-    let dig = |e: &EvOut| -> usize {
-        if e.key & HBIT != 0 {
-            nb
-        } else {
-            ((e.key >> sh) & mask) as usize
-        }
-    };
+/// Bits of the in-bucket person digit.
+const NBK: u32 = 13;
+
+/// In-bucket person digit: hash bits disjoint from the bucket bits (`pbk`). Within a bucket,
+/// events and clicks are both ordered by (digit, key): every person's records stay contiguous
+/// and both lists can be merged in one walk. Persons spread evenly over the digits, so most
+/// digit ranges hold a single person.
+#[inline(always)]
+fn dg(key: u64) -> usize {
+    (mix(key) >> 36) as usize & ((1 << NBK) - 1)
+}
+
+/// Counting-sort pass of `v` into `out` on `dg`. Afterwards cnt[d] is the end of range d.
+fn hk_scatter<T: Copy>(v: &[T], out: &mut Vec<T>, cnt: &mut Vec<u32>, key: impl Fn(&T) -> u64) {
+    let n = v.len();
+    let nb = 1usize << NBK;
     cnt.clear();
-    cnt.resize(nb + 2, 0);
-    for e in evs.iter() {
-        cnt[dig(e) + 1] += 1;
+    cnt.resize(nb + 1, 0);
+    for e in v {
+        cnt[dg(key(e)) + 1] += 1;
     }
-    for i in 0..=nb {
+    for i in 0..nb {
         cnt[i + 1] += cnt[i];
     }
-    tmp.clear();
-    tmp.reserve(n);
+    out.clear();
+    out.reserve(n);
     {
-        let sp = tmp.spare_capacity_mut();
-        for e in evs.iter() {
-            let d = dig(e);
+        let sp = out.spare_capacity_mut();
+        for e in v {
+            let d = dg(key(e));
             sp[cnt[d] as usize].write(*e);
             cnt[d] += 1;
         }
     }
-    unsafe { tmp.set_len(n) };
-    // cnt[d] is now the end of range d
+    unsafe { out.set_len(n) };
+}
+
+#[inline(always)]
+fn isort_by<T: Copy>(v: &mut [T], less: impl Fn(&T, &T) -> bool) {
+    for i in 1..v.len() {
+        let x = v[i];
+        let mut j = i;
+        while j > 0 && less(&x, &v[j - 1]) {
+            v[j] = v[j - 1];
+            j -= 1;
+        }
+        v[j] = x;
+    }
+}
+
+/// Sort by (dg(key), key, ts); equal (key, ts) pairs may end up in any order. `base` is at most
+/// every ts (the window start), `span` bounds ts - base. A counting pass on the digit, then per
+/// range: when the range holds one key, its (ts, index) pairs are sorted as u64s and gathered back.
+fn sort_evs(evs: &mut Vec<EvOut>, tmp: &mut Vec<EvOut>, cnt: &mut Vec<u32>, base: i64, span: i64) {
+    let n = evs.len();
+    if n < 256 {
+        evs.sort_unstable_by_key(|e| (dg(e.key), k128(e)));
+        return;
+    }
+    hk_scatter(evs, tmp, cnt, |e| e.key);
+    let fast = span >= 0 && span < (1i64 << 55);
+    let mut ks = [0u64; 256];
     let mut st = 0usize;
-    for d in 0..=nb {
+    for d in 0..1usize << NBK {
         let en = cnt[d] as usize;
-        if en - st > 1 {
-            sort_small(&mut tmp[st..en]);
+        let m = en - st;
+        let r = &tmp[st..en];
+        if m == 1 {
+            evs[st] = r[0];
+        } else if m > 1 {
+            let k0 = r[0].key;
+            let mut same = fast && m <= 256;
+            if same {
+                for (i, e) in r.iter().enumerate() {
+                    ks[i] = (((e.ts - base) as u64) << 8) | i as u64;
+                    same &= e.key == k0;
+                }
+            }
+            if same {
+                let ks = &mut ks[..m];
+                if m <= 32 {
+                    isort_by(ks, |a, b| a < b);
+                } else {
+                    ks.sort_unstable();
+                }
+                for (j, &k) in ks.iter().enumerate() {
+                    evs[st + j] = r[(k & 0xFF) as usize];
+                }
+            } else {
+                evs[st..en].copy_from_slice(r);
+                sort_small(&mut evs[st..en]);
+            }
         }
         st = en;
     }
-    std::mem::swap(evs, tmp);
 }
 
+#[inline(always)]
+fn click_less(a: &ClickRec, b: &ClickRec) -> bool {
+    match (a.key, a.ts).cmp(&(b.key, b.ts)) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Greater => false,
+        std::cmp::Ordering::Equal => unpack(a.cid) < unpack(b.cid),
+    }
+}
+
+/// Sort clicks by (dg(key), key, ts, click_id bytes): a counting pass on the digit, then a small
+/// sort per range.
+fn sort_clicks(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Vec<u32>) {
+    let n = cl.len();
+    if n < 256 {
+        cl.sort_unstable_by(|a, b| (dg(a.key), a.key, a.ts).cmp(&(dg(b.key), b.key, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid))));
+        return;
+    }
+    hk_scatter(cl, tmp, cnt, |c| c.key);
+    let mut st = 0usize;
+    for d in 0..1usize << NBK {
+        let en = cnt[d] as usize;
+        let m = en - st;
+        if m == 1 {
+            cl[st] = tmp[st];
+        } else if m > 1 {
+            let o = &mut cl[st..en];
+            o.copy_from_slice(&tmp[st..en]);
+            if m <= 32 {
+                isort_by(o, click_less);
+            } else {
+                o.sort_unstable_by(|a, b| (a.key, a.ts).cmp(&(b.key, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid))));
+            }
+        }
+        st = en;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn process_bucket(
     evs: &mut Vec<EvOut>,
     tmp: &mut Vec<EvOut>,
     cnt: &mut Vec<u32>,
     clicks: &mut Vec<ClickRec>,
+    ctmp: &mut Vec<ClickRec>,
     win: &mut Win,
     organic: u32,
     uds: &mut Vec<UD>,
     cm: &mut CampAcc,
+    base: i64,
+    span: i64,
 ) {
     let mut tm = now();
-    sort_evs(evs, tmp, cnt);
+    sort_evs(evs, tmp, cnt, base, span);
     pt(7, &mut tm);
-    clicks.sort_unstable_by(|a, b| (a.key, a.ts).cmp(&(b.key, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid))));
+    sort_clicks(clicks, ctmp, cnt);
     pt(11, &mut tm);
     let mut ci = 0;
     let mut i = 0;
     let mut day = DayAcc { key: 0, day: 0, sessions: 0, events: 0, rev: 0, cats: vec![] };
     while i < evs.len() {
         let pid = evs[i].key;
+        let pd = dg(pid);
         let mut j = i;
         while j < evs.len() && evs[j].key == pid {
             j += 1;
         }
-        while ci < clicks.len() && clicks[ci].key < pid {
+        while ci < clicks.len() && (dg(clicks[ci].key), clicks[ci].key) < (pd, pid) {
             ci += 1;
         }
         let mut cj = ci;
@@ -1204,6 +1296,74 @@ fn manifest_ts(txt: &str, key: &str) -> Option<i64> {
     parse_ts(rest[..q3].as_bytes())
 }
 
+struct EvCtx<'a> {
+    prod: &'a IdLookup,
+    unknown_cat: u32,
+    ws: i64,
+    we: i64,
+    rs: &'a RandomState,
+}
+
+/// Parses one chunk of event lines: records with a packed event_id go to `flat`, the rest to
+/// `fb`; user ids with no packed key are noted in `fbn` (hash key, packed slice).
+#[inline(never)]
+fn parse_events(c: B, cx: &EvCtx, flat: &mut Vec<EvRec>, fb: &mut Vec<EvRec>, fbn: &mut Vec<(u64, u64)>) {
+    let mut tci = TsCache::new();
+    let mut tct = TsCache::new();
+    scan::<7>(c, |&[eid, uid, ts, ing, et, pr, price]| {
+        if eid.is_empty() {
+            return;
+        }
+        let ingest = parse_ts_c(ing, &mut tci).unwrap_or(i64::MAX);
+        let mut r = EvRec { eid: 0, ingest, uid: 0, ts: 0, meta: 0 };
+        'v: {
+            if uid.is_empty() || pr.is_empty() {
+                break 'v;
+            }
+            let Some(t) = parse_ts_c(ts, &mut tct) else { break 'v };
+            if t < cx.ws || t >= cx.we {
+                break 'v;
+            }
+            let purch = match et {
+                b"view" | b"cart" => false,
+                b"purchase" => true,
+                _ => break 'v,
+            };
+            let mut pv = 0u64;
+            if purch {
+                match parse_price(price) {
+                    Some(p) => pv = p as u64,
+                    None => break 'v,
+                }
+            }
+            if ingest.wrapping_sub(t) > DAY {
+                break 'v;
+            }
+            r.ts = t;
+            let cat = cx.prod.get(pr).unwrap_or(cx.unknown_cat) as u64;
+            r.meta = pv | (cat << 24) | META_OK | if purch { META_PURCH } else { 0 };
+            r.uid = match pack6(uid) {
+                Some(k) => k,
+                None => {
+                    let k = cx.rs.hash_one(uid) | HBIT;
+                    fbn.push((k, pack(uid)));
+                    k
+                }
+            };
+        }
+        match pack6(eid) {
+            Some(k) => {
+                r.eid = k;
+                flat.push(r);
+            }
+            None => {
+                r.eid = pack(eid);
+                fb.push(r);
+            }
+        }
+    });
+}
+
 fn main() {
     let ep = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
     let ep0 = ep();
@@ -1373,6 +1533,65 @@ fn main() {
         },
         || {
             let ev_chunks = all_chunks(&csv_files(&data.join("events")));
+            let cx = EvCtx { prod: &prod, unknown_cat, ws, we, rs: &rs };
+            if std::env::var_os("SHOP_PARSE").is_some() {
+                // measurement aid: event parsing alone, serial, into reused buffers
+                let (mut flat, mut fb, mut fbn) = (Vec::with_capacity(CHUNK / 32), vec![], vec![]);
+                for rep in 0..3 {
+                    let t = std::time::Instant::now();
+                    let mut n = 0usize;
+                    for &c in &ev_chunks {
+                        flat.clear();
+                        fb.clear();
+                        fbn.clear();
+                        parse_events(c, &cx, &mut flat, &mut fb, &mut fbn);
+                        n += flat.len() + fb.len();
+                    }
+                    eprintln!("parse rep{} {:.3}s ({} recs)", rep, t.elapsed().as_secs_f64(), n);
+                }
+            }
+            if std::env::var_os("SHOP_PARTS").is_some() {
+                // measurement aid: each per-field step alone over the real fields
+                let mut fs: [Vec<B>; 7] = Default::default();
+                for &c in &ev_chunks {
+                    scan::<7>(c, |f| {
+                        for k in 0..7 {
+                            fs[k].push(f[k]);
+                        }
+                    });
+                }
+                let tm = |name: &str, f: &mut dyn FnMut() -> u64| {
+                    let mut best = f64::MAX;
+                    let mut r = 0;
+                    for _ in 0..3 {
+                        let t = std::time::Instant::now();
+                        r = f();
+                        best = best.min(t.elapsed().as_secs_f64());
+                    }
+                    eprintln!("part {name} {:.3}s ({})", best, r & 1);
+                };
+                tm("ts", &mut || {
+                    let mut c = TsCache::new();
+                    fs[2].iter().map(|b| parse_ts_c(b, &mut c).unwrap_or(0) as u64).fold(0, u64::wrapping_add)
+                });
+                tm("ingest", &mut || {
+                    let mut c = TsCache::new();
+                    fs[3].iter().map(|b| parse_ts_c(b, &mut c).unwrap_or(0) as u64).fold(0, u64::wrapping_add)
+                });
+                tm("pack-eid", &mut || fs[0].iter().map(|b| pack6(b).unwrap_or(0)).fold(0, u64::wrapping_add));
+                tm("pack-uid", &mut || fs[1].iter().map(|b| pack6(b).unwrap_or(0)).fold(0, u64::wrapping_add));
+                tm("prod", &mut || fs[5].iter().map(|b| prod.get(b).unwrap_or(0) as u64).fold(0, u64::wrapping_add));
+                tm("et", &mut || {
+                    fs[4].iter()
+                        .map(|b| match *b {
+                            b"view" | b"cart" => 1u64,
+                            b"purchase" => 2,
+                            _ => 0,
+                        })
+                        .fold(0, u64::wrapping_add)
+                });
+                tm("price", &mut || fs[6].iter().map(|b| parse_price(b).unwrap_or(0) as u64).fold(0, u64::wrapping_add));
+            }
             if std::env::var("SHOP_PROBE").is_ok() {
                 let t = std::time::Instant::now();
                 let mut acc = 0u64;
@@ -1417,61 +1636,8 @@ fn main() {
                     let mut flat: Vec<EvRec> = Vec::with_capacity(c.len() / 64);
                     let mut fb: Vec<EvRec> = vec![];
                     let mut fbn: Vec<(u64, u64)> = vec![];
-                    let mut tci = TsCache::new();
-                    let mut tct = TsCache::new();
                     let mut tm = now();
-                    scan::<7>(c, |&[eid, uid, ts, ing, et, pr, price]| {
-                        if eid.is_empty() {
-                            return;
-                        }
-                        let ingest = parse_ts_c(ing, &mut tci).unwrap_or(i64::MAX);
-                        let mut r = EvRec { eid: 0, ingest, uid: 0, ts: 0, meta: 0 };
-                        'v: {
-                            if uid.is_empty() || pr.is_empty() {
-                                break 'v;
-                            }
-                            let Some(t) = parse_ts_c(ts, &mut tct) else { break 'v };
-                            if t < ws || t >= we {
-                                break 'v;
-                            }
-                            let purch = match et {
-                                b"view" | b"cart" => false,
-                                b"purchase" => true,
-                                _ => break 'v,
-                            };
-                            let mut pv = 0u64;
-                            if purch {
-                                match parse_price(price) {
-                                    Some(p) => pv = p as u64,
-                                    None => break 'v,
-                                }
-                            }
-                            if ingest.wrapping_sub(t) > DAY {
-                                break 'v;
-                            }
-                            r.ts = t;
-                            let cat = prod.get(pr).unwrap_or(unknown_cat) as u64;
-                            r.meta = pv | (cat << 24) | META_OK | if purch { META_PURCH } else { 0 };
-                            r.uid = match pack6(uid) {
-                                Some(k) => k,
-                                None => {
-                                    let k = rs.hash_one(uid) | HBIT;
-                                    fbn.push((k, pack(uid)));
-                                    k
-                                }
-                            };
-                        }
-                        match pack6(eid) {
-                            Some(k) => {
-                                r.eid = k;
-                                flat.push(r);
-                            }
-                            None => {
-                                r.eid = pack(eid);
-                                fb.push(r);
-                            }
-                        }
-                    });
+                    parse_events(c, &cx, &mut flat, &mut fb, &mut fbn);
                     pt(0, &mut tm);
                     let (v, off) = bucketize(&flat, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize);
                     pt(1, &mut tm);
@@ -1644,6 +1810,7 @@ fn main() {
             let mut tmp: Vec<EvOut> = vec![];
             let mut cnt: Vec<u32> = vec![];
             let mut cl: Vec<ClickRec> = vec![];
+            let mut ctmp: Vec<ClickRec> = vec![];
             for p in g * per..((g + 1) * per).min(PB) {
                 let mut tm = now();
                 evs.clear();
@@ -1656,7 +1823,7 @@ fn main() {
                 }
                 pt(6, &mut tm);
                 let mut uds = Vec::new();
-                process_bucket(&mut evs, &mut tmp, &mut cnt, &mut cl, &mut win, ncamp as u32, &mut uds, &mut cm);
+                process_bucket(&mut evs, &mut tmp, &mut cnt, &mut cl, &mut ctmp, &mut win, ncamp as u32, &mut uds, &mut cm, ws, we.wrapping_sub(ws));
                 out.push(uds);
             }
             (out, cm)
