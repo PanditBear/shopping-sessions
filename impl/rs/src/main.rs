@@ -1213,19 +1213,6 @@ const GPA: u64 = 16;
 /// pack6 code of 'u'
 const UPRE: u64 = 58;
 impl GpTab {
-    /// prefetches the entry of user key k; false when k has no entry here
-    #[inline(always)]
-    fn pf(&self, k: u64) -> bool {
-        if let Some(v) = gen_val(k, UPRE) {
-            let idx = gen_idx(v, self.key);
-            let (gp, a) = ((idx >> 9) as usize, idx & 511);
-            if a < GPA && gp < self.n {
-                prefetch(unsafe { self.e.as_ptr().add(2 * gp) });
-                return true;
-            }
-        }
-        false
-    }
     /// person key of user key k, or None when the filter and table must answer
     #[inline(always)]
     fn get(&self, k: u64) -> Option<u64> {
@@ -5135,20 +5122,11 @@ fn main() {
             let mut hit = vec![0u32; n + 1];
             let mut cnt = vec![0u32; PB + 1];
             let mut m = 0usize;
-            let gt = mf.g.as_ref();
             for i in 0..n {
                 if i + RPD < n {
-                    let k2 = tmp[i + RPD].key;
-                    if !gt.is_some_and(|g| g.pf(k2)) {
-                        mf.pf(k2);
-                    }
+                    mf.pf(tmp[i + RPD].key);
                 }
                 let k = tmp[i].key;
-                if let Some(p) = gt.and_then(|g| g.get(k)) {
-                    tmp[i].key = p;
-                    cnt[pbk(p) + 1] += 1;
-                    continue;
-                }
                 let h = mf.hit(k);
                 hit[m] = i as u32;
                 m += h as usize;
