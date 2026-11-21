@@ -7,3 +7,4 @@ time,event,ticket,branch,dev,holdout,runtime_s,board,commit,note
 2026-11-20 18:34:26,land,C-fuzz,worktree-agent-a79a139d2c50ed7d0,1.0,1.0,73.064,,0f2f12fd31,
 2026-11-20 18:43:44,land,D-dock,D-dock,1.0,1.0,65.292,,3ce024ad99,
 2026-11-20 18:52:14,board,,,,,,2.85,98cdde8eae,"BB-5BA297E4 scored 2.85 s (Rust, musl scratch image)"
+2026-11-20 19:19:01,land,R-speed2,speed2,1.0,1.0,46.98,,0d6adbddb6,
