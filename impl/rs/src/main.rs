@@ -1165,6 +1165,18 @@ use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 use parquet::schema::types::ColumnPath;
 
+/// Output page codec. Fewer output bytes means less writeback when the container exits, and the
+/// output is small next to the input, so a fast codec costs little. SHOP_CODEC=none|lz4|zstd[:level].
+fn codec() -> Compression {
+    let v = std::env::var("SHOP_CODEC").unwrap_or_default();
+    let (name, lvl) = v.split_once(':').unwrap_or((v.as_str(), "1"));
+    match name {
+        "none" => Compression::UNCOMPRESSED,
+        "lz4" => Compression::LZ4_RAW,
+        _ => Compression::ZSTD(parquet::basic::ZstdLevel::try_new(lvl.parse().unwrap_or(1)).unwrap_or_default()),
+    }
+}
+
 fn props() -> Arc<WriterProperties> {
     // Dictionary encoding on the low-cardinality columns makes the output about 2.5x smaller for no
     // measurable write time, and fewer bytes means less writeback when the container exits. user_id stays
@@ -1172,7 +1184,7 @@ fn props() -> Arc<WriterProperties> {
     // A dictionary that outgrows the default page limit falls back to plain on its own.
     Arc::new(
         WriterProperties::builder()
-            .set_compression(Compression::UNCOMPRESSED)
+            .set_compression(codec())
             .set_dictionary_enabled(true)
             .set_column_dictionary_enabled(ColumnPath::from("user_id"), false)
             .set_statistics_enabled(EnabledStatistics::None)

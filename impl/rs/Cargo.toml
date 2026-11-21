@@ -9,7 +9,7 @@ memmap2 = "0.9"
 memchr = "2"
 ahash = "0.8"
 mimalloc = { version = "0.1", default-features = false }
-parquet = { version = "55", default-features = false }
+parquet = { version = "55", default-features = false, features = ["zstd", "lz4"] }
 
 [profile.release]
 opt-level = 3
