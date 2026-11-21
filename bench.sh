@@ -34,10 +34,18 @@ for spec in "$@"; do
     (cd $W/w$i/impl/rs && CC_x86_64_unknown_linux_musl=musl-gcc RUSTFLAGS="-C target-cpu=x86-64-v3" CARGO_TARGET_DIR=$W/tgt \
        cargo build --release --locked -q --target x86_64-unknown-linux-musl)
     cp $W/tgt/x86_64-unknown-linux-musl/release/shop $W/bin-$sha
+    if [ -d $W/w$i/impl/launcher ]; then
+      (cd $W/w$i/impl/rs && CC_x86_64_unknown_linux_musl=musl-gcc RUSTFLAGS="${WIDEFLAGS:--C target-cpu=x86-64-v4 -C target-feature=+prefer-256-bit}" CARGO_TARGET_DIR=$W/tgtw \
+         cargo build --release --locked -q --target x86_64-unknown-linux-musl)
+      cp $W/tgtw/x86_64-unknown-linux-musl/release/shop $W/binw-$sha
+      (cd $W/w$i/impl/launcher && cargo build --release --locked -q --target x86_64-unknown-linux-musl)
+      cp $W/w$i/impl/launcher/target/x86_64-unknown-linux-musl/release/launcher $W/binl-$sha
+    fi
   fi
   echo "== image bench$i: $sha ($(git log -1 --format=%s $sha)) env [${envs//@/ }]"
-  cp $W/bin-$sha $W/img/shop
-  { printf 'FROM scratch\nCOPY shop /app/shop\n'; for e in ${envs//@/ }; do echo "ENV $e"; done; printf 'CMD ["/app/shop"]\n'; } > $W/img/Dockerfile
+  for f in $W/img/shop*; do [ -e $f ] && unlink $f; done
+  if [ -f $W/binl-$sha ]; then cp $W/binl-$sha $W/img/shop; cp $W/bin-$sha $W/img/shop-base; cp $W/binw-$sha $W/img/shop-wide; ex='COPY shop-base /app/shop-base\nCOPY shop-wide /app/shop-wide\n'; else cp $W/bin-$sha $W/img/shop; ex=''; fi
+  { printf "FROM scratch\nCOPY shop /app/shop\n$ex"; for e in ${envs//@/ }; do echo "ENV $e"; done; printf 'CMD ["/app/shop"]\n'; } > $W/img/Dockerfile
   docker build -q -t bench$i $W/img >/dev/null
   IMGS+=("bench$i"); [ $i = 1 ] && BIN1=$W/bin-$sha
 done
