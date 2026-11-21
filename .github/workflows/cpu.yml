@@ -1,0 +1,24 @@
+name: cpu (whole-process cpu per ref)
+on:
+  push:
+    branches: [speed/fuse3-cpu]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: toolchain
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends musl-tools bc time
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get install -y -q --no-install-recommends linux-tools-common "linux-tools-$(uname -r)" \
+            || sudo apt-get install -y -q --no-install-recommends linux-tools-common linux-tools-azure || true
+      - name: cpu
+        run: bash cpu.sh 59800fb b380fad 59573a9 2170feb
