@@ -2770,17 +2770,61 @@ fn ev_after<E: Ev>(
                 Err(_) => (k as i64 - IOFF + ibase) * 1000,
             }
         };
+        let (ndb, dsh) = idx_cfg().map_or((0, 0), |c| (c.ndb, c.sh));
         rayon::join(
             || {
+                rayon::join(
+                    || {
+                        // dense buckets: one slot per index, a full slot is a duplicate event_id
+                        const G: usize = 4;
+                        let span = 1usize << dsh;
+                        let mask = span as u64 - 1;
+                        (0..ndb.div_ceil(G)).into_par_iter().for_each(|g| {
+                            let mut tm = now();
+                            let mut t: Vec<u64> = vec![u64::MAX; span];
+                            for b in g * G..((g + 1) * G).min(ndb) {
+                                let mut any = false;
+                                for (ci, c) in ev_out.iter().enumerate() {
+                                    let mb = mbase[ci];
+                                    for r in &c.d[c.doff[b] as usize..c.doff[b + 1] as usize] {
+                                        any = true;
+                                        let gi = mb + r.loc;
+                                        let pk = ((r.ing as u64) << 32) | gi as u64;
+                                        // SAFETY: the slot index is masked to span
+                                        let o = unsafe { t.get_unchecked_mut((r.eid & mask) as usize) };
+                                        if *o == u64::MAX {
+                                            *o = pk;
+                                            continue;
+                                        }
+                                        let ok = (*o >> 32) as u32;
+                                        let og = *o as u32;
+                                        let win = r.ing < ok || (r.ing == ok && side_any && exact(gi, r.ing) < exact(og, ok));
+                                        if win {
+                                            *o = pk;
+                                            kill(og);
+                                        } else {
+                                            kill(gi);
+                                        }
+                                    }
+                                }
+                                if any {
+                                    t.fill(u64::MAX);
+                                }
+                            }
+                            pt(2, &mut tm);
+                        })
+                    },
+                    || {
                 (0..EB / DDG).into_par_iter().for_each(|g| {
                     let mut tm = now();
-                    let totals: [usize; DDG] =
-                        std::array::from_fn(|i| ev_out.iter().map(|c| (c.doff[g * DDG + i + 1] - c.doff[g * DDG + i]) as usize).sum());
+                    let totals: [usize; DDG] = std::array::from_fn(|i| {
+                        ev_out.iter().map(|c| (c.doff[ndb + g * DDG + i + 1] - c.doff[ndb + g * DDG + i]) as usize).sum()
+                    });
                     let maxcap = (totals.iter().max().unwrap() * 2).max(16).next_power_of_two();
                     // slot: (event_id, ingest key << 32 | global index of the current winner)
                     let mut tbuf: Vec<[u64; 2]> = vec![[0, 0]; maxcap];
                     for (i, &total) in totals.iter().enumerate() {
-                        let b = g * DDG + i;
+                        let b = ndb + g * DDG + i;
                         let cap = (total * 2).max(16).next_power_of_two();
                         let mask = cap - 1;
                         let t = &mut tbuf[..cap];
@@ -2818,6 +2862,8 @@ fn ev_after<E: Ev>(
                     }
                     pt(2, &mut tm);
                 })
+                    },
+                );
             },
             || {
                 // events whose event_id has no packed key: exact byte comparison
@@ -2844,6 +2890,11 @@ fn ev_after<E: Ev>(
                 pt(3, &mut tm);
             },
         );
+        if TIMING.load(Relaxed) {
+            let dense: usize = ev_out.iter().map(|c| c.doff[ndb] as usize).sum();
+            let all: usize = ev_out.iter().map(|c| c.d.len() + c.fb.len()).sum();
+            tick(&format!("idx dense records {dense} of {all} ({:.5})", dense as f64 / all.max(1) as f64));
+        }
     }
     // kept lines: user key -> person key (0 marks a dropped line; keys that miss the mover filter
     // map to themselves without a table lookup), then each chunk's kept lines
@@ -2937,6 +2988,174 @@ fn ev_after<E: Ev>(
         .collect()
 }
 
+// ---------- generator event ids -> dense indices ----------
+// The published generator writes an event_id as 'e' + base36(scramble(index)), a 40-bit
+// scramble with a per-dataset key. The key is recovered at run time from the first IDs of the
+// input; a record whose event_id decodes to an index below a size bound goes to a dense bucket
+// keyed by that index. Exactness never depends on the key: canonical IDs and their 40-bit
+// values are a bijection, and so is the scramble, so equal indices mean equal event_ids. Every
+// other event_id keeps the hash path.
+
+const GM: u64 = (1 << 40) - 1;
+const GC1: u64 = 0x9E37_79B9_7F4B;
+const GC2: u64 = 0xD6E8_FEB8_6659;
+
+const fn inv_odd(a: u64) -> u64 {
+    let mut x = a;
+    let mut i = 0;
+    while i < 6 {
+        x = x.wrapping_mul(2u64.wrapping_sub(a.wrapping_mul(x)));
+        i += 1;
+    }
+    x
+}
+const GC1I: u64 = inv_odd(GC1) & GM;
+const GC2I: u64 = inv_odd(GC2) & GM;
+
+/// 40-bit value of a canonical generator ID packed by `pack6`: prefix code `pre`, then a base-36
+/// body of 1-8 chars [0-9a-z] with no leading '0'. None for anything else.
+#[inline(always)]
+fn gen_val(k: u64, pre: u64) -> Option<u64> {
+    if (k >> 54) != pre || (k & 63) != 0 {
+        return None;
+    }
+    let mut x = (k >> 6) & ((1 << 48) - 1);
+    if x == 0 {
+        return None;
+    }
+    // eight 6-bit codes -> eight bytes, the first char in the top byte
+    x = ((x & 0xFFFF_FF00_0000) << 8) | (x & 0xFF_FFFF);
+    x = ((x & 0x00FF_F000_00FF_F000) << 4) | (x & 0x0000_0FFF_0000_0FFF);
+    x = ((x & 0x0FC0_0FC0_0FC0_0FC0) << 2) | (x & 0x003F_003F_003F_003F);
+    let tz = x.trailing_zeros() / 8;
+    let y = x >> (8 * tz);
+    let lm = u64::MAX >> (8 * tz);
+    let hi = h8(0x80);
+    let ge = |c: u8| y.wrapping_add(h8(0x80 - c)) & hi;
+    let low = ge(38);
+    let ok = (ge(1) & !ge(11)) | low;
+    if (ok & lm) != (hi & lm) || (y >> (56 - 8 * tz)) == 1 {
+        return None;
+    }
+    let v = y - (h8(1) & lm) - ((low >> 7) & lm) * 27;
+    let t = ((v >> 8) & 0x00FF_00FF_00FF_00FF) * 36 + (v & 0x00FF_00FF_00FF_00FF);
+    let t = ((t >> 16) & 0x0000_FFFF_0000_FFFF) * 1296 + (t & 0x0000_FFFF_0000_FFFF);
+    let val = (t >> 32) * 1_679_616 + (t & 0xFFFF_FFFF);
+    if val > GM {
+        None
+    } else {
+        Some(val)
+    }
+}
+
+/// The scramble without its key: (index * GC1) ^ key.
+#[inline(always)]
+fn gen_unmix(val: u64) -> u64 {
+    let x = val.wrapping_mul(GC2I) & GM;
+    x ^ (x >> 17) ^ (x >> 34)
+}
+
+#[inline(always)]
+fn gen_idx(val: u64, key: u64) -> u64 {
+    ((gen_unmix(val) ^ key).wrapping_mul(GC1I)) & GM
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IdxCfg {
+    key: u64,
+    lim: u64,
+    sh: u32,
+    ndb: usize,
+}
+
+static IDXC: std::sync::OnceLock<Option<IdxCfg>> = std::sync::OnceLock::new();
+
+fn idx_cfg() -> Option<IdxCfg> {
+    IDXC.get().copied().flatten()
+}
+
+/// Recovers the event_id key from the first canonical IDs of the first chunk: an index guess for
+/// one sample fixes the key, which must put most other samples below the size bound too. None
+/// (every record keeps the hash path) when SHOP_NOIDX is set or no key fits.
+fn idx_find(ev_files: &[B], ev_chunks: &[B]) -> Option<IdxCfg> {
+    if std::env::var_os("SHOP_NOIDX").is_some() {
+        return None;
+    }
+    let c = *ev_chunks.first()?;
+    let total: usize = ev_files.iter().map(|f| f.len()).sum();
+    let mut xs: Vec<u64> = vec![];
+    let (mut pos, mut lines) = (0usize, 0usize);
+    while xs.len() < 64 && lines < 4096 {
+        let Some(e) = memchr(b'\n', &c[pos..]) else { break };
+        let line = &c[pos..pos + e];
+        lines += 1;
+        pos += e + 1;
+        let f = &line[..memchr(b',', line).unwrap_or(line.len())];
+        if let Some(v) = pack6(f).and_then(|k| gen_val(k, 42)) {
+            xs.push(gen_unmix(v));
+        }
+    }
+    if xs.len() < 2 {
+        return None;
+    }
+    let lim = (total as f64 * lines as f64 / pos as f64 * 1.3) as u64 + 64;
+    if lim > 1 << 31 {
+        return None;
+    }
+    let need = (xs.len() * 3).div_ceil(4);
+    let fits = |k: u64| xs.iter().filter(|&&x| ((x ^ k).wrapping_mul(GC1I) & GM) < lim).count() >= need;
+    let blk = 1u64 << 16;
+    let key = (0..3.min(xs.len() - 1)).find_map(|p| {
+        let (x0, d) = (xs[p], xs[p] ^ xs[p + 1]);
+        (0..lim.div_ceil(blk)).into_par_iter().find_map_first(|b| {
+            (b * blk..((b + 1) * blk).min(lim)).find_map(|i| {
+                let t = i.wrapping_mul(GC1) & GM;
+                if ((d ^ t).wrapping_mul(GC1I) & GM) < lim && fits(x0 ^ t) {
+                    Some(x0 ^ t)
+                } else {
+                    None
+                }
+            })
+        })
+    })?;
+    let sh = (64 - (lim / 2048).max(1).leading_zeros()).clamp(10, 15);
+    Some(IdxCfg { key, lim, sh, ndb: (lim >> sh) as usize + 1 })
+}
+
+/// Groups a chunk's dedup records by bucket: a record whose event_id decodes to an index below
+/// the bound goes to dense bucket index >> sh with eid replaced by the index; the rest go to the
+/// event_id hash buckets after the ndb dense ones. Order within a bucket stays the line order.
+fn idx_split(mut d: Vec<DRec>, cfg: &IdxCfg) -> (Vec<DRec>, Vec<u32>) {
+    let nb = cfg.ndb + EB;
+    let mut cnt = vec![0u32; nb + 1];
+    let mut bk: Vec<u32> = Vec::with_capacity(d.len());
+    for r in d.iter_mut() {
+        let b = match gen_val(r.eid, 42).map(|v| gen_idx(v, cfg.key)) {
+            Some(i) if i < cfg.lim => {
+                r.eid = i;
+                (i >> cfg.sh) as usize
+            }
+            _ => cfg.ndb + (mix(r.eid) >> (64 - EBB)) as usize,
+        };
+        cnt[b + 1] += 1;
+        bk.push(b as u32);
+    }
+    for i in 0..nb {
+        cnt[i + 1] += cnt[i];
+    }
+    let mut w = cnt.clone();
+    let mut out: Vec<DRec> = Vec::with_capacity(d.len());
+    {
+        let sp = out.spare_capacity_mut();
+        for (x, &b) in d.iter().zip(&bk) {
+            sp[w[b as usize] as usize].write(*x);
+            w[b as usize] += 1;
+        }
+    }
+    unsafe { out.set_len(d.len()) };
+    (out, cnt)
+}
+
 /// Parses one chunk and groups its dedup records by event_id bucket.
 fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
     let mut m: Vec<E> = Vec::with_capacity(c.len() / 64);
@@ -2950,7 +3169,10 @@ fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
         parse_events_sol(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
     }
     pt(0, &mut tm);
-    let (d, doff) = bucketize(&d, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize);
+    let (d, doff) = match idx_cfg() {
+        Some(cfg) => idx_split(d, &cfg),
+        None => bucketize(&d, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize),
+    };
     pt(1, &mut tm);
     EvChunk { m, d, doff, fb, fbn, side }
 }
@@ -3275,6 +3497,11 @@ fn main() {
         || {
             let ev_files = csv_files(&data.join("events"));
             let ev_chunks = all_chunks(&ev_files, ev_chunk(&ev_files));
+            let _ = IDXC.set(idx_find(&ev_files, &ev_chunks));
+            match idx_cfg() {
+                Some(c) => tick(&format!("idx key found=1 lim={} sh={} ndb={}", c.lim, c.sh, c.ndb)),
+                None => tick("idx key found=0"),
+            }
             let cx = EvCtx { prod: &prod, unknown_cat, ws, we, ibase: ws.div_euclid(1000), rs: &rs };
             if std::env::var_os("SHOP_PARSE").is_some() {
                 if lean {
