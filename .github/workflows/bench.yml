@@ -61,57 +61,40 @@ jobs:
           echo "== perf stat"
           sudo env $E $P stat -e task-clock,cycles,instructions,branches,branch-misses,cache-references,cache-misses,page-faults -o $R/stat.txt $W/shop-prof 2> $R/stat.ticks.txt
           cat $R/stat.txt $R/stat.ticks.txt | tee -a $R/stat.all.txt | tail -40
-          echo "== perf list"; $P list 2>&1 | grep -iE 'branch|cache|LLC|mem_load|retired' | head -60 | tee $R/perflist.txt
-          LC=""; PERC=2000
-          for ev in mem_load_retired.l3_miss longest_lat_cache.miss mem_load_retired.l2_miss LLC-load-misses cache-misses; do
-            sudo env $E $P stat -x, -e $ev -o $R/probe.$ev.txt $W/shop-prof >/dev/null 2>&1
-            c=$(grep -E "$ev" $R/probe.$ev.txt | cut -d, -f1); echo "probe $ev = $c" | tee -a $R/machine.txt
-            if [ -z "$LC" ] && [ -n "$c" ] && [ "$c" -gt 100000 ] 2>/dev/null; then LC=$ev; PERC=$(( c / 20000 + 1 )); fi
-          done
-          echo "cache event chosen: $LC period $PERC" | tee -a $R/machine.txt
-          i=0
-          for EVT in branch-misses ${LC:-cache-misses}; do
-            i=$((i+1)); n=$i
-            PER=5000; [ $n = 2 ] && PER=$PERC
-            sudo env $E $P record -q -c $PER -e ${EVT}:pp -g -o $W/perf$n.data $W/shop-prof >/dev/null 2>$R/rec$n.ticks.txt
-            if [ ! -s $W/perf$n.data ] || grep -qi 'not supported\|cannot open\|failed\|invalid' $R/rec$n.ticks.txt; then
-              head -5 $R/rec$n.ticks.txt
-              sudo env $E $P record -q -c $PER -e ${EVT} -g -o $W/perf$n.data $W/shop-prof >/dev/null 2>$R/rec$n.ticks.txt
-              echo "event run$n: $EVT (no pp) period $PER" | tee -a $R/machine.txt
-            else
-              echo "event run$n: ${EVT}:pp period $PER" | tee -a $R/machine.txt
-            fi
-          done
-          sudo chmod a+r $W/perf*.data
-          for n in 1 2; do
-            sudo $P report -i $W/perf$n.data --stdio -n --no-children -g none --sort dso,symbol 2>/dev/null | grep -v '^#' | grep -v '^$' | head -60 > $R/overall$n.self.txt
-            sudo $P report -i $W/perf$n.data --stdio -n --no-children -g none --sort symbol,srcline 2>/dev/null | grep -v '^#' | grep -v '^$' | head -1500 > $R/overall$n.srcline.txt
-            sudo $P report -i $W/perf$n.data --stdio -n --no-children -g none --sort comm 2>/dev/null | grep -v '^#' | grep -v '^$' | head -12 > $R/overall$n.comm.txt
-          done
-          for n in 1 2; do
-            T0=$(sudo $P script -i $W/perf$n.data -F time 2>/dev/null | sed -n 1p | tr -d ' :')
-            echo "T0=$T0" > $R/phase$n.t0.txt
-            grep -E '^\[[0-9.]+s\]' $R/rec$n.ticks.txt > $R/phase$n.ticks.txt
-            prev=0.0; i=0
-            while IFS= read -r line; do
-              t=$(echo "$line" | sed -E 's/^\[([0-9.]+)s\].*/\1/'); lab=$(echo "$line" | sed -E 's/^\[[0-9.]+s\] *//' | cut -c1-40)
-              i=$((i+1))
-              a=$(echo "$T0 + $prev" | bc -l); b=$(echo "$T0 + $t" | bc -l)
-              echo "### run$n phase $i: $prev .. $t s  (ends at: $lab)" >> $R/phases$n.txt
-              sudo $P report -i $W/perf$n.data --stdio -n --no-children -g none --sort symbol --time $a,$b 2>/dev/null | grep -v '^#' | grep -v '^$' | head -25 >> $R/phases$n.txt
-              prev=$t
-            done < $R/phase$n.ticks.txt
-          done
-          for n in 1 2; do
-            sudo $P script -i $W/perf$n.data --no-inline -F time,ip,sym 2>/dev/null | gzip -6 > $R/script$n.txt.gz
-          done
-          for n in 1 2; do
-            sudo $P script -i $W/perf$n.data -G -F ip,sym 2>/dev/null | awk 'NF>=2 {c[$1" "$2]++} END{for(k in c) print c[k], k}' | sort -rn > $R/ipcount$n.txt
-            grep -E 'parse_events_sol|parse_clicks' $R/ipcount$n.txt | head -4000 | awk '{print $2}' > $W/ips$n.txt
-            addr2line -i -f -a -e $W/shop-prof < $W/ips$n.txt 2>/dev/null | gzip -6 > $R/a2l$n.txt.gz
-            grep -E 'parse_events_sol|parse_clicks' $R/ipcount$n.txt | head -4000 | gzip -6 > $R/ipparse$n.txt.gz
-          done
-          echo "== done"; ls -l $R; head -40 $R/overall1.self.txt; head -40 $R/overall2.self.txt
+          echo "== perf list (counters)"; $P list 2>&1 | grep -E 'mem_load_retired|dtlb_(load|store)_misses.walk|cycle_activity|topdown|slots' | head -80 | tee $R/perflist.txt
+          st() { nm=$1; shift; echo "### stat $nm: $*" | tee -a $R/topdown.txt; sudo env $E $P stat "$@" -o $R/st.$nm.txt $W/shop-prof >/dev/null 2>$R/st.$nm.err; cat $R/st.$nm.txt | grep -vE '^#|^$' | tee -a $R/topdown.txt; head -3 $R/st.$nm.err | tee -a $R/topdown.txt; }
+          st td1 --topdown
+          st tdL1 -M TopdownL1
+          st tdL2 -M TopdownL2
+          st tdraw -e slots,topdown-retiring,topdown-bad-spec,topdown-fe-bound,topdown-be-bound
+          st tdraw2 -e slots,topdown-retiring,topdown-bad-spec,topdown-fe-bound,topdown-be-bound,topdown-heavy-ops,topdown-br-mispredict,topdown-fetch-lat,topdown-mem-bound
+          st core -e cycles,instructions,branches,branch-misses
+          st ml -e mem_load_retired.l1_miss,mem_load_retired.l2_miss,mem_load_retired.l3_miss,mem_load_retired.fb_hit
+          st ml2 -e mem_load_retired.l1_hit,mem_load_retired.l2_hit,mem_load_retired.l3_hit,instructions
+          st tlb -e dtlb_load_misses.walk_completed,dtlb_store_misses.walk_completed,dtlb_load_misses.stlb_hit,dtlb_store_misses.stlb_hit
+          st stall -e cycle_activity.stalls_l1d_miss,cycle_activity.stalls_l2_miss,cycle_activity.stalls_l3_miss,cycle_activity.stalls_total
+          st stall2 -e cycle_activity.cycles_l1d_miss,cycle_activity.cycles_mem_any,resource_stalls.sb,cycles
+          cp $R/topdown.txt $R/topdown.keep
+          rec() { nm=$1; EVT=$2; c=$(grep -E "$EVT" $R/st.$3.txt | grep -vE 'not supported|not counted' | awk '{gsub(",","",$1); print $1}' | head -1)
+            case "$c" in ''|*[!0-9]*) echo "rec $nm: no count for $EVT" | tee -a $R/machine.txt; return;; esac
+            PER=$(( c / 40000 + 1 )); echo "rec $nm $EVT count=$c period=$PER" | tee -a $R/machine.txt
+            sudo env $E $P record -q -c $PER -e ${EVT}:pp -g -o $W/r$nm.data $W/shop-prof >/dev/null 2>$R/rec.$nm.ticks.txt
+            if [ ! -s $W/r$nm.data ]; then echo "no pp for $nm" | tee -a $R/machine.txt; sudo env $E $P record -q -c $PER -e ${EVT} -g -o $W/r$nm.data $W/shop-prof >/dev/null 2>$R/rec.$nm.ticks.txt; fi
+            sudo chmod a+r $W/r$nm.data
+            sudo $P script -i $W/r$nm.data -G -F time,ip,sym 2>/dev/null > $W/r$nm.txt
+            head -1 $W/r$nm.txt | tee $R/t0.$nm.txt; wc -l < $W/r$nm.txt | tee -a $R/machine.txt
+            grep -E 'parse_events_sol' $W/r$nm.txt | awk '{print $1, $2}' | gzip -6 > $R/pe.$nm.gz
+            grep -E '^\[[0-9.]+s\]' $R/rec.$nm.ticks.txt > $R/ticks.$nm.txt
+            grep -E 'parse_events_sol' $W/r$nm.txt | awk '{print $2}' | sort -u > $W/ips.$nm.txt
+            addr2line -i -f -a -e $W/shop-prof < $W/ips.$nm.txt 2>/dev/null | gzip -6 > $R/a2l.$nm.gz
+            sudo $P report -i $W/r$nm.data --stdio -n --no-children -g none --sort symbol 2>/dev/null | grep -v '^#' | grep -v '^$' | cut -c1-150 | head -25 > $R/top.$nm.txt
+          }
+          rec cyc cycles core
+          rec ins instructions core
+          rec l1m mem_load_retired.l1_miss ml
+          rec tlbs dtlb_store_misses.walk_completed tlb
+          rec l3m mem_load_retired.l3_miss ml
+          echo "== done"; ls -l $R; head -20 $R/top.*.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
