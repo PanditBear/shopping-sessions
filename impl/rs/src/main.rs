@@ -677,7 +677,26 @@ fn leak_file(p: &Path) -> Option<B> {
     let m = unsafe { memmap2::Mmap::map(&f).ok()? };
     #[cfg(target_os = "linux")]
     {
-        let _ = m.advise(memmap2::Advice::Sequential);
+        match std::env::var("SHOP_MAP").as_deref() {
+            Ok("willneed") => {
+                let _ = m.advise(memmap2::Advice::WillNeed);
+            }
+            Ok("pop") => {
+                let _ = m.advise(memmap2::Advice::PopulateRead);
+            }
+            Ok("ppop") => {
+                // populate in parallel 8 MiB slices
+                let n = m.len();
+                (0..n.div_ceil(8 << 20)).into_par_iter().for_each(|i| {
+                    let a = i * (8 << 20);
+                    let _ = m.advise_range(memmap2::Advice::PopulateRead, a, (8usize << 20).min(n - a));
+                });
+            }
+            Ok("none") => {}
+            _ => {
+                let _ = m.advise(memmap2::Advice::Sequential);
+            }
+        }
     }
     let m: &'static memmap2::Mmap = Box::leak(Box::new(m));
     if std::env::var_os("SHOP_TOUCH").is_some() {
@@ -2366,6 +2385,20 @@ fn main() {
     if timing {
         let v: Vec<String> = (0..12).map(|i| format!("{}={:.2}", PROF_NAMES[i], PROF[i].load(Relaxed) as f64 / 1e9)).collect();
         eprintln!("prof(cpu s): {}", v.join(" "));
+    }
+    if timing {
+        for (f, keys) in [("/proc/self/smaps_rollup", &["AnonHugePages", "Rss"][..]), ("/proc/self/stat", &[][..])] {
+            if let Ok(t) = std::fs::read_to_string(f) {
+                if keys.is_empty() {
+                    let v: Vec<&str> = t.rsplit(')').next().unwrap_or("").split_whitespace().collect();
+                    eprintln!("faults minflt={} majflt={}", v.get(7).unwrap_or(&"?"), v.get(9).unwrap_or(&"?"));
+                }
+                for l in t.lines().filter(|l| keys.iter().any(|k| l.starts_with(k))) {
+                    eprintln!("smaps {}", l);
+                }
+            }
+        }
+        eprintln!("thp {}", std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled").unwrap_or_default().trim());
     }
     if timing {
         eprintln!("epoch main={:.3} end={:.3}", ep0, ep());
