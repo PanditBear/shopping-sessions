@@ -75,6 +75,12 @@ for im in "${IMGS[@]}"; do
   echo "$im wall $w internal $n start $pr exit $po"
 done | tee -a ${GITHUB_STEP_SUMMARY:-/dev/null}
 
+echo "== output parity vs ${IMGS[0]}"
+for im in "${IMGS[@]}"; do KEEP=$im run $im $W/data >/dev/null; done
+for im in "${IMGS[@]:1}"; do
+  if diff -r -q $W/keep-${IMGS[0]} $W/keep-$im >/dev/null; then echo "$im same"; else echo "$im DIFFERENT"; fi
+done | tee -a ${GITHUB_STEP_SUMMARY:-/dev/null}
+
 echo "== last-run phase ticks"
 for im in "${IMGS[@]}"; do echo "-- $im"; cat $W/err-$im.txt; done
 
