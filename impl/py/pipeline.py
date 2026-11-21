@@ -4,8 +4,12 @@ import datetime
 import json
 import os
 import re
+import sys
 from collections import defaultdict
 from pathlib import Path
+
+if hasattr(sys, "set_int_max_str_digits"):
+    sys.set_int_max_str_digits(0)  # rules: an over-long digit string is out of window, never a crash
 
 import pyarrow as pa
 import pyarrow.parquet as pq
