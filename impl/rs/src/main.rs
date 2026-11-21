@@ -2754,6 +2754,7 @@ fn ev_after<E: Ev>(
     assert!(acc < u32::MAX as usize);
     mbase.push(acc as u32);
     let dead: Vec<AtomicU64> = (0..acc / 64 + 1).map(|_| AtomicU64::new(0)).collect();
+    let xv: u32 = std::env::var("DD5X").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let kill = |g: u32| {
         dead[(g >> 6) as usize].fetch_or(1u64 << (g & 63), Relaxed);
     };
@@ -2789,7 +2790,21 @@ fn ev_after<E: Ev>(
                         }
                         for (ci, c) in ev_out.iter().enumerate() {
                             let mb = mbase[ci];
-                            for r in &c.d[c.doff[b] as usize..c.doff[b + 1] as usize] {
+                            let seg = &c.d[c.doff[b] as usize..c.doff[b + 1] as usize];
+                            if xv == 4 {
+                                let mut sm = 0u64;
+                                for r in seg {
+                                    sm = sm.wrapping_add(r.eid ^ r.ing as u64 ^ r.loc as u64);
+                                }
+                                std::hint::black_box(sm);
+                                continue;
+                            }
+                            for (j, r) in seg.iter().enumerate() {
+                                if xv == 3 {
+                                    if let Some(q) = seg.get(j + 16) {
+                                        prefetch(unsafe { t.as_ptr().add((mix(q.eid) >> 8) as usize & mask) });
+                                    }
+                                }
                                 let gi = mb + r.loc;
                                 let pk = ((r.ing as u64) << 32) | gi as u64;
                                 let mut p = (mix(r.eid) >> 8) as usize & mask;
@@ -2858,7 +2873,27 @@ fn ev_after<E: Ev>(
             let mb = mbase[ci] as usize;
             let mut m = c.m;
             let n = m.len();
-            for i in 0..n {
+            let mut hits = 0usize;
+            if xv == 1 || xv == 2 {
+                for i in 0..n {
+                    if xv == 1 && i + 2 * RPD < n {
+                        mf.pf(m[i + 2 * RPD].key());
+                    }
+                    let g = mb + i;
+                    let k = m[i].key();
+                    if k != 0 && dead[g >> 6].load(Relaxed) & (1u64 << (g & 63)) == 0 {
+                        if xv == 1 && mf.hit(k) {
+                            hits += 1;
+                        }
+                        m[i].set_key(k);
+                        cnt[pbk(k) + 1] += 1;
+                    } else {
+                        m[i].set_key(0);
+                    }
+                }
+            }
+            std::hint::black_box(hits);
+            for i in 0..if xv == 1 || xv == 2 { 0 } else { n } {
                 if i + 2 * RPD < n {
                     mf.pf(m[i + 2 * RPD].key());
                 }
