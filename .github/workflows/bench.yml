@@ -61,20 +61,26 @@ jobs:
           echo "== perf stat"
           sudo env $E $P stat -e task-clock,cycles,instructions,branches,branch-misses,cache-references,cache-misses,page-faults -o $R/stat.txt $W/shop-prof 2> $R/stat.ticks.txt
           cat $R/stat.txt $R/stat.ticks.txt | tee -a $R/stat.all.txt | tail -40
-          for n in 1 2; do
-            EVT=cycles
-            sudo env $E $P record -q -F 1999 -e cycles -g -o $W/perf$n.data $W/shop-prof >/dev/null 2>$R/rec$n.ticks.txt || true
-            if [ ! -s $W/perf$n.data ] || grep -qi 'not supported\|cannot open\|failed' $R/rec$n.ticks.txt; then
-              head -5 $R/rec$n.ticks.txt; EVT=cpu-clock
-              sudo env $E $P record -q -F 1999 -e cpu-clock -g -o $W/perf$n.data $W/shop-prof >/dev/null 2>$R/rec$n.ticks.txt
+          echo "== perf list"; $P list 2>&1 | grep -iE 'branch|cache|LLC|mem_load|retired' | head -60 | tee $R/perflist.txt
+          LC=cache-misses
+          $P list 2>&1 | grep -q 'LLC-load-misses' && LC=cache-misses
+          i=0
+          for EVT in branch-misses $LC; do
+            i=$((i+1)); n=$i
+            PER=5000
+            sudo env $E $P record -q -c $PER -e ${EVT}:pp -g -o $W/perf$n.data $W/shop-prof >/dev/null 2>$R/rec$n.ticks.txt
+            if [ ! -s $W/perf$n.data ] || grep -qi 'not supported\|cannot open\|failed\|invalid' $R/rec$n.ticks.txt; then
+              head -5 $R/rec$n.ticks.txt
+              sudo env $E $P record -q -c $PER -e ${EVT} -g -o $W/perf$n.data $W/shop-prof >/dev/null 2>$R/rec$n.ticks.txt
+              echo "event run$n: $EVT (no pp) period $PER" | tee -a $R/machine.txt
+            else
+              echo "event run$n: ${EVT}:pp period $PER" | tee -a $R/machine.txt
             fi
-            echo "event run$n: $EVT" | tee -a $R/machine.txt
           done
           sudo chmod a+r $W/perf*.data
           for n in 1 2; do
             sudo $P report -i $W/perf$n.data --stdio -n --no-children -g none --sort dso,symbol 2>/dev/null | grep -v '^#' | grep -v '^$' | head -60 > $R/overall$n.self.txt
-            sudo $P report -i $W/perf$n.data --stdio -n --no-children -g none --sort srcline 2>/dev/null | grep -v '^#' | grep -v '^$' | head -60 > $R/overall$n.srcline.txt
-            sudo $P report -i $W/perf$n.data --stdio -n --children -g none --sort symbol 2>/dev/null | grep -v '^#' | grep -v '^$' | head -40 > $R/overall$n.children.txt
+            sudo $P report -i $W/perf$n.data --stdio -n --no-children -g none --sort symbol,srcline 2>/dev/null | grep -v '^#' | grep -v '^$' | head -1500 > $R/overall$n.srcline.txt
             sudo $P report -i $W/perf$n.data --stdio -n --no-children -g none --sort comm 2>/dev/null | grep -v '^#' | grep -v '^$' | head -12 > $R/overall$n.comm.txt
           done
           for n in 1 2; do
@@ -83,20 +89,20 @@ jobs:
             grep -E '^\[[0-9.]+s\]' $R/rec$n.ticks.txt > $R/phase$n.ticks.txt
             prev=0.0; i=0
             while IFS= read -r line; do
-              t=$(echo "$line" | sed -E 's/^\[([0-9.]+)s\].*/\1/'); lab=$(echo "$line" | sed -E 's/^\[[0-9.]+s\] *//' | cut -c1-40)
+              t=$(echo "$line" | sed -E 's/^\[([0-9.]+)s\].*//'); lab=$(echo "$line" | sed -E 's/^\[[0-9.]+s\] *//' | cut -c1-40)
               i=$((i+1))
               a=$(echo "$T0 + $prev" | bc -l); b=$(echo "$T0 + $t" | bc -l)
               echo "### run$n phase $i: $prev .. $t s  (ends at: $lab)" >> $R/phases$n.txt
-              sudo $P report -i $W/perf$n.data --stdio -n --no-children -g none --sort symbol --time $a,$b 2>/dev/null | grep -v '^#' | grep -v '^$' | head -18 >> $R/phases$n.txt
+              sudo $P report -i $W/perf$n.data --stdio -n --no-children -g none --sort symbol --time $a,$b 2>/dev/null | grep -v '^#' | grep -v '^$' | head -25 >> $R/phases$n.txt
               prev=$t
             done < $R/phase$n.ticks.txt
           done
           for n in 1 2; do
             sudo $P script -i $W/perf$n.data --no-inline -F time,ip,sym 2>/dev/null | gzip -6 > $R/script$n.txt.gz
           done
-          echo "== done"; ls -l $R; head -70 $R/overall2.self.txt
+          echo "== done"; ls -l $R; head -40 $R/overall1.self.txt; head -40 $R/overall2.self.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: down18-perf
+          name: parse-pmu
           path: /tmp/pf/rep
