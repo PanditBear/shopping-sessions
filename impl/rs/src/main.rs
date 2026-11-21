@@ -1715,7 +1715,7 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
                     2 => true,
                     _ => break 'v,
                 };
-                let mut pv = 0u32;
+                let (mut pv, mut cat) = (0u32, 0u32);
                 if purch {
                     match parse_price(price) {
                         Some(p) => pv = p,
@@ -1725,7 +1725,10 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
                 if ingest.wrapping_sub(t) > DAY {
                     break 'v;
                 }
-                let cat = cx.prod.get_fast(pr, c0).unwrap_or(cx.unknown_cat);
+                // the category only matters for a purchase
+                if purch {
+                    cat = cx.prod.get_fast(pr, c0).unwrap_or(cx.unknown_cat);
+                }
                 let key = match pack6(uid) {
                     Some(k) => k,
                     None => {
@@ -1986,47 +1989,87 @@ fn ev_parse<E: Ev>(ev_chunks: &[B], cx: &EvCtx) -> Vec<EvChunk<E>> {
     ev_chunks.par_iter().map(|&c| ev_chunk_parse(c, cx)).collect()
 }
 
+/// measurement aid: order-sensitive checksum of one parsed chunk, chained on h
+fn hash_chunk<E: Ev>(mut h: u64, r: &EvChunk<E>) -> u64 {
+    let mut add = |x: u64| h = mix(h ^ x).wrapping_add(x);
+    add(r.m.len() as u64);
+    for e in &r.m {
+        add(e.key() ^ (e.rts() << 1));
+        if let Some((p, cat)) = e.pc() {
+            add(p ^ ((cat as u64) << 32));
+        }
+    }
+    for x in &r.d {
+        add(x.eid ^ ((x.ing as u64) << 1) ^ ((x.loc as u64) << 40));
+    }
+    for &x in &r.doff {
+        add(x as u64);
+    }
+    for x in &r.fb {
+        add(x.0 ^ (x.1 as u64) ^ ((x.2 as u64) << 40));
+    }
+    for x in &r.fbn {
+        add(x.0 ^ x.1);
+    }
+    for x in &r.side {
+        add(x.0 as u64 ^ x.1 as u64);
+    }
+    h
+}
+
+/// measurement aid: cycles this thread has run (Windows; 0 elsewhere), unaffected by preemption
+fn thread_cycles() -> u64 {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentThread() -> isize;
+            fn QueryThreadCycleTime(h: isize, c: *mut u64) -> i32;
+        }
+        let mut c = 0u64;
+        // SAFETY: plain Win32 calls on the current thread's pseudo handle
+        unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut c) };
+        c
+    }
+    #[cfg(not(windows))]
+    0
+}
+
 /// measurement aid: event parsing alone, serial (SHOP_PARSE=reps); prints the best time and a
 /// checksum of everything the parse produces
 fn parse_aid<E: Ev>(ev_chunks: &[B], cx: &EvCtx) {
     let reps = std::env::var("SHOP_PARSE").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(3).max(1);
+    if std::env::var_os("SHOP_PARSE_SCAN").is_some() {
+        // the line scanner alone
+        let mut bc = u64::MAX;
+        for rep in 0..reps {
+            let t = std::time::Instant::now();
+            let c0 = thread_cycles();
+            let mut n = 0u64;
+            for &c in ev_chunks {
+                scan7(c, |f| n += (f[0].len() + f[3].len() + f[6].len()) as u64);
+            }
+            bc = bc.min(thread_cycles() - c0);
+            eprintln!("scan rep{} {:.3}s ({})", rep, t.elapsed().as_secs_f64(), n);
+        }
+        eprintln!("parse best 0s sum 0 gcyc {:.4}", bc as f64 / 1e9);
+        return;
+    }
     let mut best = f64::MAX;
     let mut sum = 0u64;
+    let mut bc = u64::MAX;
     for rep in 0..reps {
         let t = std::time::Instant::now();
+        let c0 = thread_cycles();
         let all: Vec<EvChunk<E>> = ev_chunks.iter().map(|&c| ev_chunk_parse(c, cx)).collect();
+        bc = bc.min(thread_cycles() - c0);
         let el = t.elapsed().as_secs_f64();
-        let mut h = 0u64;
-        let mut add = |x: u64| h = mix(h ^ x).wrapping_add(x);
-        for r in &all {
-            add(r.m.len() as u64);
-            for e in &r.m {
-                add(e.key() ^ (e.rts() << 1));
-                if let Some((p, cat)) = e.pc() {
-                    add(p ^ ((cat as u64) << 32));
-                }
-            }
-            for x in &r.d {
-                add(x.eid ^ ((x.ing as u64) << 1) ^ ((x.loc as u64) << 40));
-            }
-            for &x in &r.doff {
-                add(x as u64);
-            }
-            for x in &r.fb {
-                add(x.0 ^ (x.1 as u64) ^ ((x.2 as u64) << 40));
-            }
-            for x in &r.fbn {
-                add(x.0 ^ x.1);
-            }
-            for x in &r.side {
-                add(x.0 as u64 ^ x.1 as u64);
-            }
-        }
+        let h = all.iter().fold(0u64, |h, r| hash_chunk(h, r));
         best = best.min(el);
         sum = h;
         eprintln!("parse rep{} {:.3}s", rep, el);
     }
-    eprintln!("parse best {:.3}s sum {:016x}", best, sum);
+    eprintln!("parse best {:.3}s sum {:016x} gcyc {:.4}", best, sum, bc as f64 / 1e9);
 }
 
 fn fbn_merge<E: Ev>(v: &[EvChunk<E>], names_map: &mut AHashMap<u64, u64>) {
