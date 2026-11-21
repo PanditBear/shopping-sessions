@@ -47,7 +47,7 @@ const CHUNK: usize = 4 << 20;
 // event dedup buckets (by event_id) and person buckets: set once from the input size in `size_buckets`
 static EBB_V: AtomicU32 = AtomicU32::new(11);
 static PBB_V: AtomicU32 = AtomicU32::new(10);
-const EBB_ADD: i32 = 0; // log2 offsets over the size rule
+const EBB_ADD: i32 = -9; // log2 offsets over the size rule
 const PBB_ADD: i32 = 0;
 #[inline(always)]
 fn ebb() -> u32 {
