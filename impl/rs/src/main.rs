@@ -2443,7 +2443,12 @@ fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
     let mut d: Vec<DRec> = Vec::with_capacity(c.len() / 64);
     let (mut fb, mut fbn, mut side) = (vec![], vec![], vec![]);
     let mut tm = now();
-    parse_events(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
+    static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OLD.get_or_init(|| std::env::var_os("SHOP_EVOLD").is_some()) {
+        parse_events(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
+    } else {
+        parse_events_sol(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
+    }
     pt(0, &mut tm);
     let (d, doff) = bucketize(&d, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize);
     pt(1, &mut tm);
