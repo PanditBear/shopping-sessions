@@ -92,6 +92,13 @@ fn prefetch<T>(p: *const T) {
     let _ = p;
 }
 
+/// Input prefetch distance in bytes for the event and click line kernels: SHOP_PFD, default
+/// 1024, 0 turns it off. Read once.
+fn pf_dist() -> usize {
+    static D: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var("SHOP_PFD").ok().and_then(|s| s.parse().ok()).unwrap_or(1024))
+}
+
 // ---------- id keys ----------
 // An id of 1..=10 bytes drawn from [0-9A-Z_a-z] packs exactly into 6-bit codes (order-preserving,
 // left aligned, zero padded): a value below 2^60. Any other id gets a 63-bit hash with bit 63 set,
@@ -1643,7 +1650,12 @@ fn parse_clicks(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: 
     let base = c.as_ptr();
     let mut pos = 0usize;
     let mut sbuf: Vec<[B; 4]> = Vec::new();
+    let pfd = pf_dist();
     while pos + 64 <= len {
+        if pfd != 0 {
+            // a prefetch never faults, so the address may lie past the chunk
+            prefetch(base.wrapping_add(pos + pfd));
+        }
         // SAFETY: pos + 64 <= len
         let p = unsafe { base.add(pos) };
         let (ca, qa, na) = masks64(p);
@@ -3295,7 +3307,13 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
     let base = c.as_ptr();
     let mut pos = 0usize;
     let mut sbuf: Vec<[B; 7]> = Vec::new();
+    let pfd = pf_dist();
     'ln: while pos + 128 <= len {
+        if pfd != 0 {
+            // a prefetch never faults, so the address may lie past the chunk
+            prefetch(base.wrapping_add(pos + pfd));
+            prefetch(base.wrapping_add(pos + pfd + 64));
+        }
         // SAFETY: pos + 128 <= len, and the second window starts at most 64 bytes in
         let p = unsafe { base.add(pos) };
         let (ca, qa, na) = masks64(p);
