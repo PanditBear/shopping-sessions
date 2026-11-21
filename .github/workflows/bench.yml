@@ -91,22 +91,8 @@ jobs:
               prev=$t
             done < $R/phase$n.ticks.txt
           done
-          for n in 2; do
-            T0=$(sudo $P script -i $W/perf$n.data -F time 2>/dev/null | sed -n 1p | tr -d ' :')
-            for sym in memcpy memcmp memset sort_clicks 'ChunksProducer<[u64; 2]>' ZSTD_compressBlock_fast ud_row_group; do
-              echo "##### OVERALL callers of $sym" >> $R/callers$n.txt
-              sudo $P report -i $W/perf$n.data --stdio --no-children --symbol-filter="$sym" -g callee,0.5,callee,function,percent --max-stack 5 --sort symbol 2>/dev/null | grep -v '^#' | grep -v '^$' | cut -c1-200 | head -70 >> $R/callers$n.txt
-            done
-            sed -E 's/^\[([0-9.]+)s\].*/\1/' $R/phase$n.ticks.txt > $W/tk.txt
-            prev=0.0
-            for t in $(cat $W/tk.txt); do
-              a=$(echo "$T0 + $prev" | bc -l); b=$(echo "$T0 + $t" | bc -l)
-              for sym in memcpy memcmp sort_clicks 'ChunksProducer<[u64; 2]>'; do
-                echo "##### WINDOW $prev..$t callers of $sym" >> $R/callers$n.win.txt
-                sudo $P report -i $W/perf$n.data --stdio --no-children --symbol-filter="$sym" -g callee,0.5,callee,function,percent --max-stack 5 --sort symbol --time $a,$b 2>/dev/null | grep -v '^#' | grep -v '^$' | cut -c1-200 | head -40 >> $R/callers$n.win.txt
-              done
-              prev=$t
-            done
+          for n in 1 2; do
+            sudo $P script -i $W/perf$n.data --no-inline -F time,ip,sym 2>/dev/null | gzip -6 > $R/script$n.txt.gz
           done
           echo "== done"; ls -l $R; head -70 $R/overall2.self.txt
       - uses: actions/upload-artifact@v4
