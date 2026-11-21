@@ -22,5 +22,5 @@ for r in "$@"; do
   echo "== $sha ($(git log -1 --format=%s $sha))"; find $W/out-$sha -maxdepth 2 | head -40
   OUTS+=("$W/out-$sha")
 done
-pip install -q pyspark==3.5.3 duckdb polars pyarrow
+python3 -m pip install -q pyspark==3.5.3 duckdb polars pyarrow; java -version 2>&1 | head -1; python3 --version
 python3 pqread.py "${OUTS[@]}"

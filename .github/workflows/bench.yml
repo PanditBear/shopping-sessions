@@ -156,7 +156,11 @@ jobs:
         run: |
           sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends musl-tools
           rustup target add x86_64-unknown-linux-musl
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: pqcheck
         env:
           REFS: ${{ github.event.inputs.pqrefs }}
+          JAVA_HOME: ${{ env.JAVA_HOME_17_X64 }}
         run: bash pqcheck.sh $REFS
