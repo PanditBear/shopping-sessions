@@ -1359,19 +1359,29 @@ fn dg(key: u64) -> usize {
     (mix(key) >> 36) as usize & ((1 << NBK) - 1)
 }
 
-/// Sub-bucket bits. A person bucket is split into 2^SUBB sub-buckets by the top bits of dg, so the
-/// sub-buckets taken in order are the bucket in (dg, key) order; each one is sorted and sessionized
-/// while it is in L2.
-const SUBB: u32 = 2;
-const SUBN: usize = 1 << SUBB;
-/// digits per sub-bucket
-const SDN: usize = 1 << (NBK - SUBB);
-
-/// Index of the sub-bucket of `key` among all PB * SUBN: its person bucket times SUBN plus its sub.
-#[inline(always)]
-fn pbs(key: u64) -> usize {
-    let m = mix(key);
-    (((m >> 20) as usize & (PB - 1)) << SUBB) | ((m >> (36 + NBK - SUBB)) as usize & (SUBN - 1))
+/// Counting-sort pass of `v` into `out` on `dg`. Afterwards cnt[d] is the end of range d.
+fn hk_scatter<T: Copy>(v: &[T], out: &mut Vec<T>, cnt: &mut Vec<u32>, key: impl Fn(&T) -> u64) {
+    let n = v.len();
+    let nb = 1usize << NBK;
+    cnt.clear();
+    cnt.resize(nb + 1, 0);
+    for e in v {
+        cnt[dg(key(e)) + 1] += 1;
+    }
+    for i in 0..nb {
+        cnt[i + 1] += cnt[i];
+    }
+    out.clear();
+    out.reserve(n);
+    {
+        let sp = out.spare_capacity_mut();
+        for e in v {
+            let d = dg(key(e));
+            sp[cnt[d] as usize].write(*e);
+            cnt[d] += 1;
+        }
+    }
+    unsafe { out.set_len(n) };
 }
 
 #[inline(always)]
@@ -1387,46 +1397,29 @@ fn isort_by<T: Copy>(v: &mut [T], less: impl Fn(&T, &T) -> bool) {
     }
 }
 
-/// Sort one sub-bucket by (dg(key), key, ts); equal (key, ts) pairs may end up in any order. `cnt`
-/// holds the count of each of its SDN digits (dg & (SDN - 1)), counted in the gather; `span` bounds
-/// every rts. One scatter pass on the digit into `tmp`, then per range: a range shorter than
-/// RADIX_MIN with few keys is ordered as packed u64s (`pack_sort`), a long one-key range with
-/// `radix_rts`.
-fn sort_evs<E: Ev>(evs: &mut [E], tmp: &mut Vec<E>, cnt: &mut [u32], ks: &mut [u64], span: i64) {
+/// Sort by (dg(key), key, ts); equal (key, ts) pairs may end up in any order. `span` bounds
+/// every rts. A counting pass on the digit, then per range: a range shorter than RADIX_MIN with
+/// few keys is ordered as packed u64s (`pack_sort`), a long one-key range with `radix_rts`.
+fn sort_evs<E: Ev>(evs: &mut [E], tmp: &mut Vec<E>, cnt: &mut Vec<u32>, span: i64) {
     let n = evs.len();
-    if n == 0 {
+    if n < 256 {
+        evs.sort_unstable_by_key(|e| (dg(e.key()), k128(e)));
         return;
     }
-    let mut s = 0u32;
-    for c in cnt.iter_mut() {
-        let x = *c;
-        *c = s;
-        s += x;
-    }
-    tmp.clear();
-    tmp.reserve(n);
-    {
-        let sp = tmp.spare_capacity_mut();
-        for e in evs.iter() {
-            let d = dg(e.key()) & (SDN - 1);
-            sp[cnt[d] as usize].write(*e);
-            cnt[d] += 1;
-        }
-    }
-    unsafe { tmp.set_len(n) };
-    // cnt[d] is now the end of range d; walk the non-empty ranges only
+    hk_scatter(evs, tmp, cnt, |e| e.key());
     let fast = span >= 0 && span < (1i64 << 55);
     let sb = 64 - (span as u64).leading_zeros();
+    let mut ks = vec![0u64; RADIX_MIN];
     let mut st = 0usize;
-    while st < n {
-        let k0 = tmp[st].key();
-        let en = cnt[dg(k0) & (SDN - 1)] as usize;
+    for d in 0..1usize << NBK {
+        let en = cnt[d] as usize;
         let m = en - st;
+        let r = &tmp[st..en];
         if m == 1 {
-            evs[st] = tmp[st];
-        } else {
-            let r = &tmp[st..en];
-            if fast && m < RADIX_MIN && pack_sort(r, &mut evs[st..en], ks, sb) {
+            evs[st] = r[0];
+        } else if m > 1 {
+            let k0 = r[0].key();
+            if fast && m < RADIX_MIN && pack_sort(r, &mut evs[st..en], &mut ks, sb) {
             } else if fast && m >= RADIX_MIN && r.iter().all(|e| e.key() == k0) {
                 radix_rts(&mut tmp[st..en], &mut evs[st..en]);
             } else {
@@ -1540,30 +1533,16 @@ fn click_less(a: &ClickRec, b: &ClickRec) -> bool {
     }
 }
 
-/// Sort clicks by (dg(key), key, ts, click_id bytes). `cnt` holds the count of each digit (1 << NBK
-/// entries, counted in the gather): one scatter pass on the digit into `tmp`, then a small sort per range.
-fn sort_clicks(cl: &mut [ClickRec], tmp: &mut Vec<ClickRec>, cnt: &mut [u32], pk: &mut Vec<u64>) {
+/// Sort clicks by (dg(key), key, ts, click_id bytes): a counting pass on the digit, then a small
+/// sort per range.
+fn sort_clicks(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Vec<u32>) {
     let n = cl.len();
-    if n == 0 {
+    if n < 256 {
+        cl.sort_unstable_by(|a, b| (dg(a.key), a.key, a.ts).cmp(&(dg(b.key), b.key, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid))));
         return;
     }
-    let mut s = 0u32;
-    for c in cnt.iter_mut() {
-        let x = *c;
-        *c = s;
-        s += x;
-    }
-    tmp.clear();
-    tmp.reserve(n);
-    {
-        let sp = tmp.spare_capacity_mut();
-        for c in cl.iter() {
-            let d = dg(c.key);
-            sp[cnt[d] as usize].write(*c);
-            cnt[d] += 1;
-        }
-    }
-    unsafe { tmp.set_len(n) };
+    hk_scatter(cl, tmp, cnt, |c| c.key);
+    let mut pk: Vec<u64> = vec![];
     // walk the non-empty digit ranges only: a bucket holds fewer clicks than there are digits
     let mut st = 0usize;
     while st < n {
@@ -1571,7 +1550,7 @@ fn sort_clicks(cl: &mut [ClickRec], tmp: &mut Vec<ClickRec>, cnt: &mut [u32], pk
         let m = en - st;
         if m == 1 {
             cl[st] = tmp[st];
-        } else if m > 32 && sort_one_clicker(&tmp[st..en], &mut cl[st..en], pk) {
+        } else if m > 32 && sort_one_clicker(&tmp[st..en], &mut cl[st..en], &mut pk) {
         } else if m > 1 {
             let o = &mut cl[st..en];
             o.copy_from_slice(&tmp[st..en]);
@@ -1622,8 +1601,25 @@ fn sort_one_clicker(src: &[ClickRec], out: &mut [ClickRec], pk: &mut Vec<u64>) -
     true
 }
 
-/// Sessionizes the sorted events of one sub-bucket against its sorted clicks.
-fn proc_sorted<E: Ev>(evs: &[E], clicks: &[ClickRec], win: &mut Win, organic: u32, uds: &mut Vec<UD>, cm: &mut CampAcc, base: i64) {
+#[allow(clippy::too_many_arguments)]
+fn process_bucket<E: Ev>(
+    evs: &mut [E],
+    tmp: &mut Vec<E>,
+    cnt: &mut Vec<u32>,
+    clicks: &mut Vec<ClickRec>,
+    ctmp: &mut Vec<ClickRec>,
+    win: &mut Win,
+    organic: u32,
+    uds: &mut Vec<UD>,
+    cm: &mut CampAcc,
+    base: i64,
+    span: i64,
+) {
+    let mut tm = now();
+    sort_evs(evs, tmp, cnt, span);
+    pt(7, &mut tm);
+    sort_clicks(clicks, ctmp, cnt);
+    pt(11, &mut tm);
     let mut ci = 0;
     let mut i = 0;
     let mut day = DayAcc { key: 0, day: 0, sessions: 0, events: 0, rev: 0, cats: vec![] };
@@ -1713,6 +1709,7 @@ fn proc_sorted<E: Ev>(evs: &[E], clicks: &[ClickRec], win: &mut Win, organic: u3
         ci = cj;
         i = j;
     }
+    pt(8, &mut tm);
 }
 
 // ---------- parquet output ----------
@@ -2857,7 +2854,7 @@ fn ev_after<E: Ev>(
         .enumerate()
         .map(|(ci, c)| {
             let mut tm = now();
-            let mut cnt = vec![0u32; PB * SUBN + 1];
+            let mut cnt = vec![0u32; PB + 1];
             let mb = mbase[ci] as usize;
             let mut m = c.m;
             let n = m.len();
@@ -2876,19 +2873,19 @@ fn ev_after<E: Ev>(
                 if k != 0 && dead[g >> 6].load(Relaxed) & (1u64 << (g & 63)) == 0 {
                     let pk = if mf.hit(k) { tab.get(k) } else { k };
                     m[i].set_key(pk);
-                    cnt[pbs(pk) + 1] += 1;
+                    cnt[pbk(pk) + 1] += 1;
                 } else {
                     m[i].set_key(0);
                 }
             }
             pt(4, &mut tm);
-            for p in 0..PB * SUBN {
+            for p in 0..PB {
                 cnt[p + 1] += cnt[p];
             }
-            let tot = cnt[PB * SUBN] as usize;
+            let tot = cnt[PB] as usize;
             let mut out: Vec<E> = Vec::with_capacity(tot);
             {
-                let mut w: Vec<u32> = (0..PB).map(|p| cnt[p * SUBN]).collect();
+                let mut w = cnt.clone();
                 let sp = out.spare_capacity_mut();
                 for e in &m {
                     let k = e.key();
@@ -2917,68 +2914,22 @@ fn ev_after<E: Ev>(
             let mut out = vec![];
             let mut evs: Vec<E> = vec![];
             let mut tmp: Vec<E> = vec![];
-            let mut hist: Vec<u32> = vec![0; 1 << NBK];
-            let mut chist: Vec<u32> = vec![0; 1 << NBK];
-            let mut ks = vec![0u64; RADIX_MIN];
-            let mut pk: Vec<u64> = vec![];
+            let mut cnt: Vec<u32> = vec![];
             let mut cl: Vec<ClickRec> = vec![];
             let mut ctmp: Vec<ClickRec> = vec![];
-            let span = we.wrapping_sub(ws);
             for p in g * per..((g + 1) * per).min(PB) {
                 let mut tm = now();
-                // clicks: one buffer, counting each digit on the way
-                chist.fill(0);
                 cl.clear();
                 for (v, o) in click_out.iter() {
-                    let sl = &v[o[p] as usize..o[p + 1] as usize];
-                    for c in sl {
-                        chist[dg(c.key)] += 1;
-                    }
-                    cl.extend_from_slice(sl);
+                    cl.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
                 }
-                let mut cb = [0usize; SUBN + 1];
-                for s in 0..SUBN {
-                    cb[s + 1] = cb[s] + chist[s * SDN..(s + 1) * SDN].iter().map(|&x| x as usize).sum::<usize>();
-                }
-                // events: each chunk's slice goes into the ranges of its sub-buckets, counting each digit
-                let mut off = [0usize; SUBN + 1];
-                for (_, o) in parts.iter() {
-                    for s in 0..SUBN {
-                        off[s + 1] += (o[p * SUBN + s + 1] - o[p * SUBN + s]) as usize;
-                    }
-                }
-                for s in 0..SUBN {
-                    off[s + 1] += off[s];
-                }
-                let n = off[SUBN];
-                hist.fill(0);
                 evs.clear();
-                evs.reserve(n);
-                {
-                    let mut w = off;
-                    let sp = evs.spare_capacity_mut();
-                    for (v, o) in parts.iter() {
-                        for e in &v[o[p * SUBN] as usize..o[(p + 1) * SUBN] as usize] {
-                            let d = dg(e.key());
-                            let s = d >> (NBK - SUBB);
-                            sp[w[s]].write(*e);
-                            w[s] += 1;
-                            hist[d] += 1;
-                        }
-                    }
+                for (v, o) in parts.iter() {
+                    evs.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
                 }
-                unsafe { evs.set_len(n) };
                 pt(6, &mut tm);
-                sort_clicks(&mut cl, &mut ctmp, &mut chist, &mut pk);
-                pt(11, &mut tm);
                 let mut uds = Vec::new();
-                for s in 0..SUBN {
-                    let ev = &mut evs[off[s]..off[s + 1]];
-                    sort_evs(ev, &mut tmp, &mut hist[s * SDN..(s + 1) * SDN], &mut ks, span);
-                    pt(7, &mut tm);
-                    proc_sorted(ev, &cl[cb[s]..cb[s + 1]], &mut win, ncamp as u32, &mut uds, &mut cm, ws);
-                    pt(8, &mut tm);
-                }
+                process_bucket(&mut evs, &mut tmp, &mut cnt, &mut cl, &mut ctmp, &mut win, ncamp as u32, &mut uds, &mut cm, ws, we.wrapping_sub(ws));
                 out.push(uds);
             }
             (out, cm)
