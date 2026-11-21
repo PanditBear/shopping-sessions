@@ -880,11 +880,13 @@ struct IdTab {
     s: Vec<[u64; 2]>,
     shift: u32,
     mask: usize,
+    /// keys whose person key is not the key itself
+    mov: usize,
 }
 impl IdTab {
     fn with_cap(n: usize) -> Self {
         let cap = (n + n / 2).max(16).next_power_of_two();
-        IdTab { s: vec![[0u64; 2]; cap], shift: 64 - cap.trailing_zeros(), mask: cap - 1 }
+        IdTab { s: vec![[0u64; 2]; cap], shift: 64 - cap.trailing_zeros(), mask: cap - 1, mov: 0 }
     }
     #[inline(always)]
     fn slot(&self, k: u64) -> usize {
@@ -3161,33 +3163,80 @@ fn main() {
                     }
                 }
                 tick(&format!("links inserted {}", idx_key.len()));
+                // union by index: the larger root goes under the smaller one, so parent[g] <= g always
+                // holds (path halving keeps it too)
                 for (a, b) in edges {
                     let ra = find(&mut parent, a);
                     let rb = find(&mut parent, b);
-                    if ra != rb {
+                    if ra < rb {
+                        parent[rb as usize] = ra;
+                    } else if rb < ra {
                         parent[ra as usize] = rb;
                     }
                 }
+                tick("links union");
                 let nl = idx_key.len();
-                let mut best: Vec<u32> = (0..nl as u32).collect();
+                // one forward pass sets every entry to its root: parent[g] <= g and lower entries are final
+                let mut root = parent;
                 for g in 0..nl {
-                    let r = find(&mut parent, g as u32) as usize;
-                    let (kg, kb) = (idx_key[g], idx_key[best[r] as usize]);
-                    let less = if kg & HBIT == 0 && kb & HBIT == 0 { kg < kb } else { unpack(idx_ref[g]) < unpack(idx_ref[best[r] as usize]) };
-                    if less {
-                        best[r] = g as u32;
+                    let p = root[g] as usize;
+                    root[g] = root[p];
+                }
+                // smallest id of each component as [key, index] at its root; the root is the component's
+                // lowest index, so it comes before every other member
+                let mut bk: Vec<[u64; 2]> = vec![[0u64; 2]; nl];
+                for g in 0..nl {
+                    if g + RPD < nl {
+                        prefetch(bk.as_ptr().wrapping_add(root[g + RPD] as usize));
+                    }
+                    let r = root[g] as usize;
+                    let kg = idx_key[g];
+                    if r == g {
+                        bk[g] = [kg, g as u64];
+                    } else {
+                        let [kb, b] = bk[r];
+                        let less = if kg & HBIT == 0 && kb & HBIT == 0 { kg < kb } else { unpack(idx_ref[g]) < unpack(idx_ref[b as usize]) };
+                        if less {
+                            bk[r] = [kg, g as u64];
+                        }
                     }
                 }
-                let mut ft = IdTab::with_cap(nl);
-                for g in 0..nl {
-                    let b = best[find(&mut parent, g as u32) as usize] as usize;
-                    let pk = idx_key[b];
-                    ft.get_or_insert(idx_key[g], pk);
-                    if pk & HBIT != 0 && b == g {
-                        names_map.insert(pk, idx_ref[b]);
+                tick("links best");
+                let mut nroot = 0usize;
+                for r in 0..nl {
+                    if root[r] as usize == r {
+                        nroot += 1;
+                        let [pk, b] = bk[r];
+                        if pk & HBIT != 0 {
+                            names_map.insert(pk, idx_ref[b as usize]);
+                        }
                     }
                 }
-                ft
+                // the insert table becomes the id table in place: a slot's index turns into its person key
+                {
+                    let (root, bk) = (&root[..], &bk[..]);
+                    t.s.par_chunks_mut(1 << 14).for_each(|c| {
+                        let n = c.len();
+                        for i in 0..n {
+                            if i + 2 * PFD < n {
+                                prefetch(root.as_ptr().wrapping_add(c[i + 2 * PFD][1] as usize));
+                            }
+                            if i + PFD < n {
+                                let e = c[i + PFD];
+                                if e[0] != 0 {
+                                    prefetch(bk.as_ptr().wrapping_add(root[e[1] as usize] as usize));
+                                }
+                            }
+                            let e = &mut c[i];
+                            if e[0] != 0 {
+                                e[1] = bk[root[e[1] as usize] as usize][0];
+                            }
+                        }
+                    });
+                }
+                t.mov = nl - nroot;
+                tick(&format!("links table movers {} pairs {}", t.mov, occ / 2));
+                t
             };
             drop(link_pairs);
             tick("links done");
