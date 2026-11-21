@@ -2734,6 +2734,34 @@ struct EvChunk<E> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct DLine([u64; 8]);
+
+// (slots whose event_id equals k, free slots) of a dedup table line, as 4-bit masks
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn line4(l: &DLine, k: u64) -> (u32, u32) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let v = _mm256_load_si256(l.0.as_ptr() as *const __m256i);
+        let eq = _mm256_cmpeq_epi64(v, _mm256_set1_epi64x(k as i64));
+        let z = _mm256_cmpeq_epi64(v, _mm256_setzero_si256());
+        (_mm256_movemask_pd(_mm256_castsi256_pd(eq)) as u32, _mm256_movemask_pd(_mm256_castsi256_pd(z)) as u32)
+    }
+}
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+fn line4(l: &DLine, k: u64) -> (u32, u32) {
+    let mut eq = 0;
+    let mut z = 0;
+    for j in 0..4 {
+        eq |= ((l.0[j] == k) as u32) << j;
+        z |= ((l.0[j] == 0) as u32) << j;
+    }
+    (eq, z)
+}
+
 fn ev_after<E: Ev>(
     mut ev_out: Vec<EvChunk<E>>,
     tab: &IdTab,
@@ -2780,42 +2808,48 @@ fn ev_after<E: Ev>(
                     let mut tm = now();
                     let totals: [usize; DDG] =
                         std::array::from_fn(|i| ev_out.iter().map(|c| (c.doff[g * DDG + i + 1] - c.doff[g * DDG + i]) as usize).sum());
-                    let maxcap = (totals.iter().max().unwrap() * 2).max(16).next_power_of_two();
-                    // slot: (event_id, ingest key << 32 | global index of the current winner)
-                    let mut tbuf: Vec<[u64; 2]> = vec![[0, 0]; maxcap];
+                    let maxl = (totals.iter().max().unwrap() / 2).max(4).next_power_of_two();
+                    // 64-byte lines of 4 slots: event_ids, then (ingest key << 32 | global index of the
+                    // current winner). A line fills in slot order, so a key is absent once a line has a
+                    // free slot; one line holds the probe almost always (load ~45%).
+                    let mut tbuf: Vec<DLine> = vec![DLine([0; 8]); maxl];
                     for (i, &total) in totals.iter().enumerate() {
                         let b = g * DDG + i;
-                        let cap = (total * 2).max(16).next_power_of_two();
-                        let mask = cap - 1;
-                        let t = &mut tbuf[..cap];
+                        let nl = (total / 2).max(4).next_power_of_two();
+                        let lmask = nl - 1;
+                        let t = &mut tbuf[..nl];
                         if i > 0 {
-                            t.fill([0, 0]);
+                            t.fill(DLine([0; 8]));
                         }
                         for (ci, c) in ev_out.iter().enumerate() {
                             let mb = mbase[ci];
                             for r in &c.d[c.doff[b] as usize..c.doff[b + 1] as usize] {
                                 let gi = mb + r.loc;
                                 let pk = ((r.ing as u64) << 32) | gi as u64;
-                                let mut p = (mix(r.eid) >> 8) as usize & mask;
+                                let mut p = (mix(r.eid) >> 8) as usize & lmask;
                                 loop {
-                                    let o = unsafe { t.get_unchecked_mut(p) };
-                                    if o[0] == 0 {
-                                        *o = [r.eid, pk];
-                                        break;
-                                    }
-                                    if o[0] == r.eid {
-                                        let ok = (o[1] >> 32) as u32;
-                                        let og = o[1] as u32;
+                                    let l = unsafe { t.get_unchecked_mut(p) };
+                                    let (meq, mz) = line4(l, r.eid);
+                                    if meq != 0 {
+                                        let j = meq.trailing_zeros() as usize + 4;
+                                        let ok = (l.0[j] >> 32) as u32;
+                                        let og = l.0[j] as u32;
                                         let win = r.ing < ok || (r.ing == ok && side_any && exact(gi, r.ing) < exact(og, ok));
                                         if win {
-                                            o[1] = pk;
+                                            l.0[j] = pk;
                                             kill(og);
                                         } else {
                                             kill(gi);
                                         }
                                         break;
                                     }
-                                    p = (p + 1) & mask;
+                                    if mz != 0 {
+                                        let j = mz.trailing_zeros() as usize;
+                                        l.0[j] = r.eid;
+                                        l.0[j + 4] = pk;
+                                        break;
+                                    }
+                                    p = (p + 1) & lmask;
                                 }
                             }
                         }
