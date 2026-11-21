@@ -1103,32 +1103,57 @@ struct MoverF {
     /// movers of generator-form user IDs by generator person, when the user_id key is known
     g: Option<GpTab>,
 }
+/// The mover filter under construction: `add` takes every id-table entry (key, person key) once,
+/// in any order and from any thread, so it can ride along on a pass that writes the entries.
+struct MoverB {
+    w: Vec<AtomicU64>,
+    nw: usize,
+    gn: usize,
+    key: Option<u64>,
+    ge: Vec<AtomicU64>,
+}
+impl MoverB {
+    fn new(slots: usize, mov: usize, ukey: Option<u64>) -> Self {
+        let nw = (slots / 16).max(1);
+        let w: Vec<AtomicU64> = (0..nw).map(|_| AtomicU64::new(0)).collect();
+        let gn = if ukey.is_some() { 2 * mov + (1 << 16) } else { 0 };
+        let mut ge = std::mem::ManuallyDrop::new(vec![0u64; 2 * gn]);
+        // SAFETY: AtomicU64 has the same size and alignment as u64
+        let ge = unsafe { Vec::from_raw_parts(ge.as_mut_ptr() as *mut AtomicU64, ge.len(), ge.capacity()) };
+        MoverB { w, nw, gn, key: ukey, ge }
+    }
+    #[inline(always)]
+    fn add(&self, k: u64, p: u64) {
+        if k != 0 && k != p {
+            let h = mix(k);
+            self.w[h as usize & (self.nw - 1)].fetch_or(MoverF::bits(h), Relaxed);
+            if let Some(key) = self.key {
+                GpTab::add(&self.ge, self.gn, key, k, p);
+            }
+        }
+    }
+    fn finish(self) -> MoverF {
+        let MoverB { w, nw, gn, key, ge } = self;
+        let mut ge = std::mem::ManuallyDrop::new(ge);
+        // SAFETY: as in `new`
+        let ge = unsafe { Vec::from_raw_parts(ge.as_mut_ptr() as *mut u64, ge.len(), ge.capacity()) };
+        let g = key.map(|key| GpTab { key, n: gn, e: ge });
+        MoverF { w, mask: nw - 1, g }
+    }
+}
 impl MoverF {
+    #[allow(dead_code)]
     fn build(tab: &IdTab) -> Self {
         Self::build_with(tab, UKEYC.get().copied().flatten())
     }
     fn build_with(tab: &IdTab, ukey: Option<u64>) -> Self {
-        let nw = (tab.s.len() / 16).max(1);
-        let w: Vec<AtomicU64> = (0..nw).map(|_| AtomicU64::new(0)).collect();
-        let gn = if ukey.is_some() { 2 * tab.mov + (1 << 16) } else { 0 };
-        let mut ge = vec![0u64; 2 * gn];
-        {
-            // SAFETY: AtomicU64 has the same in-memory representation as u64
-            let ga = unsafe { &*(ge.as_mut_slice() as *mut [u64] as *const [AtomicU64]) };
-            tab.s.par_chunks(1 << 15).for_each(|c| {
-                for e in c {
-                    if e[0] != 0 && e[0] != e[1] {
-                        let h = mix(e[0]);
-                        w[h as usize & (nw - 1)].fetch_or(Self::bits(h), Relaxed);
-                        if let Some(key) = ukey {
-                            GpTab::add(ga, gn, key, e[0], e[1]);
-                        }
-                    }
-                }
-            });
-        }
-        let g = ukey.map(|key| GpTab { key, n: gn, e: ge });
-        MoverF { w, mask: nw - 1, g }
+        let mb = MoverB::new(tab.s.len(), tab.mov, ukey);
+        tab.s.par_chunks(1 << 15).for_each(|c| {
+            for e in c {
+                mb.add(e[0], e[1]);
+            }
+        });
+        mb.finish()
     }
     /// person key of user key k
     #[inline(always)]
@@ -5228,8 +5253,10 @@ fn main() {
     );
 
     // the insert table becomes the id table in place (a slot's index turns into its person key), with the whole pool
+    let mb = MoverB::new(tab.s.len(), nl - nroot, UKEYC.get().copied().flatten());
     {
         let (root, bk) = (&root[..], &bk[..]);
+        let mb = &mb;
         tab.s.par_chunks_mut(1 << 14).for_each(|c| {
             let n = c.len();
             for i in 0..n {
@@ -5245,6 +5272,7 @@ fn main() {
                 let e = &mut c[i];
                 if e[0] != 0 {
                     e[1] = bk[root[e[1] as usize] as usize][0];
+                    mb.add(e[0], e[1]);
                 }
             }
         });
@@ -5256,7 +5284,7 @@ fn main() {
     // clicks
     let click_chunks = all_chunks(&csv_files(&data.join("clicks")), CHUNK);
     let mut tm = now();
-    let mf = MoverF::build(&tab);
+    let mf = mb.finish();
     pt(4, &mut tm);
     let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_chunks
         .par_iter()
