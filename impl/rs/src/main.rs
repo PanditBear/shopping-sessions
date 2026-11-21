@@ -1392,7 +1392,6 @@ fn isort_by<T: Copy>(v: &mut [T], less: impl Fn(&T, &T) -> bool) {
 /// every rts. One scatter pass on the digit into `tmp`, then per range: a range shorter than
 /// RADIX_MIN with few keys is ordered as packed u64s (`pack_sort`), a long one-key range with
 /// `radix_rts`.
-#[inline(never)]
 fn sort_evs<E: Ev>(evs: &mut [E], tmp: &mut Vec<E>, cnt: &mut [u32], ks: &mut [u64], span: i64) {
     let n = evs.len();
     if n == 0 {
@@ -1543,7 +1542,6 @@ fn click_less(a: &ClickRec, b: &ClickRec) -> bool {
 
 /// Sort clicks by (dg(key), key, ts, click_id bytes). `cnt` holds the count of each digit (1 << NBK
 /// entries, counted in the gather): one scatter pass on the digit into `tmp`, then a small sort per range.
-#[inline(never)]
 fn sort_clicks(cl: &mut [ClickRec], tmp: &mut Vec<ClickRec>, cnt: &mut [u32], pk: &mut Vec<u64>) {
     let n = cl.len();
     if n == 0 {
@@ -1625,7 +1623,6 @@ fn sort_one_clicker(src: &[ClickRec], out: &mut [ClickRec], pk: &mut Vec<u64>) -
 }
 
 /// Sessionizes the sorted events of one sub-bucket against its sorted clicks.
-#[inline(never)]
 fn proc_sorted<E: Ev>(evs: &[E], clicks: &[ClickRec], win: &mut Win, organic: u32, uds: &mut Vec<UD>, cm: &mut CampAcc, base: i64) {
     let mut ci = 0;
     let mut i = 0;
