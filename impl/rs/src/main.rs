@@ -1455,10 +1455,6 @@ fn parse_clicks(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: 
     let base = c.as_ptr();
     let mut pos = 0usize;
     let mut sbuf: Vec<[B; 4]> = Vec::new();
-    // campaign lookup state for the fast path (same result as `camp.get_fast2`)
-    let cp2 = camp.prefix.len() == 2;
-    let cpx = if cp2 { u16::from_le_bytes([camp.prefix[0], camp.prefix[1]]) } else { 0 };
-    let carr = camp.arr.as_slice();
     while pos + 64 <= len {
         // SAFETY: pos + 64 <= len
         let p = unsafe { base.add(pos) };
@@ -1487,27 +1483,7 @@ fn parse_clicks(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: 
                 continue;
             }
             let (pm, nm) = fld(e1 + 1, e2);
-            // SAFETY: nm >= 3 puts pm..pm + 3 inside the window, and pm + nm >= lo + 8 puts the
-            // 8 bytes ending at pm + nm inside the chunk
-            let cf = if cp2
-                && nm.wrapping_sub(3) < 8
-                && pm as usize + nm >= lo + 8
-                && unsafe { std::ptr::read_unaligned(pm as *const u16) } == cpx
-                && unsafe { *pm.add(2) } != b'0'
-            {
-                let w = unsafe { std::ptr::read_unaligned(pm.add(nm).sub(8) as *const u64) };
-                let low = (u64::MAX >> (8 * (nm - 2) as u32 - 1)) >> 1;
-                let w2 = (w & !low) | (h8(b'0') & low);
-                let v = parse8(w2) as usize;
-                if dig8(w2) && v < (1 << 24) {
-                    Some(carr.get(v).copied().filter(|&x| x != u32::MAX))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            let Some(ci) = cf.unwrap_or_else(|| camp.get(sl(pm, nm))) else { continue };
+            let Some(ci) = camp.get_fast2(sl(pm, nm), lo) else { continue };
             let (pt, nt) = fld(e2 + 1, l);
             // SAFETY (ldp, day_get, hms, ts25): a 20- or 25-byte field lies inside the window.
             // ts13: the time is the fourth field and both ids are not empty, so the 3 bytes
