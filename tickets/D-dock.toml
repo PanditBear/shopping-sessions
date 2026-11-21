@@ -1,0 +1,4 @@
+id = "D-dock"
+files = ["Dockerfile"]
+why = "Scorer runs the image's CMD with no arguments (kit README): use CMD, like the starters"
+created = "2026-11-20 18:41:36"
