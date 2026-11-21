@@ -1,0 +1,30 @@
+name: bench (linux, scorer docker flags)
+on:
+  push:
+    branches: [bench]
+  workflow_dispatch:
+    inputs:
+      refs:
+        description: "commits or branches to compare, space separated"
+        required: true
+      runs:
+        description: "timed runs per ref"
+        default: "5"
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: bench
+      - name: toolchain
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends musl-tools bc
+          rustup target add x86_64-unknown-linux-musl
+      - name: bench
+        env:
+          RUNS: ${{ github.event.inputs.runs || '5' }}
+          REFS: ${{ github.event.inputs.refs || '98cdde8 af124c1 1698b09' }}
+        run: bash bench.sh $REFS
