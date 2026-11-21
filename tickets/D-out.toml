@@ -1,0 +1,4 @@
+id = "D-out"
+files = ["impl/rs/src/main.rs"]
+why = "post-exit writeback scales with output bytes: dictionary-encode output columns except user_id (60M output 274 -> 108 MB). CI 60M A/B same binary: wall 5.885 -> 5.654 s (7763), 7.154 -> 6.791 s (8370C); exit tail 0.46-0.51 -> 0.10-0.12 s; 20M neutral (1.927 -> 1.949). user_id dictionary or DELTA_BYTE_ARRAY cost more write time than they save."
+created = "2026-11-20 22:27:00"
