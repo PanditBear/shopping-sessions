@@ -310,6 +310,150 @@ fn scan<const N: usize>(chunk: B, mut f: impl FnMut(&[B; N])) {
     }
 }
 
+/// Bytes per block of `scan_batch` (a multiple of 64): small enough that a block stays in L1
+/// between the mask pass and the field pass.
+const SB: usize = 8192;
+
+/// Same lines and fields as `scan` (same dialect, same order), handed to `f` one block at a time.
+/// One pass writes separator and newline positions into arrays, a second walks the lines. A line
+/// is well formed when its N-th separator is its newline and its quote count equals twice its
+/// quoted fields. Lines longer than a block, and a last line with no newline, go to `scan`.
+#[inline(always)]
+fn scan_batch<const N: usize>(chunk: B, mut f: impl FnMut(&[[B; N]])) {
+    let len = chunk.len();
+    let base = chunk.as_ptr();
+    let mut pp: Vec<u32> = vec![0; SB + 64 + N];
+    let mut ll: Vec<u32> = vec![0; SB + 64];
+    let mut bat: Vec<[B; N]> = vec![[&[][..]; N]; SB / 2 + 1];
+    let mut qmv = [0u64; SB / 64];
+    let mut qcv = [0u32; SB / 64];
+    let mut tmp = [0u8; 64];
+    let mut pos = 0usize;
+    while pos < len {
+        let last = pos + SB >= len;
+        let end = if last { len } else { pos + SB };
+        let ng = (end - pos + 63) / 64;
+        let (mut np, mut nl, mut qacc) = (0usize, 0usize, 0u32);
+        for g in 0..ng {
+            let gp = pos + 64 * g;
+            let p = if gp + 64 <= len {
+                unsafe { base.add(gp) }
+            } else {
+                tmp = [0u8; 64];
+                tmp[..len - gp].copy_from_slice(&chunk[gp..]);
+                tmp.as_ptr()
+            };
+            let (cm, qm, nm) = masks64(p);
+            qmv[g] = qm;
+            qcv[g] = qacc;
+            qacc += qm.count_ones();
+            let off = (64 * g) as u32;
+            let mut s = cm | nm;
+            let cnt = s.count_ones() as usize;
+            // SAFETY: pp has SB + 64 + N slots and np + cnt <= 64 * (g + 1) <= SB
+            unsafe {
+                let d = pp.as_mut_ptr().add(np);
+                for i in 0..8 {
+                    *d.add(i) = off + s.trailing_zeros();
+                    s &= s.wrapping_sub(1);
+                }
+                if cnt > 8 {
+                    let mut i = 8;
+                    while s != 0 {
+                        *d.add(i) = off + s.trailing_zeros();
+                        s &= s - 1;
+                        i += 1;
+                    }
+                }
+            }
+            np += cnt;
+            let mut t = nm;
+            let c2 = t.count_ones() as usize;
+            // SAFETY: ll has SB + 64 slots and nl + c2 <= 64 * (g + 1) <= SB
+            unsafe {
+                let d = ll.as_mut_ptr().add(nl);
+                *d = off + t.trailing_zeros();
+                t &= t.wrapping_sub(1);
+                *d.add(1) = off + t.trailing_zeros();
+                t &= t.wrapping_sub(1);
+                if c2 > 2 {
+                    let mut i = 2;
+                    while t != 0 {
+                        *d.add(i) = off + t.trailing_zeros();
+                        t &= t - 1;
+                        i += 1;
+                    }
+                }
+            }
+            nl += c2;
+        }
+        for i in 0..N {
+            pp[np + i] = u32::MAX;
+        }
+        let blk = unsafe { base.add(pos) };
+        let mut c = 0usize;
+        let mut ls = 0u32;
+        let mut qprev = 0u32;
+        let mut nb = 0usize;
+        for j in 0..nl {
+            let le = ll[j];
+            let g = (le >> 6) as usize;
+            let qle = qcv[g] + (qmv[g] & ((1u64 << (le & 63)) - 1)).count_ones();
+            if pp[c + N - 1] == le {
+                let mut out: [B; N] = [&[]; N];
+                let mut start = ls;
+                let mut expect = 0u32;
+                for k in 0..N {
+                    let e = pp[c + k];
+                    let flen = e - start;
+                    // SAFETY: start <= e < end; for an empty field both reads hit the separator
+                    let lb = e - (flen != 0) as u32;
+                    let q = (flen >= 2) & unsafe { (*blk.add(start as usize) == b'"') & (*blk.add(lb as usize) == b'"') };
+                    let q = q as u32;
+                    out[k] = unsafe { std::slice::from_raw_parts(blk.add((start + q) as usize), (flen - 2 * q) as usize) };
+                    expect += 2 * q;
+                    start = e + 1;
+                }
+                // SAFETY: a well-formed line takes at least N bytes (N >= 2), so nb <= SB / 2
+                unsafe { *bat.as_mut_ptr().add(nb) = out };
+                nb += (expect == qle - qprev) as usize;
+                c += N;
+            } else {
+                while pp[c] != le {
+                    c += 1;
+                }
+                c += 1;
+            }
+            qprev = qle;
+            ls = le + 1;
+        }
+        if nb > 0 {
+            f(&bat[..nb]);
+        }
+        if last {
+            if pos + (ls as usize) < len {
+                scan::<N>(&chunk[pos + ls as usize..], |l| f(std::slice::from_ref(l)));
+            }
+            break;
+        }
+        if nl == 0 {
+            // a line longer than a block
+            match memchr(b'\n', &chunk[end..]) {
+                Some(i) => {
+                    scan::<N>(&chunk[pos..end + i + 1], |l| f(std::slice::from_ref(l)));
+                    pos = end + i + 1;
+                }
+                None => {
+                    scan::<N>(&chunk[pos..], |l| f(std::slice::from_ref(l)));
+                    break;
+                }
+            }
+            continue;
+        }
+        pos += ls as usize;
+    }
+}
+
 #[inline]
 fn d2(b: &[u8]) -> Option<i64> {
     let (x, y) = (b[0].wrapping_sub(b'0'), b[1].wrapping_sub(b'0'));
@@ -367,6 +511,126 @@ fn parse8(w: u64) -> u64 {
 fn parse_ts(b: &[u8]) -> Option<i64> {
     parse_ts_c(b, &mut TsCache::with_bits(1))
 }
+/// Day number of a validated "YYYY-MM-DD" prefix: the cache-miss path of `ts_iso`.
+#[cold]
+#[inline(never)]
+fn ts_days(b: &[u8]) -> Option<i64> {
+    if b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let y = d2(&b[0..2])? * 100 + d2(&b[2..4])?;
+    let mo = d2(&b[5..7])?;
+    let d = d2(&b[8..10])?;
+    if !(1..=12).contains(&mo) || d < 1 {
+        return None;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let dim = match mo {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+    };
+    if d > dim {
+        return None;
+    }
+    Some(days_from_civil(y, mo, d))
+}
+
+/// `parse_ts_c` for "YYYY-MM-DDTHH:MM:SSZ" (n == 20) or "...+HH:MM" (n == 25); the caller
+/// checks the length and byte 19.
+#[inline(always)]
+fn ts_iso(b: &[u8], c: &mut TsCache) -> Option<i64> {
+    let n = b.len();
+    if b[10] != b'T' {
+        return None;
+    }
+    let t = ld8(b, 11);
+    let t2 = t ^ 0x00000A00000A0000;
+    if (t & 0x0000FF0000FF0000) != 0x00003A00003A0000 || !dig8(t2) {
+        return None;
+    }
+    let v = t2.wrapping_sub(h8(0x30));
+    let v = v.wrapping_mul(10).wrapping_add(v >> 8);
+    let (h, mi, s) = ((v & 0xFF) as i64, ((v >> 24) & 0xFF) as i64, ((v >> 48) & 0xFF) as i64);
+    if h > 23 || mi > 59 || s > 59 {
+        return None;
+    }
+    let days;
+    let p8 = ld8(b, 0);
+    let tag2 = u16::from_le_bytes([b[8], b[9]]) as u32 | 0x1_0000;
+    let hi = ((p8 ^ ((tag2 as u64) << 40)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> c.sh) as usize;
+    let ent = &mut c.ents[hi];
+    if ent.p8 == p8 && ent.tag2 == tag2 {
+        days = ent.days as i64;
+    } else {
+        days = ts_days(b)?;
+        if days == days as i32 as i64 {
+            *ent = TsEnt { p8, tag2, days: days as i32 };
+        }
+    }
+    let mut off = 0i64;
+    if n == 25 {
+        if b[22] != b':' {
+            return None;
+        }
+        let oh = d2(&b[20..22])?;
+        let om = d2(&b[23..25])?;
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        off = (oh * 60 + om) * 60_000;
+        if b[19] == b'-' {
+            off = -off;
+        }
+    }
+    Some(days * DAY + ((h * 60 + mi) * 60 + s) * 1000 - off)
+}
+
+/// `parse_ts_c` for an all-digit value of 9..=16 bytes; the caller checks the length.
+#[inline(always)]
+fn ts_num(b: &[u8]) -> Option<i64> {
+    let n = b.len();
+    let sh = 8 * (16 - n) as u32;
+    let hw = (ld8(b, 0) << sh) | (h8(0x30) & ((1u64 << sh) - 1));
+    let lw = ld8(b, n - 8);
+    if !(dig8(hw) & dig8(lw)) {
+        return None;
+    }
+    Some((parse8(hw) * 100_000_000 + parse8(lw)) as i64)
+}
+
+/// Same result as `parse_ts_c`, with the two common shapes inlined.
+#[inline(always)]
+fn ts_fast(b: &[u8], c: &mut TsCache) -> Option<i64> {
+    let n = b.len();
+    if n == 20 && b[19] == b'Z' {
+        ts_iso(b, c)
+    } else if n == 13 {
+        ts_num(b)
+    } else {
+        parse_ts_c(b, c)
+    }
+}
+
+/// 1 for "view" or "cart", 2 for "purchase", 0 otherwise.
+#[inline(always)]
+fn et_code(b: &[u8]) -> u32 {
+    match b.len() {
+        4 => {
+            let w = u32::from_le_bytes(b[..4].try_into().unwrap());
+            ((w == u32::from_le_bytes(*b"view")) | (w == u32::from_le_bytes(*b"cart"))) as u32
+        }
+        8 => 2 * (ld8(b, 0) == u64::from_le_bytes(*b"purchase")) as u32,
+        _ => 0,
+    }
+}
+
 #[inline]
 fn parse_ts_c(b: &[u8], c: &mut TsCache) -> Option<i64> {
     let n = b.len();
@@ -374,83 +638,10 @@ fn parse_ts_c(b: &[u8], c: &mut TsCache) -> Option<i64> {
         return None;
     }
     if (n == 20 && b[19] == b'Z') || (n == 25 && (b[19] == b'+' || b[19] == b'-')) {
-        if b[10] != b'T' {
-            return None;
-        }
-        let t = ld8(b, 11);
-        let t2 = t ^ 0x00000A00000A0000;
-        if (t & 0x0000FF0000FF0000) != 0x00003A00003A0000 || !dig8(t2) {
-            return None;
-        }
-        let v = t2.wrapping_sub(h8(0x30));
-        let v = v.wrapping_mul(10).wrapping_add(v >> 8);
-        let (h, mi, s) = ((v & 0xFF) as i64, ((v >> 24) & 0xFF) as i64, ((v >> 48) & 0xFF) as i64);
-        if h > 23 || mi > 59 || s > 59 {
-            return None;
-        }
-        let days;
-        let p8 = ld8(b, 0);
-        let tag2 = u16::from_le_bytes([b[8], b[9]]) as u32 | 0x1_0000;
-        let hi = ((p8 ^ ((tag2 as u64) << 40)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> c.sh) as usize;
-        let ent = &mut c.ents[hi];
-        if ent.p8 == p8 && ent.tag2 == tag2 {
-            days = ent.days as i64;
-        } else {
-            if b[4] != b'-' || b[7] != b'-' {
-                return None;
-            }
-            let y = d2(&b[0..2])? * 100 + d2(&b[2..4])?;
-            let mo = d2(&b[5..7])?;
-            let d = d2(&b[8..10])?;
-            if !(1..=12).contains(&mo) || d < 1 {
-                return None;
-            }
-            let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-            let dim = match mo {
-                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-                4 | 6 | 9 | 11 => 30,
-                _ => {
-                    if leap {
-                        29
-                    } else {
-                        28
-                    }
-                }
-            };
-            if d > dim {
-                return None;
-            }
-            days = days_from_civil(y, mo, d);
-            if days == days as i32 as i64 {
-                *ent = TsEnt { p8, tag2, days: days as i32 };
-            }
-        }
-        let mut off = 0i64;
-        if n == 25 {
-            if b[22] != b':' {
-                return None;
-            }
-            let oh = d2(&b[20..22])?;
-            let om = d2(&b[23..25])?;
-            if oh > 23 || om > 59 {
-                return None;
-            }
-            off = (oh * 60 + om) * 60_000;
-            if b[19] == b'-' {
-                off = -off;
-            }
-        }
-        return Some(days * DAY + ((h * 60 + mi) * 60 + s) * 1000 - off);
+        return ts_iso(b, c);
     }
-    // F3: digits only
     if (9..=16).contains(&n) {
-        let sh = 8 * (16 - n) as u32;
-        let hw = (ld8(b, 0) << sh) | (h8(0x30) & ((1u64 << sh) - 1));
-        let lw = ld8(b, n - 8);
-        if !(dig8(hw) & dig8(lw)) {
-            return None;
-        }
-        return Some((parse8(hw) * 100_000_000 + parse8(lw)) as i64);
+        return ts_num(b);
     }
     if n <= 18 {
         let mut v: u64 = 0;
@@ -644,6 +835,27 @@ impl IdLookup {
                 }
             }
         }
+    }
+    /// Same result as `get`; `lo` is the lowest readable address at or before `b` (a one-byte
+    /// prefix and up to 8 digits are read as one word ending at the end of `b`).
+    #[inline(always)]
+    fn get_fast(&self, b: B, lo: usize) -> Option<u32> {
+        let n = b.len();
+        let p = b.as_ptr() as usize;
+        if self.prefix.len() == 1 && (2..=9).contains(&n) && p + n >= lo + 8 && b[0] == self.prefix[0] && b[1] != b'0' {
+            // SAFETY: [p + n - 8, p + n) lies inside the chunk that starts at lo
+            let w = unsafe { std::ptr::read_unaligned((p + n - 8) as *const u64) };
+            let d = (n - 1) as u32;
+            let low = (u64::MAX >> (8 * d - 1)) >> 1;
+            let w2 = (w & !low) | (h8(b'0') & low);
+            if dig8(w2) {
+                let v = parse8(w2) as usize;
+                if v < (1 << 24) {
+                    return self.arr.get(v).copied().filter(|&x| x != u32::MAX);
+                }
+            }
+        }
+        self.get(b)
     }
 }
 
@@ -1448,55 +1660,58 @@ struct EvCtx<'a> {
 fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>) {
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
-    scan::<7>(c, |&[eid, uid, ts, ing, et, pr, price]| {
-        if eid.is_empty() {
-            return;
-        }
-        let ingest = parse_ts_c(ing, &mut tci).unwrap_or(i64::MAX);
-        let mut r = E::nil();
-        'v: {
-            if uid.is_empty() || pr.is_empty() {
-                break 'v;
+    let c0 = c.as_ptr() as usize;
+    scan_batch::<7>(c, |lines| {
+        for &[eid, uid, ts, ing, et, pr, price] in lines {
+            if eid.is_empty() {
+                continue;
             }
-            let Some(t) = parse_ts_c(ts, &mut tct) else { break 'v };
-            if t < cx.ws || t >= cx.we {
-                break 'v;
-            }
-            let purch = match et {
-                b"view" | b"cart" => false,
-                b"purchase" => true,
-                _ => break 'v,
-            };
-            let mut pv = 0u32;
-            if purch {
-                match parse_price(price) {
-                    Some(p) => pv = p,
-                    None => break 'v,
+            let ingest = ts_fast(ing, &mut tci).unwrap_or(i64::MAX);
+            let mut r = E::nil();
+            'v: {
+                if uid.is_empty() || pr.is_empty() {
+                    break 'v;
                 }
-            }
-            if ingest.wrapping_sub(t) > DAY {
-                break 'v;
-            }
-            let cat = cx.prod.get(pr).unwrap_or(cx.unknown_cat);
-            let key = match pack6(uid) {
-                Some(k) => k,
-                None => {
-                    let k = cx.rs.hash_one(uid) | HBIT;
-                    fbn.push((k, pack(uid)));
-                    k
+                let Some(t) = ts_fast(ts, &mut tct) else { break 'v };
+                if t < cx.ws || t >= cx.we {
+                    break 'v;
                 }
-            };
-            r = E::mk(key, (t - cx.ws) as u64, pv, cat);
-        }
-        let loc = m.len() as u32;
-        m.push(r);
-        let (ik, exact) = ing32(ingest, cx.ibase);
-        if !exact {
-            side.push((loc, ingest));
-        }
-        match pack6(eid) {
-            Some(k) => d.push(DRec { eid: k, ing: ik, loc }),
-            None => fb.push((pack(eid), ingest, loc)),
+                let purch = match et_code(et) {
+                    1 => false,
+                    2 => true,
+                    _ => break 'v,
+                };
+                let mut pv = 0u32;
+                if purch {
+                    match parse_price(price) {
+                        Some(p) => pv = p,
+                        None => break 'v,
+                    }
+                }
+                if ingest.wrapping_sub(t) > DAY {
+                    break 'v;
+                }
+                let cat = cx.prod.get_fast(pr, c0).unwrap_or(cx.unknown_cat);
+                let key = match pack6(uid) {
+                    Some(k) => k,
+                    None => {
+                        let k = cx.rs.hash_one(uid) | HBIT;
+                        fbn.push((k, pack(uid)));
+                        k
+                    }
+                };
+                r = E::mk(key, (t - cx.ws) as u64, pv, cat);
+            }
+            let loc = m.len() as u32;
+            m.push(r);
+            let (ik, exact) = ing32(ingest, cx.ibase);
+            if !exact {
+                side.push((loc, ingest));
+            }
+            match pack6(eid) {
+                Some(k) => d.push(DRec { eid: k, ing: ik, loc }),
+                None => fb.push((pack(eid), ingest, loc)),
+            }
         }
     });
 }
