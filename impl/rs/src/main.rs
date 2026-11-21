@@ -3030,6 +3030,7 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names)
     f.out.extend_from_slice(&(t.b.len() as u32).to_le_bytes());
     f.out.extend_from_slice(b"PAR1");
     std::fs::write(path, &f.out).unwrap();
+    out_kick(path);
     pt(12, &mut tm);
 }
 
@@ -3065,6 +3066,30 @@ fn write_campaign_daily(path: &Path, rows: &[(u32, i32, [u64; 4])], names: &[B],
         rg.close().unwrap();
     }
     w.close().unwrap();
+    out_kick(path);
+}
+
+/// Start writeback of a finished output file now (SYNC_FILE_RANGE_WRITE, does not wait). The
+/// container teardown flushes the output filesystem, and that flush waits for every dirty output
+/// page (GHA 20M: about 4 ms per output MB after the process ends); started here, the disk writes
+/// overlap the rest of the output phase and the exit. SHOP_OKICK=off skips it.
+fn out_kick(path: &Path) {
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn sync_file_range(fd: i32, off: i64, n: i64, flags: u32) -> i32;
+        }
+        if std::env::var("SHOP_OKICK").map_or(false, |v| v == "off") {
+            return;
+        }
+        use std::os::fd::AsRawFd;
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+            // SAFETY: plain syscall on an open descriptor; 2 = SYNC_FILE_RANGE_WRITE, whole file
+            unsafe { sync_file_range(f.as_raw_fd(), 0, 0, 2) };
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = path;
 }
 
 // ---------- main ----------
