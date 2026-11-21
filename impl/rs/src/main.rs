@@ -4339,6 +4339,20 @@ fn ev_after_idx<E: Ev>(
                         for b in g * G..((g + 1) * G).min(ndb) {
                             lb.clear();
                             lg.clear();
+                            let bn: usize = ev_out
+                                .iter()
+                                .map(|c| {
+                                    let (sa, _, oa, _) = c.dz.seg(b);
+                                    sa.len() + oa.len()
+                                })
+                                .sum();
+                            lb.reserve(bn);
+                            if dside_any {
+                                lg.reserve(bn);
+                            }
+                            let lbp = lb.as_mut_ptr();
+                            let lgp = lg.as_mut_ptr();
+                            let mut qn = 0usize;
                             for (ci, c) in ev_out.iter().enumerate() {
                                 // each chunk keeps bucket b in its own far-off stretch: fetch the count a few
                                 // chunks ahead and the records of the next chunk but one
@@ -4362,11 +4376,16 @@ fn ev_after_idx<E: Ev>(
                                         if let Some(y) = part.get(j + 16) {
                                             prefetch(t.as_ptr().wrapping_add((y.i as u64 & mask) as usize) as *const u8);
                                         }
-                                        let q = lb.len() as u32;
-                                        lb.push(x.e);
-                                        if dside_any {
-                                            lg.push(((ci as u64) << 32) | (p0 + j) as u64);
+                                        let q = qn as u32;
+                                        // SAFETY: qn < bn <= capacity of lb (and lg when dside_any): bn is the sum of
+                                        // all seg lengths of b, and exactly one record is written per seg record
+                                        unsafe {
+                                            lbp.add(qn).write(x.e);
+                                            if dside_any {
+                                                lgp.add(qn).write(((ci as u64) << 32) | (p0 + j) as u64);
+                                            }
                                         }
+                                        qn += 1;
                                         let pk = ((x.ing as u64) << 32) | q as u64;
                                         // SAFETY: the slot index is masked to span
                                         let o = unsafe { t.get_unchecked_mut((x.i as u64 & mask) as usize) };
@@ -4378,16 +4397,28 @@ fn ev_after_idx<E: Ev>(
                                         if x.ing < ok
                                             || (x.ing == ok
                                                 && dside_any
-                                                && dexact(lg[q as usize], x.ing) < dexact(lg[*o as u32 as usize], ok))
+                                                // SAFETY: q and *o as u32 are < qn and lg[..qn] is written
+                                                && dexact(unsafe { *lgp.add(q as usize) }, x.ing)
+                                                    < dexact(unsafe { *lgp.add(*o as u32 as usize) }, ok))
                                         {
                                             *o = pk;
                                         }
                                     }
                                 }
                             }
+                            // SAFETY: qn records were written to lb (and lg when dside_any), qn <= capacity
+                            unsafe {
+                                lb.set_len(qn);
+                                if dside_any {
+                                    lg.set_len(qn);
+                                }
+                            }
                             pt(2, &mut tm);
                             if !lb.is_empty() {
                                 const PD: usize = 16;
+                                em.reserve(lb.len());
+                                let emp = em.as_mut_ptr();
+                                let mut en = em.len();
                                 let tl = t.len();
                                 for j in 0..tl {
                                     if j + PD < tl {
@@ -4405,21 +4436,26 @@ fn ev_after_idx<E: Ev>(
                                             let pk = pk_of(&mut pc, k, tab, mf);
                                             e.set_key(pk);
                                             let ts = e.rts();
-                                            if pk != rk || em.len() == rs {
-                                                if em.len() > rs {
-                                                    ds.push(RunD::new(rk, rs, em.len() - rs, rok));
+                                            if pk != rk || en == rs {
+                                                if en > rs {
+                                                    ds.push(RunD::new(rk, rs, en - rs, rok));
                                                 }
                                                 rk = pk;
-                                                rs = em.len();
+                                                rs = en;
                                                 rok = true;
                                             } else {
                                                 rok &= ts >= lts;
                                             }
                                             lts = ts;
-                                            em.push(e);
+                                            // SAFETY: en < em.len() at bucket start + lb.len() <= capacity (reserved
+                                            // above), and at most one write per lb record
+                                            unsafe { emp.add(en).write(e) };
+                                            en += 1;
                                         }
                                     }
                                 }
+                                // SAFETY: en - old len records were written, en <= capacity
+                                unsafe { em.set_len(en) };
                             }
                             pt(4, &mut tm);
                         }
