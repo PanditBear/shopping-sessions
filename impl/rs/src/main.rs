@@ -2142,6 +2142,9 @@ fn sort_clicks(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Vec<u3
         cl.sort_unstable_by(|a, b| (dg(a.key), a.key, a.ts).cmp(&(dg(b.key), b.key, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid))));
         return;
     }
+    if ck_rdx() && sort_clicks_rdx(cl, tmp, cnt) {
+        return;
+    }
     hk_scatter(cl, tmp, cnt, |c| c.key);
     let mut pk: Vec<u64> = vec![];
     // walk the non-empty digit ranges only: a bucket holds fewer clicks than there are digits
@@ -2163,6 +2166,128 @@ fn sort_clicks(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Vec<u3
         }
         st = en;
     }
+}
+
+fn ck_rdx() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("SHOP_CKRDX").map(|v| v != "0").unwrap_or(true))
+}
+
+thread_local! {
+    static CK_KEYS: std::cell::RefCell<(Vec<u64>, Vec<u64>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// Bucket-wide click sort without per-range sorts: (dg, ts quantum, index) packed into u64s are
+/// LSD radix sorted (two 11-bit ts passes, one digit pass), the records are gathered once, then
+/// each digit range that is not yet in (key, ts, click_id) order (several keys, or two clicks in
+/// one quantum) is sorted. Returns false (and leaves `cl` alone) when the fields do not fit.
+fn sort_clicks_rdx(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Vec<u32>) -> bool {
+    let n = cl.len();
+    let ib = 64 - ((n - 1) as u64).leading_zeros();
+    if ib + 22 + NBK > 64 {
+        return false;
+    }
+    let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+    for c in cl.iter() {
+        lo = lo.min(c.ts);
+        hi = hi.max(c.ts);
+    }
+    let Some(span) = hi.checked_sub(lo) else { return false };
+    let q = (64 - (span as u64).leading_zeros()).saturating_sub(22);
+    let (sht, shd) = (ib, ib + 22);
+    const H1: usize = 2048;
+    const HD: usize = 4096;
+    cnt.clear();
+    cnt.resize(HD + (1 << NBK), 0);
+    CK_KEYS.with(|kk| {
+        let (ka, kb) = &mut *kk.borrow_mut();
+        ka.clear();
+        ka.reserve(n);
+        kb.clear();
+        kb.resize(n, 0);
+        for (j, c) in cl.iter().enumerate() {
+            let t = (c.ts.wrapping_sub(lo) as u64) >> q;
+            let d = dg(c.key);
+            ka.push(((d as u64) << shd) | (t << sht) | j as u64);
+            cnt[(t & 2047) as usize] += 1;
+            cnt[H1 + (t >> 11) as usize] += 1;
+            cnt[HD + d] += 1;
+        }
+        let (mut src, mut dst) = (&mut ka[..], &mut kb[..]);
+        for (base, len, sh, mask) in [(0usize, H1, sht, 2047u64), (H1, H1, sht + 11, 2047), (HD, 1usize << NBK, shd, (1u64 << NBK) - 1)] {
+            let h = &mut cnt[base..base + len];
+            if base != HD && h[((src[0] >> sh) & mask) as usize] as usize == n {
+                continue;
+            }
+            let mut s = 0u32;
+            for x in h.iter_mut() {
+                let c = *x;
+                *x = s;
+                s += c;
+            }
+            for &k in src.iter() {
+                let b = ((k >> sh) & mask) as usize;
+                dst[h[b] as usize] = k;
+                h[b] += 1;
+            }
+            std::mem::swap(&mut src, &mut dst);
+        }
+        let im = (1u64 << ib) - 1;
+        tmp.clear();
+        tmp.reserve(n);
+        {
+            let sp = tmp.spare_capacity_mut();
+            for (o, &k) in sp.iter_mut().zip(src.iter()) {
+                o.write(cl[(k & im) as usize]);
+            }
+        }
+        unsafe { tmp.set_len(n) };
+    });
+    std::mem::swap(cl, tmp);
+    // after the digit pass cnt[HD + d] is the end of range d
+    let mut st = 0usize;
+    while st < n {
+        let en = cnt[HD + dg(cl[st].key)] as usize;
+        let r = &mut cl[st..en];
+        let k0 = r[0].key;
+        if r.len() > 1 && !(r.iter().all(|c| c.key == k0) && isort_one(r)) {
+            if r.len() <= 32 {
+                isort_by(r, click_less);
+            } else {
+                r.sort_unstable_by(|a, b| (a.key, a.ts).cmp(&(b.key, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid))));
+            }
+        }
+        st = en;
+    }
+    true
+}
+
+/// Insertion sort of one clicker's clicks (already in ts quantum order) by (ts, click_id bytes).
+/// Gives up after about two moves per click and returns false, leaving `r` a permutation.
+fn isort_one(r: &mut [ClickRec]) -> bool {
+    #[inline(always)]
+    fn less(a: &ClickRec, b: &ClickRec) -> bool {
+        a.ts < b.ts || (a.ts == b.ts && unpack(a.cid) < unpack(b.cid))
+    }
+    let mut budget = 2 * r.len() + 16;
+    for i in 1..r.len() {
+        if !less(&r[i], &r[i - 1]) {
+            continue;
+        }
+        let x = r[i];
+        let mut j = i;
+        while j > 0 && less(&x, &r[j - 1]) {
+            if budget == 0 {
+                r[j] = x;
+                return false;
+            }
+            budget -= 1;
+            r[j] = r[j - 1];
+            j -= 1;
+        }
+        r[j] = x;
+    }
+    true
 }
 
 /// A long digit range is nearly always one heavy clicker. When every click in `src` has the same key,
@@ -6175,5 +6300,69 @@ mod pack_simd_tests {
             quote_case(q, c, end);
         }
         assert!(acc > 1_000_000, "{acc}");
+    }
+}
+
+#[cfg(test)]
+mod ck_sort_tests {
+    use super::*;
+
+    fn rnd(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    fn mk(key: u64, ts: i64, id: B, camp: u32) -> ClickRec {
+        ClickRec { key, ts, cid: pack(id), camp }
+    }
+
+    #[test]
+    fn sort_clicks_matches_reference() {
+        let mut s = 0x1234_5678_9abc_def1u64;
+        let ids: &'static [Vec<u8>] = Vec::leak((0..4000)
+            .map(|_| {
+                let l = 1 + (rnd(&mut s) % 9) as usize;
+                (0..l).map(|_| b"k0a\x00z"[(rnd(&mut s) % 5) as usize]).collect()
+            })
+            .collect::<Vec<Vec<u8>>>());
+        // (clicks, distinct keys, ts span, ts step, one far outlier)
+        let cases: [(usize, u64, i64, i64, bool); 8] = [
+            (300, 3, 2_000_000_000, 1000, false),
+            (5000, 1, 5_000_000, 1000, false),
+            (20000, 500, 2_000_000_000, 1, false),
+            (10000, 1, 1000, 1, true),
+            (3000, 2000, 30_000, 1000, false),
+            (700, 2, 60_000, 1, true),
+            (256, 1, 10, 1, false),
+            (40000, 9000, 1_800_000_000, 1000, false),
+        ];
+        for (ci, &(n, nk, span, step, far)) in cases.iter().enumerate() {
+            let keys: Vec<u64> = (0..nk).map(|_| rnd(&mut s)).collect();
+            let base = if ci % 2 == 0 { 1_830_000_000_000i64 } else { -5_000_000_000 };
+            let mut v: Vec<ClickRec> = (0..n)
+                .map(|j| {
+                    let k = keys[(rnd(&mut s) % nk) as usize];
+                    let t = base + (rnd(&mut s) % (span as u64 / step as u64 + 1)) as i64 * step;
+                    let t = if far && j == n / 2 { base + (1i64 << 40) } else { t };
+                    mk(k, t, &ids[(rnd(&mut s) % ids.len() as u64) as usize], j as u32)
+                })
+                .collect();
+            if ci == 3 {
+                // one clicker, one quantum, reversed: the insertion sort must give up
+                v.sort_by(|a, b| b.ts.cmp(&a.ts));
+            }
+            let mut want = v.clone();
+            want.sort_by(|a, b| (dg(a.key), a.key, a.ts).cmp(&(dg(b.key), b.key, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid))));
+            let f = |v: &[ClickRec]| v.iter().map(|c| (c.key, c.ts, unpack(c.cid).to_vec())).collect::<Vec<_>>();
+            let (mut tmp, mut cnt) = (vec![], vec![]);
+            let mut a = v.clone();
+            sort_clicks(&mut a, &mut tmp, &mut cnt);
+            assert!(f(&a) == f(&want), "sort_clicks case {ci}");
+            let mut b = v.clone();
+            assert!(sort_clicks_rdx(&mut b, &mut tmp, &mut cnt), "rdx fits case {ci}");
+            assert!(f(&b) == f(&want), "sort_clicks_rdx case {ci}");
+        }
     }
 }
