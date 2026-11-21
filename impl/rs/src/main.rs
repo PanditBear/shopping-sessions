@@ -60,7 +60,7 @@ fn mix(k: u64) -> u64 {
     k ^ (k >> 29)
 }
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 static TIMING: AtomicBool = AtomicBool::new(false);
 static PROF: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 const PROF_NAMES: [&str; 13] =
@@ -3824,37 +3824,114 @@ fn ev_after<E: Ev>(
     drop(dead);
     tick("dedup done");
 
-    let ngroups = (rayon::current_num_threads() * 4).clamp(1, PB);
-    let per = PB.div_ceil(ngroups);
-    (0..ngroups)
-        .into_par_iter()
-        .map(|g| {
-            let mut cm = CampAcc::new(ncamp + 1, d0, nd);
-            let mut win = Win { cnt: vec![0; ncamp + 1], pos: vec![0; ncamp + 1], active: vec![] };
-            let mut out = vec![];
-            let mut evs: Vec<E> = vec![];
-            let mut tmp: Vec<E> = vec![];
-            let mut cnt: Vec<u32> = vec![];
-            let mut cl: Vec<ClickRec> = vec![];
-            let mut ctmp: Vec<ClickRec> = vec![];
-            for p in g * per..((g + 1) * per).min(PB) {
-                let mut tm = now();
-                cl.clear();
-                for (v, o) in click_out.iter() {
-                    cl.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
-                }
-                evs.clear();
-                for (v, o) in parts.iter() {
-                    evs.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
-                }
-                pt(6, &mut tm);
-                let mut uds = Vec::new();
-                process_bucket(&mut evs, &mut tmp, &mut cnt, &mut cl, &mut ctmp, &mut win, ncamp as u32, &mut uds, &mut cm, ws, we.wrapping_sub(ws));
-                out.push(uds);
+    let cost = pb_cost(&parts, click_out);
+    lpt_run(&cost, || SsW::new(ncamp, d0, nd), |p, w: &mut SsW<E>| {
+        w.gather(p, &parts, click_out);
+        let mut uds = Vec::new();
+        process_bucket(&mut w.evs, &mut w.tmp, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut uds, &mut w.cm, ws, we.wrapping_sub(ws));
+        w.out.push(uds);
+    })
+    .into_iter()
+    .map(|w| (w.out, w.cm))
+    .collect()
+}
+
+/// Scratch and accumulators of one sessionize worker.
+struct SsW<E> {
+    cm: CampAcc,
+    win: Win,
+    out: Vec<Vec<UD>>,
+    evs: Vec<E>,
+    tmp: Vec<E>,
+    runs: Vec<Run>,
+    cnt: Vec<u32>,
+    cl: Vec<ClickRec>,
+    ctmp: Vec<ClickRec>,
+}
+
+impl<E: Ev> SsW<E> {
+    fn new(ncamp: usize, d0: i64, nd: usize) -> Self {
+        SsW {
+            cm: CampAcc::new(ncamp + 1, d0, nd),
+            win: Win { cnt: vec![0; ncamp + 1], pos: vec![0; ncamp + 1], active: vec![] },
+            out: vec![],
+            evs: vec![],
+            tmp: vec![],
+            runs: vec![],
+            cnt: vec![],
+            cl: vec![],
+            ctmp: vec![],
+        }
+    }
+    /// Collects person bucket p's lines and clicks from every chunk.
+    fn gather(&mut self, p: usize, parts: &[(Vec<E>, Vec<u32>)], click_out: &[(Vec<ClickRec>, Vec<u32>)]) {
+        let mut tm = now();
+        self.cl.clear();
+        for (v, o) in click_out.iter() {
+            self.cl.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
+        }
+        self.evs.clear();
+        for (v, o) in parts.iter() {
+            self.evs.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
+        }
+        pt(6, &mut tm);
+    }
+}
+
+/// Estimated sessionize work of each person bucket: its lines plus twice its clicks (a click
+/// costs about two lines: radix sort plus window upkeep).
+fn pb_cost<E: Sync>(parts: &[(Vec<E>, Vec<u32>)], click_out: &[(Vec<ClickRec>, Vec<u32>)]) -> Vec<u64> {
+    const BLK: usize = 64;
+    let mut cost = vec![0u64; PB];
+    cost.par_chunks_mut(BLK).enumerate().for_each(|(b, c)| {
+        let lo = b * BLK;
+        for (_, o) in parts.iter() {
+            for (i, x) in c.iter_mut().enumerate() {
+                *x += (o[lo + i + 1] - o[lo + i]) as u64;
             }
-            (out, cm)
+        }
+        for (_, o) in click_out.iter() {
+            for (i, x) in c.iter_mut().enumerate() {
+                *x += 2 * (o[lo + i + 1] - o[lo + i]) as u64;
+            }
+        }
+    });
+    cost
+}
+
+/// Runs `f(p, state)` for every partition p (cost[p] = its estimated work) on one worker per pool
+/// thread. The workers pull partitions biggest first from a shared counter (LPT list scheduling):
+/// big partitions start early and the small ones fill the end, so the workers finish nearly
+/// together instead of one static group running alone. Returns every worker's state.
+fn lpt_run<S: Send>(cost: &[u64], init: impl Fn() -> S + Sync, f: impl Fn(usize, &mut S) + Sync) -> Vec<S> {
+    let mut ord: Vec<u32> = (0..cost.len() as u32).collect();
+    ord.sort_unstable_by_key(|&p| (std::cmp::Reverse(cost[p as usize]), p));
+    let next = AtomicUsize::new(0);
+    let nt = rayon::current_num_threads().clamp(1, ord.len().max(1));
+    let t0 = now();
+    let r: Vec<(S, f64)> = (0..nt)
+        .into_par_iter()
+        .with_min_len(1)
+        .with_max_len(1)
+        .map(|_| {
+            let mut s = init();
+            loop {
+                let i = next.fetch_add(1, Relaxed);
+                if i >= ord.len() {
+                    break;
+                }
+                f(ord[i] as usize, &mut s);
+            }
+            (s, t0.map_or(0.0, |t| t.elapsed().as_secs_f64()))
         })
-        .collect()
+        .collect();
+    if t0.is_some() {
+        let mut e: Vec<f64> = r.iter().map(|x| x.1).collect();
+        e.sort_by(f64::total_cmp);
+        let tot: u64 = cost.iter().sum();
+        eprintln!("lpt parts={} workers={nt} cost max={} total={tot} finish first={:.3} last={:.3}", cost.len(), cost.iter().max().unwrap_or(&0), e[0], e[e.len() - 1]);
+    }
+    r.into_iter().map(|x| x.0).collect()
 }
 
 // ---------- dense-index pipeline after the parse ----------
@@ -4151,38 +4228,16 @@ fn ev_after_idx<E: Ev>(
     drop(ev_out);
     tick("dedup done");
 
-    let ngroups = (rayon::current_num_threads() * 4).clamp(1, PB);
-    let per = PB.div_ceil(ngroups);
-    (0..ngroups)
-        .into_par_iter()
-        .map(|g| {
-            let mut cm = CampAcc::new(ncamp + 1, d0, nd);
-            let mut win = Win { cnt: vec![0; ncamp + 1], pos: vec![0; ncamp + 1], active: vec![] };
-            let mut out = vec![];
-            let mut evs: Vec<E> = vec![];
-            let mut tmp: Vec<E> = vec![];
-            let mut runs: Vec<Run> = vec![];
-            let mut cnt: Vec<u32> = vec![];
-            let mut cl: Vec<ClickRec> = vec![];
-            let mut ctmp: Vec<ClickRec> = vec![];
-            for p in g * per..((g + 1) * per).min(PB) {
-                let mut tm = now();
-                cl.clear();
-                for (v, o) in click_out.iter() {
-                    cl.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
-                }
-                evs.clear();
-                for (v, o) in parts.iter() {
-                    evs.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
-                }
-                pt(6, &mut tm);
-                let mut uds = Vec::new();
-                process_runs(&evs, &mut tmp, &mut runs, &mut cnt, &mut cl, &mut ctmp, &mut win, ncamp as u32, &mut uds, &mut cm, ws);
-                out.push(uds);
-            }
-            (out, cm)
-        })
-        .collect()
+    let cost = pb_cost(&parts, click_out);
+    lpt_run(&cost, || SsW::new(ncamp, d0, nd), |p, w: &mut SsW<E>| {
+        w.gather(p, &parts, click_out);
+        let mut uds = Vec::new();
+        process_runs(&w.evs, &mut w.tmp, &mut w.runs, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut uds, &mut w.cm, ws);
+        w.out.push(uds);
+    })
+    .into_iter()
+    .map(|w| (w.out, w.cm))
+    .collect()
 }
 
 /// A stretch of one person's lines in a bucket: digit, person key, start, length, ts sorted.
