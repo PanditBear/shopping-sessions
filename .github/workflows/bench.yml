@@ -74,7 +74,8 @@ jobs:
           rustup target add x86_64-unknown-linux-musl
           sudo apt-get install -y -q --no-install-recommends linux-tools-common "linux-tools-$(uname -r)" \
             || sudo apt-get install -y -q --no-install-recommends linux-tools-common linux-tools-azure || true
-          ls /usr/lib/linux-tools/*/perf || true
+          sudo apt-get install -y -q --no-install-recommends linux-perf || true
+          command -v perf || ls /usr/lib/linux-tools/*/perf || true
       - name: perf
         env:
           SHA: ${{ github.event.inputs.perfsha }}
@@ -84,7 +85,7 @@ jobs:
           set -uo pipefail
           W=/tmp/pf; mkdir -p $W
           echo "== machine"; lscpu | grep -E 'Model name|^CPU\(s\)|Thread|L1d|L2|L3|Hypervisor' | cut -c1-200; free -g | head -2; uname -r
-          P=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1); echo "perf=$P"; [ -n "$P" ] && $P --version
+          P=$(command -v perf || ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1 || true); echo "perf=$P"; $P --version
           sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
           curl -sSfL -o $W/gen.zip https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
           echo "13724cadbac5a99d847e27cea911cd2e338ff972b46c2039da87452011bb101e  $W/gen.zip" | sha256sum -c --quiet
