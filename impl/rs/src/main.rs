@@ -1204,7 +1204,7 @@ struct Line([u64; 8]);
 const WK: usize = 8;
 
 /// slot margin over the expected bucket size, in standard deviations
-const SLK: f64 = 1.0;
+const SLK: f64 = 1.5;
 
 thread_local! {
     /// a parser thread's staging lines, reused from chunk to chunk
