@@ -4989,6 +4989,14 @@ fn main() {
         drop_inputs();
         if std::env::var_os("SHOP_DROPANON").is_some() {
             drop_anon();
+            // allocator metadata lives in the zeroed arenas: skip its exit handlers
+            #[cfg(target_os = "linux")]
+            {
+                extern "C" {
+                    fn _exit(code: i32) -> !;
+                }
+                unsafe { _exit(0) }
+            }
         }
         if timing {
             eprintln!("dropin end {:.3}s", ep() - t);
