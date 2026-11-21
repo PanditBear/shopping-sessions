@@ -61,34 +61,26 @@ jobs:
           echo "== perf stat"
           sudo env $E $P stat -e task-clock,cycles,instructions,branches,branch-misses,cache-references,cache-misses,page-faults -o $R/stat.txt $W/shop-prof 2> $R/stat.ticks.txt
           cat $R/stat.txt $R/stat.ticks.txt | tee -a $R/stat.all.txt | tail -40
-          sudo env $E $P record -q -F 4999 -e cycles -o $W/perf1.data $W/shop-prof >/dev/null 2>$R/rec1.ticks.txt || true
-          sudo env $E $P record -q -F 4999 -e cache-misses -o $W/perf2.data $W/shop-prof >/dev/null 2>$R/rec2.ticks.txt || true
-          sudo env $E $P record -q -F 4999 -e cpu-clock -o $W/perf3.data $W/shop-prof >/dev/null 2>$R/rec3.ticks.txt || true
-          ls -l $W/perf*.data | tee -a $R/machine.txt
+          for n in 1 2; do
+            sudo env $E $P record -q -F 4999 -e cpu-clock -o $W/perf$n.data $W/shop-prof >/dev/null 2>$R/rec$n.ticks.txt || true
+          done
           sudo chmod a+r $W/perf*.data
-          for n in 1 2 3; do
-            [ -s $W/perf$n.data ] || continue
+          rustc --version | tee -a $R/machine.txt
+          cp $(rustc --print sysroot)/lib/rustlib/src/rust/library/core/src/ptr/mod.rs $R/core-ptr-mod.rs 2>/dev/null || echo no-rust-src | tee -a $R/machine.txt
+          for n in 1 2; do
             T0=$(sudo $P script -i $W/perf$n.data -F time 2>/dev/null | sed -n 1p | tr -d ' :')
-            echo "T0=$T0" > $R/phase$n.t0.txt
             grep -E '^\[[0-9.]+s\]' $R/rec$n.ticks.txt > $R/phase$n.ticks.txt
-            sudo $P script -i $W/perf$n.data --no-inline -F tid,time,sym 2>/dev/null | gzip -6 > $R/tidscript$n.txt.gz
+            echo "T0=$T0" > $R/phase$n.t0.txt
+            ta=$(grep 'clicks parsed' $R/rec$n.ticks.txt | sed -E 's/^\[([0-9.]+)s\].*//'); tb=$(grep 'dedup done' $R/rec$n.ticks.txt | sed -E 's/^\[([0-9.]+)s\].*//')
+            tc=$(grep 'links table movers' $R/rec$n.ticks.txt | sed -E 's/^\[([0-9.]+)s\].*//')
+            td=$(grep 'events parsed' $R/rec$n.ticks.txt | sed -E 's/^\[([0-9.]+)s\].*//')
+            sudo $P script -i $W/perf$n.data --time $(echo "$T0 + $ta" | bc -l),$(echo "$T0 + $tb" | bc -l) -F tid,time,sym,srcline 2>/dev/null | gzip -6 > $R/dd-srcline$n.txt.gz
+            sudo $P script -i $W/perf$n.data --time $(echo "$T0 + 0.3" | bc -l),$(echo "$T0 + $td" | bc -l) -F tid,time,sym,srcline 2>/dev/null | gzip -6 > $R/ev-srcline$n.txt.gz
+            sudo $P script -i $W/perf$n.data --no-inline -F tid,time 2>/dev/null | gzip -6 > $R/tidscript$n.txt.gz
           done
-          for n in 1 2; do
-            [ -s $W/perf$n.data ] || continue
-            sudo $P report -i $W/perf$n.data --stdio -n --no-children -g none --sort symbol 2>/dev/null | grep -v '^#' | grep -v '^$' | head -40 > $R/overall$n.self.txt
-            timeout 900 sudo $P report -i $W/perf$n.data --stdio -n --no-children -g none --sort symbol,srcline 2>/dev/null | grep -v '^#' | grep -v '^$' | grep -E 'ev_after_idx|Dz|put|dedup' | head -400 > $R/symsrc$n.txt
-          done
-          for n in 1 2; do
-            [ -s $W/perf$n.data ] || continue
-            timeout 900 sudo $P report -i $W/perf$n.data --stdio -n --no-children -g none --sort srcline 2>/dev/null | grep -v '^#' | grep -v '^$' | head -300 > $R/srcline$n.txt
-          done
-          for sy in $(sudo $P report -i $W/perf1.data --stdio --no-children -g none --sort symbol 2>/dev/null | grep -E 'ev_after_idx|Dz.*put' | head -4 | sed -E 's/^.*\] //' | cut -d' ' -f1 | sort -u | head -4); do
-            echo "annotating $sy" >> $R/machine.txt
-          done
-          sudo $P annotate -i $W/perf1.data --stdio -l --no-source -s "$(sudo $P report -i $W/perf1.data --stdio --no-children -g none --sort symbol 2>/dev/null | grep -E 'ev_after_idx' | head -1 | sed -E 's/^[^]]*\] *//')" 2>/dev/null | head -1500 > $R/annot-dd.txt
-          echo "== done"; ls -l $R; head -50 $R/overall1.self.txt
+          echo "== done"; ls -l $R
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: fuse3pl-perf
+          name: fuse3pl2-perf
           path: /tmp/pf/rep
