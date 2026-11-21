@@ -4316,8 +4316,21 @@ fn ev_after_idx<E: Ev>(
                     .map(|g| {
                         let mut tm = now();
                         let mut t: Vec<u64> = vec![u64::MAX; span];
-                        let mut lb: Vec<E> = Vec::new();
-                        let mut lg: Vec<u64> = Vec::new();
+                        // the largest bucket of the task sizes lb and lg once, so they never regrow
+                        let mx: usize = (g * G..((g + 1) * G).min(ndb))
+                            .map(|b| {
+                                ev_out
+                                    .iter()
+                                    .map(|c| {
+                                        let (sa, _, oa, _) = c.dz.seg(b);
+                                        sa.len() + oa.len()
+                                    })
+                                    .sum::<usize>()
+                            })
+                            .max()
+                            .unwrap_or(0);
+                        let mut lb: Vec<E> = Vec::with_capacity(mx);
+                        let mut lg: Vec<u64> = Vec::with_capacity(if dside_any { mx } else { 0 });
                         // em outlives the task (sessionize reads its runs), so size it once from the
                         // record counts instead of growing it by doubling
                         let ub: usize = (g * G..((g + 1) * G).min(ndb))
