@@ -3402,7 +3402,7 @@ unsafe fn ts25(p: *const u8, ra: u64, rb: u64, rd: i64, c: &mut DayCache) -> Opt
 /// as pointer and length, both ids packed in one vector, ISO times straight to seconds.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
 #[inline(never)]
-fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
+fn parse_events_sol1<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
     use core::arch::x86_64::_bzhi_u64;
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
@@ -3576,6 +3576,339 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
     }
     if pos < len {
         scan::<7>(&c[pos..], |f| ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side, dz));
+    }
+}
+
+/// Lines per block of `parse_events_bat` (SHOP_BATN; 0 = the one-pass kernel).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+fn bat_n() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("SHOP_BATN").ok().and_then(|s| s.parse().ok()).unwrap_or(128).min(4096))
+}
+
+/// Same records, dedup entries and side lists, in the same order, as `parse_events_sol1`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
+    let bn = bat_n();
+    if bn == 0 || c.len() > u32::MAX as usize {
+        parse_events_sol1(c, cx, m, d, fb, fbn, side, dz);
+    } else {
+        parse_events_bat(c, cx, m, d, fb, fbn, side, dz, bn);
+    }
+}
+
+/// One fast-path line of a block: field starts (from the line start) and lengths, and the
+/// values the structure pass already has.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[derive(Clone, Copy, Default)]
+struct BatL {
+    ingest: i64,
+    val: u64,
+    ku: u64,
+    pos: u32,
+    ik: u32,
+    oe: u8,
+    ne: u8,
+    ou: u8,
+    nu: u8,
+    ot: u8,
+    nt: u8,
+    oet: u8,
+    net: u8,
+    op: u8,
+    np: u8,
+    opr: u8,
+    npr: u8,
+    /// 1 event id ok, 2 user key ok, 4 ingest key exact
+    fl: u8,
+}
+
+/// Block buffers of `parse_events_bat`: lines, ingest date keys (a, b, day start), ts values
+/// and ok flags, and the four ts-shape lists (iso "Z", 13 digits, 25 bytes, other) of `bn` each.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+struct BatS {
+    bl: Vec<BatL>,
+    rk: Vec<[u64; 3]>,
+    tt: Vec<i64>,
+    tok: Vec<u8>,
+    ls: Vec<u16>,
+    bn: usize,
+}
+
+/// `parse_events_sol1` split in passes over blocks of up to `bn` fast-path lines: (A) line
+/// structure, both ids and the ingest, with each line's ts filed by shape; (B) every ts of one
+/// shape in its own loop, so the shape test is not a per-line branch; (C) the rest of each line
+/// in line order. A slow-path line first finishes the block, so the output order is the same.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(never)]
+fn parse_events_bat<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>, bn: usize) {
+    use core::arch::x86_64::_bzhi_u64;
+    let mut tci = TsCache::new();
+    let mut tct = TsCache::new();
+    let mut dci = DayCache::new();
+    let mut dct = DayCache::new();
+    let c0 = c.as_ptr() as usize;
+    // SAFETY (bzhi): BMI2 is enabled for this build
+    let bzhi = |x: u64, n: u32| unsafe { _bzhi_u64(x, n) };
+    let blsr = |x: u64| x & x.wrapping_sub(1);
+    // SAFETY (sl): only called on fields found inside the chunk
+    let sl = |p: *const u8, n: usize| -> B { unsafe { std::slice::from_raw_parts(p, n) } };
+    let ibase = cx.ibase;
+    let (imax_k, imax_x) = ing32(i64::MAX, ibase);
+    let len = c.len();
+    let base = c.as_ptr();
+    let mut bs = BatS { bl: vec![BatL::default(); bn], rk: vec![[0; 3]; bn], tt: vec![0; bn], tok: vec![0; bn], ls: vec![0; 4 * bn], bn };
+    let mut nb = 0usize;
+    let (mut n20, mut n13, mut n25, mut nxx) = (0usize, 0usize, 0usize, 0usize);
+    let mut pos = 0usize;
+    let mut sbuf: Vec<[B; 7]> = Vec::new();
+    'ln: while pos + 128 <= len {
+        // SAFETY: pos + 128 <= len, and the second window starts at most 64 bytes in
+        let p = unsafe { base.add(pos) };
+        let (ca, qa, na) = masks64(p);
+        let e0 = ca.trailing_zeros();
+        let c1 = blsr(ca);
+        let e1 = c1.trailing_zeros();
+        let c2 = blsr(c1);
+        let e2 = c2.trailing_zeros();
+        'slow: {
+            if !((c2 != 0) & (bzhi(na, e2) == 0)) {
+                break 'slow;
+            }
+            let pb = unsafe { p.add(e2 as usize + 1) };
+            let (cb, qb, nb2) = masks64(pb);
+            let l = nb2.trailing_zeros();
+            let e3 = cb.trailing_zeros();
+            let d1 = blsr(cb);
+            let e4 = d1.trailing_zeros();
+            let d2 = blsr(d1);
+            let e5 = d2.trailing_zeros();
+            let d3 = blsr(d2);
+            let (xa, bad_a) = quote_bad(bzhi(qa, e2), ca);
+            let (xb, bad_b) = quote_bad(bzhi(qb, l), cb | nb2);
+            if !((nb2 != 0) & (e5 < l) & (bzhi(d3, l) == 0) & ((bad_a | bad_b) == 0)) {
+                break 'slow;
+            }
+            let lpos = pos;
+            pos += (e2 + l + 2) as usize;
+            // field start from the line start, and length
+            let fld = |o: u32, x: u64, s: u32, e: u32| {
+                let q = ((x >> s) & 1) as u32;
+                // a quoted field has e - s >= 2
+                ((o + s + q) as usize, (e - s - 2 * q) as usize)
+            };
+            let (oe, ne) = fld(0, xa, 0, e0);
+            if ne == 0 {
+                continue 'ln;
+            }
+            let o2 = e2 + 1;
+            let (ou, nu) = fld(0, xa, e0 + 1, e1);
+            let (ot, nt) = fld(0, xa, e1 + 1, e2);
+            let (oi, ni) = fld(o2, xb, 0, e3);
+            let (oet, net) = fld(o2, xb, e3 + 1, e4);
+            let (op, np) = fld(o2, xb, e4 + 1, e5);
+            let (opr, npr) = fld(o2, xb, e5 + 1, l);
+            // SAFETY: every field lies inside the 128 readable bytes at p
+            let (pe, pu, pt, pi) = unsafe { (p.add(oe), p.add(ou), p.add(ot), p.add(oi)) };
+            // SAFETY: both ids start in the first window, so 16 bytes from each stay inside
+            // the 128 readable bytes at p
+            let (oke, val, ku, oku) = unsafe { fuse_eu(pe, ne, pu, nu) };
+            // SAFETY (ldp, hms): a 20-byte field lies inside its window. (ra, rb, rd): the
+            // ingest's date key and day start when it is a valid F1 date, else 2000-01-01's.
+            let (mut ra, mut rb, mut rd) = (D0_A, D0_B, D0_S);
+            let iso_i = if ni == 20 && unsafe { *pi.add(19) } == b'Z' {
+                let (ia, ib) = unsafe { (ldp(pi), ldp(pi.add(3))) };
+                let (dd, hs) = unsafe { (day_get(ia, ib, pi, &mut dci), hms(pi.add(11))) };
+                Some(match dd {
+                    Some(d) => {
+                        (ra, rb, rd) = (ia, ib, d);
+                        hs.map(|h| d + h)
+                    }
+                    None => None,
+                })
+            } else {
+                None
+            };
+            let (ingest, ik, iex) = match iso_i {
+                Some(Some(s)) => {
+                    let v = s - ibase + IOFF;
+                    (s * 1000, v.clamp(0, u32::MAX as i64) as u32, (v > 0) & (v < u32::MAX as i64))
+                }
+                Some(None) => (i64::MAX, imax_k, imax_x),
+                None => {
+                    let ingest = ts_fast(sl(pi, ni), &mut tci).unwrap_or(i64::MAX);
+                    let (k, x) = ing32(ingest, ibase);
+                    (ingest, k, x)
+                }
+            };
+            // ts shape: lines with an empty user id or product id never parse it
+            let ok = (nu != 0) & (np != 0);
+            // SAFETY: the ts starts in the first window, so byte 19 from it is readable
+            let z = unsafe { *pt.add(19) } == b'Z';
+            let s20 = ok & (nt == 20) & z;
+            let s13 = ok & (nt == 13);
+            let s25 = ok & (nt == 25);
+            let sxx = ok & !(s20 | s13 | s25);
+            let i = nb;
+            // SAFETY: i < bn, and every list count is at most i
+            unsafe {
+                *bs.bl.get_unchecked_mut(i) = BatL {
+                    ingest,
+                    val,
+                    ku,
+                    pos: lpos as u32,
+                    ik,
+                    oe: oe as u8,
+                    ne: ne as u8,
+                    ou: ou as u8,
+                    nu: nu as u8,
+                    ot: ot as u8,
+                    nt: nt as u8,
+                    oet: oet as u8,
+                    net: net as u8,
+                    op: op as u8,
+                    np: np as u8,
+                    opr: opr as u8,
+                    npr: npr as u8,
+                    fl: oke as u8 | (oku as u8) << 1 | (iex as u8) << 2,
+                };
+                *bs.rk.get_unchecked_mut(i) = [ra, rb, rd as u64];
+                *bs.tok.get_unchecked_mut(i) = 0;
+                let ls = bs.ls.as_mut_ptr();
+                *ls.add(n20) = i as u16;
+                *ls.add(bn + n13) = i as u16;
+                *ls.add(2 * bn + n25) = i as u16;
+                *ls.add(3 * bn + nxx) = i as u16;
+            }
+            n20 += s20 as usize;
+            n13 += s13 as usize;
+            n25 += s25 as usize;
+            nxx += sxx as usize;
+            nb += 1;
+            if nb == bn {
+                bat_flush(base, cx, c0, &mut bs, nb, [n20, n13, n25, nxx], &mut dct, &mut tct, m, d, fb, fbn, side, dz);
+                (nb, n20, n13, n25, nxx) = (0, 0, 0, 0, 0);
+            }
+            continue 'ln;
+        }
+        if nb != 0 {
+            bat_flush(base, cx, c0, &mut bs, nb, [n20, n13, n25, nxx], &mut dct, &mut tct, m, d, fb, fbn, side, dz);
+            (nb, n20, n13, n25, nxx) = (0, 0, 0, 0, 0);
+        }
+        sbuf.clear();
+        pos = scan7_line(c, pos, &mut sbuf);
+        for f in &sbuf {
+            ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side, dz);
+        }
+    }
+    if nb != 0 {
+        bat_flush(base, cx, c0, &mut bs, nb, [n20, n13, n25, nxx], &mut dct, &mut tct, m, d, fb, fbn, side, dz);
+    }
+    if pos < len {
+        scan::<7>(&c[pos..], |f| ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side, dz));
+    }
+}
+
+/// Passes B and C of `parse_events_bat` over the first `nb` lines of a block at chunk start `base`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(never)]
+fn bat_flush<E: Ev>(base: *const u8, cx: &EvCtx, c0: usize, bs: &mut BatS, nb: usize, cnt: [usize; 4], dct: &mut DayCache, tct: &mut TsCache, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
+    // SAFETY (sl): only called on fields found inside the chunk
+    let sl = |p: *const u8, n: usize| -> B { unsafe { std::slice::from_raw_parts(p, n) } };
+    let (ws, we) = (cx.ws, cx.we);
+    let bn = bs.bn;
+    let (bl, rk, tt, tok, ls) = (&bs.bl[..nb], &bs.rk[..nb], &mut bs.tt[..nb], &mut bs.tok[..nb], &bs.ls[..]);
+    // SAFETY (whole pass B): list entries are line indices below nb; field offsets and lengths
+    // were found by pass A inside the 128 readable bytes at the line start
+    unsafe {
+        let tsp = |i: usize| {
+            let l = bl.get_unchecked(i);
+            (base.add(l.pos as usize + l.ot as usize), l.nt as usize)
+        };
+        for &i in ls.get_unchecked(..cnt[0]) {
+            let i = i as usize;
+            let (pt, _) = tsp(i);
+            let [ra, rb, rd] = *rk.get_unchecked(i);
+            // same date bytes as the ingest: same day start
+            let (ta, tb) = (ldp(pt), ldp(pt.add(3)));
+            let dd = if (ta == ra) & (tb == rb) { Some(rd as i64) } else { day_get(ta, tb, pt, dct) };
+            let (t, ok) = match (dd, hms(pt.add(11))) {
+                (Some(dv), Some(h)) => ((dv + h) * 1000, 1),
+                _ => (0, 0),
+            };
+            *tt.get_unchecked_mut(i) = t;
+            *tok.get_unchecked_mut(i) = ok;
+        }
+        for &i in ls.get_unchecked(bn..bn + cnt[1]) {
+            let i = i as usize;
+            let r = ts13(tsp(i).0);
+            *tt.get_unchecked_mut(i) = r.unwrap_or(0);
+            *tok.get_unchecked_mut(i) = r.is_some() as u8;
+        }
+        for &i in ls.get_unchecked(2 * bn..2 * bn + cnt[2]) {
+            let i = i as usize;
+            let (pt, nt) = tsp(i);
+            let [ra, rb, rd] = *rk.get_unchecked(i);
+            let r = ts25(pt, ra, rb, rd as i64, dct).or_else(|| parse_ts_c(sl(pt, nt), tct));
+            *tt.get_unchecked_mut(i) = r.unwrap_or(0);
+            *tok.get_unchecked_mut(i) = r.is_some() as u8;
+        }
+        for &i in ls.get_unchecked(3 * bn..3 * bn + cnt[3]) {
+            let i = i as usize;
+            let (pt, nt) = tsp(i);
+            let r = parse_ts_c(sl(pt, nt), tct);
+            *tt.get_unchecked_mut(i) = r.unwrap_or(0);
+            *tok.get_unchecked_mut(i) = r.is_some() as u8;
+        }
+    }
+    for i in 0..nb {
+        let l = bl[i];
+        // SAFETY: line starts and field offsets come from pass A
+        let p = unsafe { base.add(l.pos as usize) };
+        let at = |o: u8| unsafe { p.add(o as usize) };
+        let ingest = l.ingest;
+        let iex = (l.fl & 4) != 0;
+        let mut r = E::nil();
+        'v: {
+            let t = tt[i];
+            if (tok[i] == 0) | (t < ws) | (t >= we) | (ingest.wrapping_sub(t) > DAY) {
+                break 'v;
+            }
+            let mut pv = 0u32;
+            let mut cat = 0u32;
+            match et_code(sl(at(l.oet), l.net as usize)) {
+                1 => {}
+                2 => {
+                    match parse_price(sl(at(l.opr), l.npr as usize)) {
+                        Some(v) => pv = v,
+                        None => break 'v,
+                    }
+                    cat = cx.prod.get_fast(sl(at(l.op), l.np as usize), c0).unwrap_or(cx.unknown_cat);
+                }
+                _ => break 'v,
+            }
+            let key = if (l.fl & 2) != 0 { l.ku } else { ev_key_slow(sl(at(l.ou), l.nu as usize), cx.rs, fbn) };
+            r = E::mk(key, (t - ws) as u64, pv, cat);
+        }
+        if (l.fl & 1) != 0 {
+            if let Some(j) = dz.idx_val(l.val) {
+                dz.put(j, l.ik, r, iex, ingest);
+                continue;
+            }
+        }
+        let loc = m.len() as u32;
+        m.push(r);
+        if !iex {
+            side.push((loc, ingest));
+        }
+        let (pe, ne) = (at(l.oe), l.ne as usize);
+        // SAFETY: 16 bytes from pe are readable (see fuse_eu's call in pass A)
+        let (ke, okk) = unsafe { pack6x1(pe, ne) };
+        if okk {
+            d.push(DRec { eid: ke, ing: l.ik, loc });
+        } else {
+            fb.push((pack(sl(pe, ne)), ingest, loc));
+        }
     }
 }
 
