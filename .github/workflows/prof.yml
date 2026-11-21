@@ -1,5 +1,7 @@
 name: prof (linux perf profile)
 on:
+  push:
+    branches: [prof]
   workflow_dispatch:
     inputs:
       sha:
@@ -32,9 +34,9 @@ jobs:
           sudo apt-get install -y -q --no-install-recommends linux-perf || true
       - name: profile
         env:
-          SHA: ${{ github.event.inputs.sha }}
-          SIZES: ${{ github.event.inputs.sizes }}
-          CPUS: ${{ github.event.inputs.cpus }}
+          SHA: ${{ github.event.inputs.sha || '1d465e9' }}
+          SIZES: ${{ github.event.inputs.sizes || '20000000:5000000 60000000:15000000' }}
+          CPUS: ${{ github.event.inputs.cpus || '8' }}
         run: bash prof.sh 2>&1 | tee /tmp/prof-log.txt
       - uses: actions/upload-artifact@v4
         if: always()
