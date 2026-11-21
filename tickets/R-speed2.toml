@@ -1,0 +1,4 @@
+id = "R-speed2"
+files = ["impl/rs/src/main.rs"]
+why = "speed round 2: SIMD line scan, packed ids, flat dedup, date cache, radix session sort (t20m n8 4.25s to about 2.1s)"
+created = "2026-11-20 19:12:48"
