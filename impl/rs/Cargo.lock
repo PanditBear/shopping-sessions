@@ -532,6 +532,7 @@ name = "shop"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "libc",
  "memchr",
  "memmap2",
  "mimalloc",

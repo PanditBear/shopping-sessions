@@ -6,8 +6,167 @@ use std::mem::MaybeUninit;
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(not(target_os = "linux"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: hpa::Hp = hpa::Hp;
+
+// Large blocks (>= SHOP_HP MiB, default 4; 0 = off) get their own 2 MiB-aligned anonymous mapping with
+// MADV_HUGEPAGE, so the big tables and record arrays sit on transparent huge pages (fewer TLB misses on
+// random access). Everything else goes to mimalloc.
+#[cfg(target_os = "linux")]
+mod hpa {
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    const HP: usize = 2 << 20;
+    static MIN: AtomicUsize = AtomicUsize::new(0); // 0 = not read yet
+    pub static NMAP: AtomicUsize = AtomicUsize::new(0);
+    pub static BMAP: AtomicUsize = AtomicUsize::new(0);
+    pub static BLIVE: AtomicUsize = AtomicUsize::new(0);
+    pub struct Hp;
+
+    #[cold]
+    fn init() -> usize {
+        let mut mib = 4usize;
+        unsafe {
+            let p = libc::getenv(b"SHOP_HP\0".as_ptr() as *const libc::c_char);
+            if !p.is_null() {
+                let s = std::ffi::CStr::from_ptr(p).to_bytes();
+                if !s.is_empty() && s.len() < 8 && s.iter().all(|c| c.is_ascii_digit()) {
+                    mib = s.iter().fold(0usize, |a, &c| a * 10 + (c - b'0') as usize);
+                }
+            }
+        }
+        let m = if mib == 0 { usize::MAX } else { mib << 20 };
+        MIN.store(m, Relaxed);
+        m
+    }
+    #[inline(always)]
+    fn big(size: usize, align: usize) -> bool {
+        let m = MIN.load(Relaxed);
+        let m = if m == 0 { init() } else { m };
+        size >= m && align <= HP
+    }
+    #[inline(always)]
+    fn rup(n: usize) -> usize {
+        (n + HP - 1) & !(HP - 1)
+    }
+    #[cold]
+    unsafe fn map(len: usize) -> *mut u8 {
+        let raw = libc::mmap(
+            core::ptr::null_mut(),
+            len + HP,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if raw == libc::MAP_FAILED {
+            return core::ptr::null_mut();
+        }
+        let a = raw as usize;
+        let s = (a + HP - 1) & !(HP - 1);
+        if s > a {
+            libc::munmap(raw, s - a);
+        }
+        let (e, re) = (s + len, a + len + HP);
+        if re > e {
+            libc::munmap(e as *mut libc::c_void, re - e);
+        }
+        libc::madvise(s as *mut libc::c_void, len, libc::MADV_HUGEPAGE);
+        NMAP.fetch_add(1, Relaxed);
+        BMAP.fetch_add(len, Relaxed);
+        BLIVE.fetch_add(len, Relaxed);
+        s as *mut u8
+    }
+    #[cold]
+    unsafe fn unmap(p: *mut u8, len: usize) {
+        libc::munmap(p as *mut libc::c_void, len);
+        BLIVE.fetch_sub(len, Relaxed);
+    }
+
+    unsafe impl GlobalAlloc for Hp {
+        #[inline]
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            if big(l.size(), l.align()) {
+                map(rup(l.size()))
+            } else {
+                GlobalAlloc::alloc(&mimalloc::MiMalloc, l)
+            }
+        }
+        #[inline]
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            if big(l.size(), l.align()) {
+                map(rup(l.size())) // fresh anonymous pages are zero
+            } else {
+                GlobalAlloc::alloc_zeroed(&mimalloc::MiMalloc, l)
+            }
+        }
+        #[inline]
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            if big(l.size(), l.align()) {
+                unmap(p, rup(l.size()))
+            } else {
+                GlobalAlloc::dealloc(&mimalloc::MiMalloc, p, l)
+            }
+        }
+        #[inline]
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, ns: usize) -> *mut u8 {
+            let (ob, nb) = (big(l.size(), l.align()), big(ns, l.align()));
+            if !ob && !nb {
+                return GlobalAlloc::realloc(&mimalloc::MiMalloc, p, l, ns);
+            }
+            if ob && nb {
+                let (o, n) = (rup(l.size()), rup(ns));
+                if n == o {
+                    return p;
+                }
+                if n < o {
+                    unmap(p.add(n), o - n);
+                    return p;
+                }
+                // grow in place when the address range after the block is free (same mapping, same advice)
+                if libc::mremap(p as *mut libc::c_void, o, n, 0) != libc::MAP_FAILED {
+                    BMAP.fetch_add(n - o, Relaxed);
+                    BLIVE.fetch_add(n - o, Relaxed);
+                    return p;
+                }
+            }
+            let q = self.alloc(Layout::from_size_align_unchecked(ns, l.align()));
+            if !q.is_null() {
+                core::ptr::copy_nonoverlapping(p, q, l.size().min(ns));
+                self.dealloc(p, l);
+            }
+            q
+        }
+    }
+
+    // SHOP_THP=1: anonymous and huge-page memory of the process plus the mapped-block counters
+    pub fn diag(label: &str) {
+        if std::env::var_os("SHOP_THP").is_none() {
+            return;
+        }
+        let r = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
+        let f = |k: &str| {
+            r.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
+        };
+        eprintln!(
+            "thp {label}: anon {} MB, anonhuge {} MB, rss {} MB; hp blocks {} mapped {} MB live {} MB",
+            f("Anonymous:") >> 10,
+            f("AnonHugePages:") >> 10,
+            f("Rss:") >> 10,
+            NMAP.load(Relaxed),
+            BMAP.load(Relaxed) >> 20,
+            BLIVE.load(Relaxed) >> 20
+        );
+    }
+}
+#[cfg(not(target_os = "linux"))]
+mod hpa {
+    pub fn diag(_: &str) {}
+}
 
 type B = &'static [u8];
 
@@ -2136,6 +2295,7 @@ fn main() {
         if timing {
             eprintln!("[{:.2}s] {}", t0.elapsed().as_secs_f64(), s);
         }
+        hpa::diag(s);
     };
 
     let mf = std::fs::read_to_string(data.join("manifest.json")).unwrap_or_default();
