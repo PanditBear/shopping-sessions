@@ -4353,18 +4353,19 @@ fn ev_after_idx<E: Ev>(
     .collect()
 }
 
-/// A stretch of one person's lines in a bucket: digit, person key, start, length, ts sorted,
-/// and where its session starts (q) and purchase lines (pq) begin in the SessIx lists.
+/// A stretch of one person's lines in a bucket: digit, person key, length (bit 31: ts sorted),
+/// and where its session starts (q; the first one is the run's start line) and purchase lines
+/// (pq) begin in the SessIx lists. 24 bytes.
 #[derive(Clone, Copy)]
 struct Run {
     d: u32,
-    k: u64,
-    s: u32,
     l: u32,
+    k: u64,
     q: u32,
     pq: u32,
-    ok: bool,
 }
+
+const RUN_OK: u32 = 1 << 31;
 
 /// Line indices found by the run pass: ss = every session start of a sorted run (each run start
 /// included), pl = every purchase line, both ascending and closed by the line count. tss/tpl hold
@@ -4436,19 +4437,24 @@ fn process_runs<E: Ev>(
         while j < n && evs[j].key() == k {
             let t = evs[j].rts();
             ok &= t >= t0;
-            ss[nss] = j as u32;
+            // SAFETY: lines 0..j added at most one entry each, so nss, npl <= j < n < ss.len(),
+            // pl.len().
+            unsafe {
+                *ss.get_unchecked_mut(nss) = j as u32;
+                *pl.get_unchecked_mut(npl) = j as u32;
+            }
             nss += (t.wrapping_sub(t0) > GAP as u64) as usize;
-            pl[npl] = j as u32;
             npl += evs[j].pc().is_some() as usize;
             t0 = t;
             j += 1;
         }
-        runs.push(Run { d: dg(k) as u32, k, s: i as u32, l: (j - i) as u32, q, pq, ok });
+        let ok = if ok { RUN_OK } else { 0 };
+        runs.push(Run { d: dg(k) as u32, l: (j - i) as u32 | ok, k, q, pq });
         i = j;
     }
     ss[nss] = n as u32;
     pl[npl] = n as u32;
-    runs.sort_unstable_by_key(|r| (r.d, r.k, r.s));
+    runs.sort_unstable_by_key(|r| (r.d, r.k, r.q)); // q rises with the start line
     pt(7, &mut tm);
     sort_clicks(clicks, ctmp, cnt);
     pt(11, &mut tm);
@@ -4470,14 +4476,16 @@ fn process_runs<E: Ev>(
             cj += 1;
         }
         let cs = &clicks[ci..cj];
-        if b == a + 1 && runs[a].ok {
+        if b == a + 1 && runs[a].l & RUN_OK != 0 {
             let r = runs[a];
             let (ss, pl) = (&six.ss[r.q as usize..], &six.pl[r.pq as usize..]);
-            person_sess(evs, ss, pl, (r.s + r.l) as usize, pid, cs, win, organic, &mut day, uds, cm, base);
+            let end = (ss[0] + (r.l & !RUN_OK)) as usize;
+            person_sess(evs, ss, pl, end, pid, cs, win, organic, &mut day, uds, cm, base);
         } else {
             tmp.clear();
             for r in &runs[a..b] {
-                tmp.extend_from_slice(&evs[r.s as usize..(r.s + r.l) as usize]);
+                let s = six.ss[r.q as usize] as usize;
+                tmp.extend_from_slice(&evs[s..s + (r.l & !RUN_OK) as usize]);
             }
             tmp.sort_by_key(|e| e.rts()); // stable driftsort merges the sorted runs
             sess_ix(tmp, &mut six.tss, &mut six.tpl);
