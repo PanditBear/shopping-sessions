@@ -279,6 +279,57 @@ fn quote_bad(q1: u64, c: u64) -> (u64, u64) {
     (x, q1 ^ x ^ (e >> 1))
 }
 
+/// `quote_bad` plus the field bounds, same inputs. Returns (bad, t, w): `t` has one bit per
+/// field at its first byte inside the quotes, `w` the bit right after its content (closing
+/// quote or separator). The k-th lowest bit of `t` starts field k; its end is the lowest bit
+/// of `w` at or above it. Bounds are only meaningful when bad is 0 and the bits of `q1` are
+/// below 63. An opening quote is never a separator, so `f + x` carries one bit up by one.
+#[inline(always)]
+fn quote_split(q1: u64, c: u64) -> (u64, u64, u64) {
+    let f = (c << 1) | 1;
+    let x = q1 & f;
+    let y = (!c.wrapping_sub(x) & c) >> 1;
+    (q1 ^ x ^ y, f.wrapping_add(x), c.wrapping_sub(y))
+}
+
+/// Fast-path split of the line at `p` into its 7 fields: fields 0-2 inside the window at `p`,
+/// fields 3-6 and the newline inside the window after the third comma, and every field
+/// either free of quotes or wholly quoted. Returns the line length with its newline and each
+/// field's start and length without its quotes, or None for the slow path.
+/// SAFETY: 128 bytes from `p` are readable.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn sol_split(p: *const u8) -> Option<(usize, [(*const u8, usize); 7])> {
+    use core::arch::x86_64::_bzhi_u64;
+    let blsr = |x: u64| x & x.wrapping_sub(1);
+    let (ca, qa, na) = masks64(p);
+    let c2 = blsr(blsr(ca));
+    let e2 = c2.trailing_zeros();
+    if !((c2 != 0) & (_bzhi_u64(na, e2) == 0)) {
+        return None;
+    }
+    let pb = p.add(e2 as usize + 1);
+    let (cb, qb, nb) = masks64(pb);
+    let l = nb.trailing_zeros();
+    let (bad_a, ta, wa) = quote_split(_bzhi_u64(qa, e2), ca);
+    let (bad_b, tb, wb) = quote_split(_bzhi_u64(qb, l), cb | nb);
+    if !((nb != 0) & (_bzhi_u64(cb, l).count_ones() == 3) & ((bad_a | bad_b) == 0)) {
+        return None;
+    }
+    // Field starts are at most 63, so the shifts stay in range.
+    let fl = |p: *const u8, t: u64, w: u64| {
+        let s = t.trailing_zeros();
+        (p.add(s as usize), (w >> s).trailing_zeros() as usize)
+    };
+    let (t1, t4) = (blsr(ta), blsr(tb));
+    let (t5, t2) = (blsr(t4), blsr(t1));
+    let t6 = blsr(t5);
+    Some((
+        (e2 + l + 2) as usize,
+        [fl(p, ta, wa), fl(p, t1, wa), fl(p, t2, wa), fl(pb, tb, wb), fl(pb, t4, wb), fl(pb, t5, wb), fl(pb, t6, wb)],
+    ))
+}
+
 /// Calls `f` with the unquoted fields of every well-formed line of `chunk` (N fields).
 /// Same dialect as rules.md: only \n ends a line; quotes allowed only around a whole field.
 #[inline(always)]
@@ -2865,9 +2916,6 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
     let mut dci = DayCache::new();
     let mut dct = DayCache::new();
     let c0 = c.as_ptr() as usize;
-    // SAFETY (bzhi): BMI2 is enabled for this build
-    let bzhi = |x: u64, n: u32| unsafe { _bzhi_u64(x, n) };
-    let blsr = |x: u64| x & x.wrapping_sub(1);
     // SAFETY (sl): only called on fields found inside the chunk
     let sl = |p: *const u8, n: usize| -> B { unsafe { std::slice::from_raw_parts(p, n) } };
     let (ws, we, ibase) = (cx.ws, cx.we, cx.ibase);
@@ -2879,46 +2927,16 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
     'ln: while pos + 128 <= len {
         // SAFETY: pos + 128 <= len, and the second window starts at most 64 bytes in
         let p = unsafe { base.add(pos) };
-        let (ca, qa, na) = masks64(p);
-        let e0 = ca.trailing_zeros();
-        let c1 = blsr(ca);
-        let e1 = c1.trailing_zeros();
-        let c2 = blsr(c1);
-        let e2 = c2.trailing_zeros();
         'slow: {
-            if !((c2 != 0) & (bzhi(na, e2) == 0)) {
+            // SAFETY: 128 bytes from p are readable
+            let Some((n, f)) = (unsafe { sol_split(p) }) else {
                 break 'slow;
-            }
-            let pb = unsafe { p.add(e2 as usize + 1) };
-            let (cb, qb, nb) = masks64(pb);
-            let l = nb.trailing_zeros();
-            let e3 = cb.trailing_zeros();
-            let d1 = blsr(cb);
-            let e4 = d1.trailing_zeros();
-            let d2 = blsr(d1);
-            let e5 = d2.trailing_zeros();
-            let d3 = blsr(d2);
-            let (xa, bad_a) = quote_bad(bzhi(qa, e2), ca);
-            let (xb, bad_b) = quote_bad(bzhi(qb, l), cb | nb);
-            if !((nb != 0) & (e5 < l) & (bzhi(d3, l) == 0) & ((bad_a | bad_b) == 0)) {
-                break 'slow;
-            }
-            pos += (e2 + l + 2) as usize;
-            let fld = |p: *const u8, x: u64, s: u32, e: u32| {
-                let q = ((x >> s) & 1) as u32;
-                // SAFETY: s <= e <= 63 inside a window; a quoted field has e - s >= 2
-                (unsafe { p.add((s + q) as usize) }, (e - s - 2 * q) as usize)
             };
-            let (pe, ne) = fld(p, xa, 0, e0);
+            pos += n;
+            let [(pe, ne), (pu, nu), (pt, nt), (pi, ni), (pet, net), (pp, np), (ppr, npr)] = f;
             if ne == 0 {
                 continue 'ln;
             }
-            let (pu, nu) = fld(p, xa, e0 + 1, e1);
-            let (pt, nt) = fld(p, xa, e1 + 1, e2);
-            let (pi, ni) = fld(pb, xb, 0, e3);
-            let (pet, net) = fld(pb, xb, e3 + 1, e4);
-            let (pp, np) = fld(pb, xb, e4 + 1, e5);
-            let (ppr, npr) = fld(pb, xb, e5 + 1, l);
             // SAFETY: both ids start in the first window, so 16 bytes from each stay inside
             // the 128 readable bytes at p
             let (ke, oke, ku, oku) = unsafe { pack6x2(pe, ne, pu, nu) };
@@ -5392,5 +5410,150 @@ mod pack_simd_tests {
             quote_case(q, c, end);
         }
         assert!(acc > 1_000_000, "{acc}");
+    }
+
+    /// The split `sol_split` replaced: comma positions by tzcnt, a quote bit per field start.
+    /// Offsets are from the line start.
+    unsafe fn sol_split_old(p: *const u8) -> Option<(usize, [(usize, usize); 7])> {
+        use core::arch::x86_64::_bzhi_u64 as bzhi;
+        let blsr = |x: u64| x & x.wrapping_sub(1);
+        let (ca, qa, na) = masks64(p);
+        let e0 = ca.trailing_zeros();
+        let c1 = blsr(ca);
+        let e1 = c1.trailing_zeros();
+        let c2 = blsr(c1);
+        let e2 = c2.trailing_zeros();
+        if !((c2 != 0) & (bzhi(na, e2) == 0)) {
+            return None;
+        }
+        let ob = e2 as usize + 1;
+        let (cb, qb, nb) = masks64(p.add(ob));
+        let l = nb.trailing_zeros();
+        let e3 = cb.trailing_zeros();
+        let d1 = blsr(cb);
+        let e4 = d1.trailing_zeros();
+        let d2 = blsr(d1);
+        let e5 = d2.trailing_zeros();
+        let d3 = blsr(d2);
+        let (xa, bad_a) = quote_bad(bzhi(qa, e2), ca);
+        let (xb, bad_b) = quote_bad(bzhi(qb, l), cb | nb);
+        if !((nb != 0) & (e5 < l) & (bzhi(d3, l) == 0) & ((bad_a | bad_b) == 0)) {
+            return None;
+        }
+        let fld = |o: usize, x: u64, s: u32, e: u32| {
+            let q = ((x >> s) & 1) as u32;
+            (o + (s + q) as usize, (e - s - 2 * q) as usize)
+        };
+        let f = [
+            fld(0, xa, 0, e0),
+            fld(0, xa, e0 + 1, e1),
+            fld(0, xa, e1 + 1, e2),
+            fld(ob, xb, 0, e3),
+            fld(ob, xb, e3 + 1, e4),
+            fld(ob, xb, e4 + 1, e5),
+            fld(ob, xb, e5 + 1, l),
+        ];
+        Some(((e2 + l + 2) as usize, f))
+    }
+
+    /// `sol_split` against `sol_split_old` on 1e7 lines: random bytes from a 4-symbol alphabet,
+    /// structured 7-field lines (quoted, empty and long fields, one or two corrupted bytes), and
+    /// lines whose third comma or newline is aimed at the last bytes of its window.
+    #[test]
+    fn sol_split_matches_old() {
+        let mut tab = [b'a'; 256];
+        for (i, b) in tab.iter_mut().enumerate() {
+            *b = match i {
+                0..=59 => b',',
+                60..=89 => b'"',
+                90..=99 => b'\n',
+                _ => b'a',
+            };
+        }
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+        }
+        let mut r = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut buf = [0u8; 192];
+        let (mut acc, mut acc_q, mut acc_ea, mut acc_eb, mut acc_long) = (0u64, 0u64, 0u64, 0u64, 0u64);
+        for case in 0..10_000_000u64 {
+            for k in 0..24 {
+                let v = r.next();
+                for j in 0..8 {
+                    buf[k * 8 + j] = tab[((v >> (8 * j)) & 255) as usize];
+                }
+            }
+            let mode = case % 4;
+            if mode != 0 {
+                let cap = [2u64, 6, 14, 24, 40][r.below(5) as usize];
+                let mut ln = [0usize; 7];
+                let mut qf = [0usize; 7];
+                for k in 0..7 {
+                    ln[k] = r.below(cap + 1) as usize;
+                    qf[k] = (r.below(100) < 30) as usize;
+                }
+                if mode == 3 {
+                    let tgt = 59 + r.below(6) as usize;
+                    if r.below(2) == 0 {
+                        ln[2] = tgt.saturating_sub(ln[0] + ln[1] + 2 + 2 * (qf[0] + qf[1] + qf[2]));
+                    } else {
+                        ln[6] = tgt.saturating_sub(ln[3] + ln[4] + ln[5] + 3 + 2 * (qf[3] + qf[4] + qf[5] + qf[6]));
+                    }
+                }
+                let mut o = 0usize;
+                for k in 0..7 {
+                    if o + ln[k] + 4 > buf.len() {
+                        break;
+                    }
+                    if k > 0 {
+                        buf[o] = b',';
+                        o += 1;
+                    }
+                    if qf[k] == 1 {
+                        buf[o] = b'"';
+                        o += 1;
+                    }
+                    for j in 0..ln[k] {
+                        buf[o + j] = b'0' + ((o + j) % 10) as u8;
+                    }
+                    o += ln[k];
+                    if qf[k] == 1 {
+                        buf[o] = b'"';
+                        o += 1;
+                    }
+                }
+                buf[o] = b'\n';
+                for _ in 0..2 {
+                    if r.below(100) < 20 {
+                        let at = r.below(o as u64 + 1) as usize;
+                        buf[at] = [b',', b'"', b'\n', b'x'][r.below(4) as usize];
+                    }
+                }
+            }
+            let p = buf.as_ptr();
+            // SAFETY: buf has more than 128 bytes
+            let (a, b) = unsafe { (sol_split_old(p), sol_split(p)) };
+            let b = b.map(|(n, f)| (n, f.map(|(q, k)| (q as usize - p as usize, k))));
+            assert!(a == b, "case {case}: {:?}\nold {a:?}\nnew {b:?}", String::from_utf8_lossy(&buf[..128]));
+            if let Some((n, _)) = a {
+                acc += 1;
+                acc_q += buf[..n].contains(&b'"') as u64;
+                acc_long += (n > 64) as u64;
+                let e2 = buf.iter().enumerate().filter(|x| *x.1 == b',').nth(2).unwrap().0;
+                acc_ea += (e2 >= 60) as u64;
+                acc_eb += (n - e2 - 2 >= 60) as u64;
+            }
+        }
+        println!("sol_split: acc {acc} quoted {acc_q} long {acc_long} e2>=60 {acc_ea} l>=60 {acc_eb}");
+        assert!(acc > 1_000_000 && acc_q > 300_000 && acc_long > 100_000 && acc_ea > 10_000 && acc_eb > 10_000);
     }
 }
