@@ -1281,8 +1281,8 @@ impl<E: Ev> Dz<E> {
     fn new(cfg: Option<IdxCfg>, len: usize) -> Self {
         let Some(c) = cfg else { return Self::off() };
         let lines = len as f64 * c.lpb;
-        let mean = lines * (1u64 << c.sh) as f64 / ((c.lim - 64) as f64 / 1.3).max(1.0) * 1.04;
-        let cap = ((mean + 1.5 * mean.sqrt() + 1.0) as usize).min(lines as usize + 16).next_multiple_of(WK);
+        let mean = lines * (1u64 << c.sh) as f64 / ((c.lim - 64) as f64 / 1.3).max(1.0);
+        let cap = ((mean + 0.5 * mean.sqrt() + 1.0) as usize).min(lines as usize + 16).next_multiple_of(WK);
         let sz = std::mem::size_of::<DR<E>>();
         let nl = (c.ndb * cap * sz).div_ceil(64);
         let mut r = Vec::with_capacity(nl);
