@@ -1524,14 +1524,60 @@ impl<T> SPtr<T> {
 
 /// One event line after parsing: user or person key (0 marks a dropped line), ts relative to
 /// the window start, and for a purchase its price (never 0) and category index.
-trait Ev: Copy + Send + Sync {
+trait Tp: Copy + Send + Sync {
+    fn rts(&self) -> u64;
+    /// (price, category) of a purchase
+    fn pc(&self) -> Option<(u64, u32)>;
+}
+
+trait Ev: Tp {
+    /// the keyless record kept in em / evs (the key lives in RunD / Run)
+    type S: Tp;
     fn nil() -> Self;
     fn mk(key: u64, rts: u64, price: u32, cat: u32) -> Self;
     fn key(&self) -> u64;
     fn set_key(&mut self, k: u64);
-    fn rts(&self) -> u64;
-    /// (price, category) of a purchase
-    fn pc(&self) -> Option<(u64, u32)>;
+    fn slim(&self) -> Self::S;
+}
+
+/// 8-byte keyless record of EvL.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct EvS {
+    ts: u32,
+    meta: u32,
+}
+
+impl Tp for EvS {
+    #[inline(always)]
+    fn rts(&self) -> u64 {
+        self.ts as u64
+    }
+    #[inline(always)]
+    fn pc(&self) -> Option<(u64, u32)> {
+        let p = self.meta & 0xFF_FFFF;
+        if p != 0 { Some((p as u64, self.meta >> 24)) } else { None }
+    }
+}
+
+/// 16-byte keyless record of EvW.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct EvSW {
+    ts: u64,
+    meta: u64,
+}
+
+impl Tp for EvSW {
+    #[inline(always)]
+    fn rts(&self) -> u64 {
+        self.ts
+    }
+    #[inline(always)]
+    fn pc(&self) -> Option<(u64, u32)> {
+        let p = self.meta & 0xFF_FFFF;
+        if p != 0 { Some((p, (self.meta >> 24) as u32)) } else { None }
+    }
 }
 
 /// 16-byte record: needs a window of at most 2^32 ms and at most 256 categories.
@@ -1542,7 +1588,24 @@ struct EvL {
     meta: u32,
 }
 
+impl Tp for EvL {
+    #[inline(always)]
+    fn rts(&self) -> u64 {
+        self.ts as u64
+    }
+    #[inline(always)]
+    fn pc(&self) -> Option<(u64, u32)> {
+        let p = self.meta & 0xFF_FFFF;
+        if p != 0 { Some((p as u64, self.meta >> 24)) } else { None }
+    }
+}
+
 impl Ev for EvL {
+    type S = EvS;
+    #[inline(always)]
+    fn slim(&self) -> EvS {
+        EvS { ts: self.ts, meta: self.meta }
+    }
     #[inline(always)]
     fn nil() -> Self {
         EvL { key: 0, ts: 0, meta: 0 }
@@ -1559,15 +1622,6 @@ impl Ev for EvL {
     fn set_key(&mut self, k: u64) {
         self.key = k;
     }
-    #[inline(always)]
-    fn rts(&self) -> u64 {
-        self.ts as u64
-    }
-    #[inline(always)]
-    fn pc(&self) -> Option<(u64, u32)> {
-        let p = self.meta & 0xFF_FFFF;
-        if p != 0 { Some((p as u64, self.meta >> 24)) } else { None }
-    }
 }
 
 /// 24-byte record for any window and category count.
@@ -1578,7 +1632,24 @@ struct EvW {
     meta: u64,
 }
 
+impl Tp for EvW {
+    #[inline(always)]
+    fn rts(&self) -> u64 {
+        self.ts
+    }
+    #[inline(always)]
+    fn pc(&self) -> Option<(u64, u32)> {
+        let p = self.meta & 0xFF_FFFF;
+        if p != 0 { Some((p, (self.meta >> 24) as u32)) } else { None }
+    }
+}
+
 impl Ev for EvW {
+    type S = EvSW;
+    #[inline(always)]
+    fn slim(&self) -> EvSW {
+        EvSW { ts: self.ts, meta: self.meta }
+    }
     #[inline(always)]
     fn nil() -> Self {
         EvW { key: 0, ts: 0, meta: 0 }
@@ -1594,15 +1665,6 @@ impl Ev for EvW {
     #[inline(always)]
     fn set_key(&mut self, k: u64) {
         self.key = k;
-    }
-    #[inline(always)]
-    fn rts(&self) -> u64 {
-        self.ts
-    }
-    #[inline(always)]
-    fn pc(&self) -> Option<(u64, u32)> {
-        let p = self.meta & 0xFF_FFFF;
-        if p != 0 { Some((p, (self.meta >> 24) as u32)) } else { None }
     }
 }
 
@@ -3961,12 +4023,14 @@ fn ev_after<E: Ev>(
 }
 
 /// Scratch and accumulators of one sessionize worker.
-struct SsW<E> {
+struct SsW<E: Ev> {
     cm: CampAcc,
     win: Win,
     out: Vec<Vec<UD>>,
     evs: Vec<E>,
     tmp: Vec<E>,
+    evs_s: Vec<E::S>,
+    tmp_s: Vec<E::S>,
     runs: Vec<Run>,
     srt: Vec<SRun>,
     cnt: Vec<u32>,
@@ -3982,6 +4046,8 @@ impl<E: Ev> SsW<E> {
             out: vec![],
             evs: vec![],
             tmp: vec![],
+            evs_s: vec![],
+            tmp_s: vec![],
             runs: vec![],
             srt: vec![],
             cnt: vec![],
@@ -4007,7 +4073,7 @@ impl<E: Ev> SsW<E> {
     /// (digit, key, part, offset) (the order process_runs used to rebuild from the gathered
     /// lines), then copies each run's lines into evs in that order. Runs of one person end up
     /// adjacent and are joined into one Run (sorted if every piece is sorted and the seams are).
-    fn gather_rd(&mut self, p: usize, dparts: &[RdPart<E>], rest: &(Vec<E>, Vec<u32>), click_out: &[(Vec<ClickRec>, Vec<u32>)]) {
+    fn gather_rd(&mut self, p: usize, dparts: &[RdPart<E::S>], rest: &(Vec<E>, Vec<u32>), click_out: &[(Vec<ClickRec>, Vec<u32>)]) {
         let mut tm = now();
         self.cl.clear();
         for (v, o) in click_out.iter() {
@@ -4042,34 +4108,52 @@ impl<E: Ev> SsW<E> {
         srt.sort_unstable_by_key(|r| (r.d, r.k, r.src));
         pt(7, &mut tm);
         let nd = dparts.len();
-        let src = |r: &SRun| -> &[E] {
+        let src = |r: &SRun| -> *const u8 {
             let t = (r.src >> 32) as usize;
             let off = r.src as u32 as usize;
-            let v = if t < nd { &dparts[t].0 } else { &rest.0 };
-            &v[off..off + (r.lk >> 1) as usize]
+            if t < nd {
+                dparts[t].0.as_ptr().wrapping_add(off) as *const u8
+            } else {
+                rest.0.as_ptr().wrapping_add(off) as *const u8
+            }
         };
-        let evs = &mut self.evs;
+        let evs = &mut self.evs_s;
         let runs = &mut self.runs;
         evs.clear();
         runs.clear();
         for i in 0..srt.len() {
             if let Some(nx) = srt.get(i + RD_AHEAD) {
-                let q = src(nx).as_ptr() as *const u8;
+                let q = src(nx);
                 prefetch(q);
                 prefetch(q.wrapping_add(64));
             }
             let r = &srt[i];
-            let v = src(r);
+            let t = (r.src >> 32) as usize;
+            let off = r.src as u32 as usize;
+            let n = (r.lk >> 1) as usize;
             let ok = r.lk & 1 != 0;
             let s = evs.len();
-            match runs.last_mut() {
-                Some(last) if last.k == r.k => {
-                    last.ok = last.ok && ok && v[0].rts() >= evs[s - 1].rts();
-                    last.l += v.len() as u32;
+            if t < nd {
+                let v = &dparts[t].0[off..off + n];
+                match runs.last_mut() {
+                    Some(last) if last.k == r.k => {
+                        last.ok = last.ok && ok && v[0].rts() >= evs[s - 1].rts();
+                        last.l += n as u32;
+                    }
+                    _ => runs.push(Run { d: r.d, k: r.k, s: s as u32, l: n as u32, ok }),
                 }
-                _ => runs.push(Run { d: r.d, k: r.k, s: s as u32, l: v.len() as u32, ok }),
+                evs.extend_from_slice(v);
+            } else {
+                let v = &rest.0[off..off + n];
+                match runs.last_mut() {
+                    Some(last) if last.k == r.k => {
+                        last.ok = last.ok && ok && v[0].rts() >= evs[s - 1].rts();
+                        last.l += n as u32;
+                    }
+                    _ => runs.push(Run { d: r.d, k: r.k, s: s as u32, l: n as u32, ok }),
+                }
+                evs.extend(v.iter().map(|e| e.slim()));
             }
-            evs.extend_from_slice(v);
         }
         pt(6, &mut tm);
     }
@@ -4110,7 +4194,7 @@ const RD_AHEAD: usize = 3;
 
 /// One dense dedup task's output: its kept lines in index order, its run descriptors grouped by
 /// person bucket, their bucket offsets, and the bucket offsets of the lines they cover.
-type RdPart<E> = (Vec<E>, Vec<RunD>, Vec<u32>, Vec<u32>);
+type RdPart<S> = (Vec<S>, Vec<RunD>, Vec<u32>, Vec<u32>);
 
 /// Groups run descriptors by person bucket (order kept inside a bucket). Returns the grouped
 /// descriptors, their bucket offsets, and prefix sums of the lines per bucket.
@@ -4278,7 +4362,7 @@ fn ev_after_idx<E: Ev>(
         let all: usize = dense + ev_out.iter().map(|c| c.d.len() + c.fb.len()).sum::<usize>();
         tick(&format!("idx dense records {dense} of {all} ({:.5}) overflow {ov} slots {slots}", dense as f64 / all.max(1) as f64));
     }
-    let (dparts, rest): (Vec<RdPart<E>>, (Vec<E>, Vec<u32>)) = {
+    let (dparts, rest): (Vec<RdPart<E::S>>, (Vec<E>, Vec<u32>)) = {
         let side_any = ev_out.iter().any(|c| !c.side.is_empty());
         let dside_any = ev_out.iter().any(|c| !c.dz.dside.is_empty());
         let ibase = ws.div_euclid(1000);
@@ -4331,7 +4415,7 @@ fn ev_after_idx<E: Ev>(
                                     .sum::<usize>()
                             })
                             .sum();
-                        let mut em: Vec<E> = Vec::with_capacity(ub);
+                        let mut em: Vec<E::S> = Vec::with_capacity(ub);
                         let mut ds: Vec<RunD> = Vec::new();
                         // open run: person key, start in em, ts sorted so far, last ts
                         let (mut rk, mut rs, mut rok, mut lts) = (0u64, 0usize, true, 0u64);
@@ -4449,7 +4533,7 @@ fn ev_after_idx<E: Ev>(
                                             lts = ts;
                                             // SAFETY: en < em.len() at bucket start + lb.len() <= capacity (reserved
                                             // above), and at most one write per lb record
-                                            unsafe { emp.add(en).write(e) };
+                                            unsafe { emp.add(en).write(e.slim()) };
                                             en += 1;
                                         }
                                     }
@@ -4573,7 +4657,7 @@ fn ev_after_idx<E: Ev>(
     lpt_run(&cost, || SsW::new(ncamp, d0, nd), |p, w: &mut SsW<E>| {
         w.gather_rd(p, &dparts, &rest, click_out);
         let mut uds = Vec::new();
-        process_runs(&w.evs, &mut w.tmp, &w.runs, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut uds, &mut w.cm, ws);
+        process_runs(&w.evs_s, &mut w.tmp_s, &w.runs, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut uds, &mut w.cm, ws);
         w.out.push(uds);
     })
     .into_iter()
@@ -4595,7 +4679,7 @@ struct Run {
 /// ordered by (digit, key) (gather_rd); a person given as one sorted run is sessionized in place,
 /// any other person (several runs, or a run out of ts order) is gathered and sorted by ts first.
 #[allow(clippy::too_many_arguments)]
-fn process_runs<E: Ev>(
+fn process_runs<E: Tp>(
     evs: &[E],
     tmp: &mut Vec<E>,
     runs: &[Run],
@@ -4649,7 +4733,7 @@ fn process_runs<E: Ev>(
 /// process_bucket.
 #[allow(clippy::too_many_arguments)]
 #[inline]
-fn person_sess<E: Ev>(
+fn person_sess<E: Tp>(
     pes: &[E],
     pid: u64,
     cs: &[ClickRec],
@@ -6876,6 +6960,92 @@ mod ck_sort_tests {
                 .collect();
             let want = g.iter().min_by(|a, b| unpack(a.cid).cmp(unpack(b.cid))).unwrap().camp;
             assert_eq!(min_cid_camp(&g), want);
+        }
+    }
+
+    #[test]
+    fn slim_runs_match_full() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _case in 0..200 {
+            let ncamp = 3usize;
+            let nd = 12usize;
+            let mut keys: Vec<u64> = (0..1 + rnd() % 30).map(|_| 1 + rnd() % 5000).collect();
+            keys.sort_by_key(|&k| (dg(k), k));
+            keys.dedup();
+            let mut full: Vec<EvL> = vec![];
+            let mut runs: Vec<Run> = vec![];
+            let mut clicks: Vec<ClickRec> = vec![];
+            for &k in &keys {
+                let nr = 1 + rnd() % 3;
+                let mut ok = true;
+                let mut last = 0u64;
+                let s0 = full.len();
+                for r in 0..nr {
+                    let n = 1 + rnd() % 12;
+                    let mut ts = rnd() % (8 * DAY as u64);
+                    let rs = full.len();
+                    let mut rok = true;
+                    for i in 0..n {
+                        let step = rnd() % 5;
+                        ts = if rnd() % 7 == 0 { ts.saturating_sub(rnd() % 3000) } else { ts + step * 1_000_000 };
+                        if i > 0 && ts < last {
+                            rok = false;
+                        }
+                        if i == 0 && r > 0 && ts < last {
+                            ok = false;
+                        }
+                        last = ts;
+                        let price = if rnd() % 3 == 0 { 1 + (rnd() % 1000) as u32 } else { 0 };
+                        full.push(EvL::mk(k, ts, price, (rnd() % 3) as u32));
+                    }
+                    ok &= rok;
+                    let _ = rs;
+                }
+                runs.push(Run { d: dg(k) as u32, k, s: s0 as u32, l: (full.len() - s0) as u32, ok });
+                for c in 0..rnd() % 6 {
+                    clicks.push(ClickRec { key: k, ts: (rnd() % (8 * DAY as u64)) as i64, cid: c + rnd() % 100, camp: (rnd() % 3) as u32 });
+                }
+            }
+            // split each person's lines into the pieces gather_rd would join: one Run per person here,
+            // ok = false forces the tmp sort path, ok = true the in-place path only if truly sorted
+            for r in runs.iter_mut() {
+                if r.ok {
+                    let v = &full[r.s as usize..(r.s + r.l) as usize];
+                    r.ok = v.windows(2).all(|w| w[0].ts <= w[1].ts);
+                }
+            }
+            let slim: Vec<EvS> = full.iter().map(|e| e.slim()).collect();
+            let run = |a: &dyn Fn(&mut Vec<UD>, &mut CampAcc, &mut Vec<ClickRec>)| {
+                let mut uds: Vec<UD> = vec![];
+                let mut cm = CampAcc::new(ncamp + 1, 0, nd);
+                let mut cl = clicks.clone();
+                a(&mut uds, &mut cm, &mut cl);
+                (uds, cm, cl)
+            };
+            let (u1, c1, _) = run(&|u, c, cl| {
+                let (mut tmp, mut cnt, mut ct) = (vec![], vec![], vec![]);
+                let mut win = Win { cnt: vec![0; ncamp + 1], pos: vec![0; ncamp + 1], active: vec![] };
+                process_runs(&full, &mut tmp, &runs, &mut cnt, cl, &mut ct, &mut win, ncamp as u32, u, c, 0);
+            });
+            let (u2, c2, _) = run(&|u, c, cl| {
+                let (mut tmp, mut cnt, mut ct) = (vec![], vec![], vec![]);
+                let mut win = Win { cnt: vec![0; ncamp + 1], pos: vec![0; ncamp + 1], active: vec![] };
+                process_runs(&slim, &mut tmp, &runs, &mut cnt, cl, &mut ct, &mut win, ncamp as u32, u, c, 0);
+            });
+            assert_eq!(u1.len(), u2.len());
+            for (a, b) in u1.iter().zip(&u2) {
+                assert_eq!((a.key, a.day, a.sessions, a.events, a.rev, a.top), (b.key, b.day, b.sessions, b.events, b.rev, b.top));
+            }
+            assert_eq!(c1.tch, c2.tch);
+            for (a, b) in c1.dense.iter().zip(&c2.dense) {
+                assert_eq!((a.s, a.p, a.r), (b.s, b.p, b.r));
+            }
         }
     }
 }
