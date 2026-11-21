@@ -3358,3 +3358,52 @@ mod tests {
         assert!(recs > 1_000_000 && purch > 10_000);
     }
 }
+
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+mod pack_simd_tests {
+    use super::*;
+
+    fn chk(a: &[u8], b: &[u8]) {
+        let mut ba = [b','; 32];
+        ba[..a.len()].copy_from_slice(a);
+        let mut bb = [b','; 32];
+        bb[..b.len()].copy_from_slice(b);
+        let (ka, oka, kb, okb) = unsafe { pack6x2(ba.as_ptr(), a.len(), bb.as_ptr(), b.len()) };
+        for (x, k, ok) in [(a, ka, oka), (b, kb, okb)] {
+            match pack6(x) {
+                Some(e) => assert!(ok && k == e, "pack6x2 differs on {:?}", x),
+                None => assert!(!ok, "pack6x2 accepts {:?}", x),
+            }
+        }
+    }
+
+    #[test]
+    fn pack6x2_matches_pack6() {
+        let alpha: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
+        for n in 1..=12usize {
+            for pos in 0..n {
+                for v in 0..=255u8 {
+                    let mut a: Vec<u8> = (0..n).map(|i| alpha[(i * 7 + n) % alpha.len()]).collect();
+                    a[pos] = v;
+                    chk(&a, b"u_1");
+                    chk(b"e_9", &a);
+                }
+            }
+        }
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for _ in 0..200_000 {
+            let n = 1 + (rnd() % 10) as usize;
+            let a: Vec<u8> = (0..n).map(|_| alpha[(rnd() % 63) as usize]).collect();
+            let m = 1 + (rnd() % 10) as usize;
+            let b: Vec<u8> = (0..m).map(|_| alpha[(rnd() % 63) as usize]).collect();
+            chk(&a, &b);
+        }
+        assert_eq!(pack6(b"u_123"), Some(1055258694234669056));
+    }
+}

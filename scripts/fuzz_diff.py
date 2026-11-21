@@ -90,7 +90,7 @@ def fmt_field(r, v, qrate):
 
 
 USERS = ["u1", "u2", "u3", "U1", "u10", " u1", "u1 ", "u1\r", "é", "z", "中", "u\u00e9", "~", "a", "B", "", "\"x", "u1\"\""]
-GOOD_USERS = ["u1", "u2", "u3", "U1", "u10", " u1", "u1 ", "é", "z", "中", "a", "B", "~", "u2\r"]
+GOOD_USERS = ["u1", "u2", "u3", "U1", "u10", " u1", "u1 ", "é", "z", "中", "a", "B", "~", "u2\r", "u_1", "uV1", "a_b_c_d_e9", "_"]
 
 
 def line_join(r, fields):
@@ -199,6 +199,8 @@ def gen_case(case_seed, d):
     base = rand_ms(r, anc)
     for i in range(nev):
         eid = "e%d" % (r.randrange(max(1, nev // 2 + 1)) if OOS else i)
+        if r.random() < 0.1:
+            eid = "e_" + eid[1:]
         if r.random() < 0.02:
             eid = ""
         uid = r.choice(users) if r.random() > 0.05 else r.choice(USERS)
