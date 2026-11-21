@@ -172,6 +172,26 @@ fn decode6(k: u64, out: &mut Vec<u8>) {
     }
 }
 
+/// Linux memory counters for the timing report: peak and current RSS, THP-backed anon memory, minor faults.
+fn memstats() -> String {
+    let rd = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+    let field = |txt: &str, k: &str| -> String {
+        txt.lines().find(|l| l.starts_with(k)).map(|l| l[k.len()..].trim().to_string()).unwrap_or_default()
+    };
+    let st = rd("/proc/self/status");
+    let sm = rd("/proc/self/smaps_rollup");
+    let stat = rd("/proc/self/stat");
+    let minflt = stat.rsplit(')').next().and_then(|r| r.split_whitespace().nth(7)).unwrap_or("").to_string();
+    format!(
+        "mem hwm={} rss={} anon={} thp={} minflt={}",
+        field(&st, "VmHWM:"),
+        field(&st, "VmRSS:"),
+        field(&sm, "Anonymous:"),
+        field(&sm, "AnonHugePages:"),
+        minflt
+    )
+}
+
 #[inline]
 fn ukey(rs: &RandomState, b: B) -> u64 {
     match pack6(b) {
@@ -1701,6 +1721,7 @@ fn main() {
         eprintln!("prof(cpu s): {}", v.join(" "));
     }
     if timing {
+        eprintln!("{}", memstats());
         eprintln!("epoch main={:.3} end={:.3}", ep0, ep());
     }
     // all output files are written and closed; skip freeing the large tables
