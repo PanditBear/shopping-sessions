@@ -1,0 +1,4 @@
+id = "B-rust"
+files = ["impl/rs/", "Dockerfile", ".dockerignore"]
+why = "Fast Rust pipeline: 36/36 fixtures, devset OK, s2..s9 match reference; 0.36s dev, 5.7s 20M native"
+created = "2026-11-20 18:01:47"
