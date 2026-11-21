@@ -2283,10 +2283,11 @@ struct Cm {
     comp: i64,
     dpo: i64,
     dico: Option<i64>,
+    raw: bool,
 }
 
 fn cm(ty: i32, name: &'static str) -> Cm {
-    Cm { ty, name, encs: vec![0, 3], nv: 0, unc: 0, comp: 0, dpo: 0, dico: None }
+    Cm { ty, name, encs: vec![0, 3], nv: 0, unc: 0, comp: 0, dpo: 0, dico: None, raw: false }
 }
 
 struct Pqf {
@@ -2308,13 +2309,13 @@ impl Pqf {
     /// One page: `dict` selects a dictionary page (PLAIN) over a data page v1 with value encoding `enc`.
     fn page(&mut self, cm: &mut Cm, dict: bool, nv: usize, enc: i32, body: &[u8]) {
         let comp: &[u8] = match &mut self.z {
-            Some(z) => {
+            Some(z) if !cm.raw => {
                 self.zb.clear();
                 self.zb.reserve(zstd::zstd_safe::compress_bound(body.len()));
                 z.compress_to_buffer(body, &mut self.zb).unwrap();
                 &self.zb
             }
-            None => body,
+            _ => body,
         };
         let mut h = Tc::new();
         h.i32(1, if dict { 2 } else { 0 });
@@ -2419,6 +2420,9 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
         cm(2, "revenue_cents"),
         cm(6, "top_category"),
     ];
+    // user_id pages are stored uncompressed: the id dictionary is high-entropy text and zstd on it costs
+    // about half the encode time for a modest size gain
+    cols[0].raw = true;
     // user_id: dictionary of the persons in row order, indices as one RLE run per person
     {
         let w = bwid(persons.saturating_sub(1) as u64);
@@ -2578,7 +2582,7 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names)
             t.list(3, 8, 1);
             uvar(&mut t.b, c.name.len() as u64);
             t.b.extend_from_slice(c.name.as_bytes());
-            t.i32(4, f.codec);
+            t.i32(4, if c.raw { 0 } else { f.codec });
             t.i64(5, c.nv);
             t.i64(6, c.unc);
             t.i64(7, c.comp);
