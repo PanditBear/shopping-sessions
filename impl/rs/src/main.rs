@@ -3396,6 +3396,15 @@ unsafe fn ts25(p: *const u8, ra: u64, rb: u64, rd: i64, c: &mut DayCache) -> Opt
     Some((d + h) * 1000 - if sg == b'-' { -off } else { off })
 }
 
+/// Sub-block size in bytes of the structural index in `parse_events_sol` (SHOP_PIXBLK).
+fn pix_blk() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let v = std::env::var("SHOP_PIXBLK").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(8192);
+        (v.clamp(512, 1 << 20) / 64) * 64
+    })
+}
+
 /// Same records, dedup entries and side lists, in the same order, as `parse_events`, except
 /// that the category of a record with no price is 0 (no product lookup for views and carts;
 /// `Ev::pc` never reads it). One fused pass: the `scan7` line classifier with the fields kept
@@ -3403,14 +3412,12 @@ unsafe fn ts25(p: *const u8, ra: u64, rb: u64, rd: i64, c: &mut DayCache) -> Opt
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
 #[inline(never)]
 fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
-    use core::arch::x86_64::_bzhi_u64;
+    use core::arch::x86_64::_pext_u64;
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
     let mut dci = DayCache::new();
     let mut dct = DayCache::new();
     let c0 = c.as_ptr() as usize;
-    // SAFETY (bzhi): BMI2 is enabled for this build
-    let bzhi = |x: u64, n: u32| unsafe { _bzhi_u64(x, n) };
     let blsr = |x: u64| x & x.wrapping_sub(1);
     // SAFETY (sl): only called on fields found inside the chunk
     let sl = |p: *const u8, n: usize| -> B { unsafe { std::slice::from_raw_parts(p, n) } };
@@ -3420,49 +3427,125 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
     let base = c.as_ptr();
     let mut pos = 0usize;
     let mut sbuf: Vec<[B; 7]> = Vec::new();
-    'ln: while pos + 128 <= len {
-        // SAFETY: pos + 128 <= len, and the second window starts at most 64 bytes in
-        let p = unsafe { base.add(pos) };
-        let (ca, qa, na) = masks64(p);
-        let e0 = ca.trailing_zeros();
-        let c1 = blsr(ca);
-        let e1 = c1.trailing_zeros();
-        let c2 = blsr(c1);
-        let e2 = c2.trailing_zeros();
-        'slow: {
-            if !((c2 != 0) & (bzhi(na, e2) == 0)) {
-                break 'slow;
+    let blk = pix_blk();
+    let maxb = blk / 64 + 4;
+    let mut sa = vec![0u64; maxb];
+    let mut qa = vec![0u64; maxb];
+    let mut na = vec![0u64; maxb];
+    let mut ent = vec![0u32; blk + 512];
+    let nwd = (blk + 512) / 64 + 4;
+    let mut kw = vec![0u64; nwd];
+    let mut aw = vec![0u64; nwd];
+    let mut bw = vec![0u64; nwd];
+    while len - pos >= 512 {
+        let pos0 = pos;
+        let bend = (pos0 + blk).min(len - 192);
+        let nb = (bend - pos0 + 63) / 64;
+        // SAFETY: the 64-byte blocks read end at pos0 + 64 * (nb + 1) <= bend + 127 <= len - 65
+        let p0 = unsafe { base.add(pos0) };
+        // block 0 is the newline before the first line; blocks 1..=nb+1 are the bytes from pos0
+        sa[0] = 1 << 63;
+        na[0] = 1 << 63;
+        qa[0] = 0;
+        for b in 1..=nb + 1 {
+            let (cm, qm, nm) = masks64(unsafe { p0.add(64 * (b - 1)) });
+            sa[b] = cm | nm;
+            qa[b] = qm;
+            na[b] = nm;
+        }
+        // flatten: one entry per separator and per quote that is not the opening or closing
+        // quote of a whole field; K flags newlines and odd quotes, A flags a separator right
+        // before an opening quote, B a separator right after a closing quote
+        let mut n = 0usize;
+        let (mut fill, mut wi) = (0u32, 0usize);
+        let (mut ak, mut aa, mut ab) = (0u128, 0u128, 0u128);
+        let eo = ent.as_mut_ptr();
+        for idx in 0..=nb {
+            let (s, q, nm) = (sa[idx], qa[idx], na[idx]);
+            let (sp, qp) = if idx == 0 { (0, 0) } else { (sa[idx - 1], qa[idx - 1]) };
+            let (sn, qn) = (sa[idx + 1], qa[idx + 1]);
+            let ps = (s << 1) | (sp >> 63);
+            let ns = (s >> 1) | (sn << 63);
+            let o = q & ps & !ns;
+            let cq = q & ns & !ps;
+            let x = q & !(o | cq);
+            let em = s | x;
+            let on0 = qn & (s >> 63) & !(sn >> 1) & 1;
+            let a_m = (o >> 1) | (on0 << 63);
+            let cp63 = (qp >> 63) & s & !(sp >> 62) & 1;
+            let b_m = (cq << 1) | cp63;
+            let cnt = em.count_ones();
+            let bo = (64 * idx as u32).wrapping_sub(64);
+            // SAFETY: n + 8 <= 64 * (nb + 2) + 8 <= blk + 512 entries
+            unsafe {
+                let po = eo.add(n);
+                let mut mm = em;
+                for k in 0..8 {
+                    *po.add(k) = bo.wrapping_add(mm.trailing_zeros());
+                    mm = blsr(mm);
+                }
+                if cnt > 8 {
+                    let mut k = 8;
+                    while mm != 0 {
+                        *po.add(k) = bo.wrapping_add(mm.trailing_zeros());
+                        mm = blsr(mm);
+                        k += 1;
+                    }
+                }
+                n += cnt as usize;
+                ak |= (_pext_u64(nm | x, em) as u128) << fill;
+                aa |= (_pext_u64(a_m, em) as u128) << fill;
+                ab |= (_pext_u64(b_m, em) as u128) << fill;
             }
-            let pb = unsafe { p.add(e2 as usize + 1) };
-            let (cb, qb, nb) = masks64(pb);
-            let l = nb.trailing_zeros();
-            let e3 = cb.trailing_zeros();
-            let d1 = blsr(cb);
-            let e4 = d1.trailing_zeros();
-            let d2 = blsr(d1);
-            let e5 = d2.trailing_zeros();
-            let d3 = blsr(d2);
-            let (xa, bad_a) = quote_bad(bzhi(qa, e2), ca);
-            let (xb, bad_b) = quote_bad(bzhi(qb, l), cb | nb);
-            if !((nb != 0) & (e5 < l) & (bzhi(d3, l) == 0) & ((bad_a | bad_b) == 0)) {
-                break 'slow;
+            fill += cnt;
+            if fill >= 64 {
+                kw[wi] = ak as u64;
+                aw[wi] = aa as u64;
+                bw[wi] = ab as u64;
+                ak >>= 64;
+                aa >>= 64;
+                ab >>= 64;
+                fill -= 64;
+                wi += 1;
             }
-            pos += (e2 + l + 2) as usize;
-            let fld = |p: *const u8, x: u64, s: u32, e: u32| {
-                let q = ((x >> s) & 1) as u32;
-                // SAFETY: s <= e <= 63 inside a window; a quoted field has e - s >= 2
-                (unsafe { p.add((s + q) as usize) }, (e - s - 2 * q) as usize)
+        }
+        kw[wi] = ak as u64;
+        aw[wi] = aa as u64;
+        bw[wi] = ab as u64;
+        let (kp, ap, bp) = (kw.as_ptr() as *const u8, aw.as_ptr() as *const u8, bw.as_ptr() as *const u8);
+        let (mut i, mut ls) = (0usize, 0usize);
+        'ln: loop {
+            if i + 8 > n {
+                break 'ln;
+            }
+            'slow: {
+                // SAFETY: i + 8 <= n, so the 8 flag bits and 8 entries exist, and the 8-byte
+                // reads stay inside the zero-padded flag words
+                let (wk, wa, wb, es) = unsafe {
+                    let rd = |p: *const u8| (p.add(i >> 3) as *const u64).read_unaligned() >> (i & 7);
+                    (rd(kp), rd(ap), rd(bp), (eo.add(i) as *const [u32; 8]).read_unaligned())
+                };
+                if !(((wk & 0xff) == 0x81) & (((wa ^ (wb >> 1)) & 0x7f) == 0) & (es[7].wrapping_sub(es[0]) <= 128) & (unsafe { *p0.add(es[7] as usize) } == b'\n')) {
+                    break 'slow;
+                }
+                ls = es[7] as usize + 1;
+                i += 7;
+            // SAFETY: every field lies between two entries of this line, inside the chunk
+            let fld = |k: usize| {
+                let s = es[k].wrapping_add(1) as usize;
+                let q = ((wa >> k) & 1) as usize;
+                (unsafe { p0.add(s + q) }, es[k + 1] as usize - s - 2 * q)
             };
-            let (pe, ne) = fld(p, xa, 0, e0);
+            let (pe, ne) = fld(0);
             if ne == 0 {
                 continue 'ln;
             }
-            let (pu, nu) = fld(p, xa, e0 + 1, e1);
-            let (pt, nt) = fld(p, xa, e1 + 1, e2);
-            let (pi, ni) = fld(pb, xb, 0, e3);
-            let (pet, net) = fld(pb, xb, e3 + 1, e4);
-            let (pp, np) = fld(pb, xb, e4 + 1, e5);
-            let (ppr, npr) = fld(pb, xb, e5 + 1, l);
+            let (pu, nu) = fld(1);
+            let (pt, nt) = fld(2);
+            let (pi, ni) = fld(3);
+            let (pet, net) = fld(4);
+            let (pp, np) = fld(5);
+            let (ppr, npr) = fld(6);
             // SAFETY: both ids start in the first window, so 16 bytes from each stay inside
             // the 128 readable bytes at p
             let (oke, val, ku, oku) = unsafe { fuse_eu(pe, ne, pu, nu) };
@@ -3569,9 +3652,24 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
             continue 'ln;
         }
         sbuf.clear();
-        pos = scan7_line(c, pos, &mut sbuf);
+        let np = scan7_line(c, pos0 + ls, &mut sbuf);
         for f in &sbuf {
             ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side, dz);
+        }
+        ls = np - pos0;
+        let mut j = i;
+        while j < n && (ent[j] as i32 as i64) < ls as i64 {
+            j += 1;
+        }
+        i = j - 1;
+        }
+        pos = pos0 + ls;
+        if ls == 0 {
+            sbuf.clear();
+            pos = scan7_line(c, pos0, &mut sbuf);
+            for f in &sbuf {
+                ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side, dz);
+            }
         }
     }
     if pos < len {
