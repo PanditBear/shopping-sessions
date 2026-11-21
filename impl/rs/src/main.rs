@@ -3807,6 +3807,7 @@ fn ev_after_idx<E: Ev>(
             let mut evs: Vec<E> = vec![];
             let mut tmp: Vec<E> = vec![];
             let mut runs: Vec<Run> = vec![];
+            let mut rtmp: Vec<Run> = vec![];
             let mut cnt: Vec<u32> = vec![];
             let mut cl: Vec<ClickRec> = vec![];
             let mut ctmp: Vec<ClickRec> = vec![];
@@ -3822,12 +3823,53 @@ fn ev_after_idx<E: Ev>(
                 }
                 pt(6, &mut tm);
                 let mut uds = Vec::new();
-                process_runs(&evs, &mut tmp, &mut runs, &mut cnt, &mut cl, &mut ctmp, &mut win, ncamp as u32, &mut uds, &mut cm, ws);
+                process_runs(&evs, &mut tmp, &mut runs, &mut rtmp, &mut cnt, &mut cl, &mut ctmp, &mut win, ncamp as u32, &mut uds, &mut cm, ws);
                 out.push(uds);
             }
             (out, cm)
         })
         .collect()
+}
+
+/// Order runs by (d, k, s): counting sort on the digit, then by (k, s) inside the few digit ranges
+/// that hold several runs (a person in several runs, or persons sharing a digit).
+fn sort_runs(runs: &mut Vec<Run>, tmp: &mut Vec<Run>, cnt: &mut Vec<u32>) {
+    let n = runs.len();
+    let nb = 1usize << NBK;
+    cnt.clear();
+    cnt.resize(nb + 1, 0);
+    for r in runs.iter() {
+        cnt[r.d as usize + 1] += 1;
+    }
+    for i in 0..nb {
+        cnt[i + 1] += cnt[i];
+    }
+    tmp.clear();
+    tmp.reserve(n);
+    {
+        let sp = tmp.spare_capacity_mut();
+        for r in runs.iter() {
+            let d = r.d as usize;
+            sp[cnt[d] as usize].write(*r);
+            cnt[d] += 1;
+        }
+    }
+    unsafe { tmp.set_len(n) };
+    // cnt[d] is now the end of range d; the scatter kept the order of s inside a range
+    let mut st = 0usize;
+    while st < n {
+        let en = cnt[tmp[st].d as usize] as usize;
+        if en - st > 1 {
+            let o = &mut tmp[st..en];
+            if o.len() <= 32 {
+                isort_by(o, |a, b| (a.k, a.s) < (b.k, b.s));
+            } else {
+                o.sort_unstable_by_key(|r| (r.k, r.s));
+            }
+        }
+        st = en;
+    }
+    std::mem::swap(runs, tmp);
 }
 
 /// A stretch of one person's lines in a bucket: digit, person key, start, length, ts sorted.
@@ -3848,6 +3890,7 @@ fn process_runs<E: Ev>(
     evs: &[E],
     tmp: &mut Vec<E>,
     runs: &mut Vec<Run>,
+    rtmp: &mut Vec<Run>,
     cnt: &mut Vec<u32>,
     clicks: &mut Vec<ClickRec>,
     ctmp: &mut Vec<ClickRec>,
@@ -3872,7 +3915,11 @@ fn process_runs<E: Ev>(
         runs.push(Run { d: dg(k) as u32, k, s: i as u32, l: (j - i) as u32, ok });
         i = j;
     }
-    runs.sort_unstable_by_key(|r| (r.d, r.k, r.s));
+    if runs.len() < 256 {
+        runs.sort_unstable_by_key(|r| (r.d, r.k, r.s));
+    } else {
+        sort_runs(runs, rtmp, cnt);
+    }
     pt(7, &mut tm);
     sort_clicks(clicks, ctmp, cnt);
     pt(11, &mut tm);
