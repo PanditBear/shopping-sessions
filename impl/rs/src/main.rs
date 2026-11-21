@@ -1684,7 +1684,12 @@ fn parse_clicks(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: 
                 continue;
             }
             let uid = sl(pu, nu);
-            out.push(ClickRec { key: ukey(rs, uid), ts: t, cid: pack(sl(pc, nc)), camp: ci });
+            // SAFETY (pack6x1): e0 < 47 puts the 16 bytes from pu inside the window
+            let key = match if e0 < 47 { unsafe { pack6x1(pu, nu) } } else { (0, false) } {
+                (k, true) => k,
+                _ => ukey(rs, uid),
+            };
+            out.push(ClickRec { key, ts: t, cid: pack(sl(pc, nc)), camp: ci });
             continue;
         }
         sbuf.clear();
@@ -3032,7 +3037,36 @@ unsafe fn pack6x2(pa: *const u8, na: usize, pb: *const u8, nb: usize) -> (u64, b
     (ka, oka, kb, okb)
 }
 
-/// Bytes 0..8 and 3..11 of "2000-01-01T", and that day's start in seconds: the key every
+//// `pack6x2` for one id: 16 bytes are read at `pa` (`na` is the length). Returns (key, ok); the
+/// key equals `pack6` of the id when ok is set, and ok is clear when `pack6` gives None.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn pack6x1(pa: *const u8, na: usize) -> (u64, bool) {
+    use core::arch::x86_64::*;
+    let x = _mm_loadu_si128(pa as *const __m128i);
+    let l4 = _mm_set1_epi8(0x0F);
+    let hn = _mm_and_si128(_mm_srli_epi16(x, 4), l4);
+    let ln = _mm_and_si128(x, l4);
+    let hi_t = _mm_setr_epi8(0, 0, 0, 1, 2, 4, 2, 8, 0, 0, 0, 0, 0, 0, 0, 0);
+    let lo_t = _mm_setr_epi8(0x0D, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0E, 0x02, 0x02, 0x02, 0x02, 0x06);
+    let cls = _mm_and_si128(_mm_shuffle_epi8(hi_t, hn), _mm_shuffle_epi8(lo_t, ln));
+    let invalid = _mm_cmpeq_epi8(cls, _mm_setzero_si128());
+    let off_t = _mm_setr_epi8(0, 0, 0, 0x2F, 0x36, 0x36, 0x3B, 0x3B, 0, 0, 0, 0, 0, 0, 0, 0);
+    let us = _mm_and_si128(_mm_cmpeq_epi8(x, _mm_set1_epi8(0x5F)), _mm_set1_epi8(4));
+    let code = _mm_sub_epi8(_mm_sub_epi8(x, _mm_shuffle_epi8(off_t, hn)), us);
+    let iota = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let inf = _mm_cmpgt_epi8(_mm_set1_epi8(na.min(16) as i8), iota);
+    let bad = _mm_movemask_epi8(_mm_and_si128(invalid, inf)) as u32;
+    let c = _mm_and_si128(code, inf);
+    let w = _mm_maddubs_epi16(c, _mm_set1_epi16(0x0140));
+    let dw = _mm_madd_epi16(w, _mm_set1_epi32(0x0001_1000));
+    let q = _mm_cvtsi128_si64(dw) as u64;
+    let d2 = _mm_extract_epi32(dw, 2) as u32;
+    let k = ((q & 0xFFFF_FFFF) << 36) | ((q >> 32) << 12) | (d2 as u64 >> 12);
+    (k, bad == 0 && na.wrapping_sub(1) < 10)
+}
+
+// Bytes 0..8 and 3..11 of "2000-01-01T", and that day's start in seconds: the key every
 /// `DayCache` slot starts with (a match on it is a correct hit).
 const D0_A: u64 = u64::from_le_bytes(*b"2000-01-");
 const D0_B: u64 = u64::from_le_bytes(*b"0-01-01T");
@@ -5791,6 +5825,39 @@ mod pack_simd_tests {
             }
             // the per-person table itself answers most keys, movers among them
             assert!(ga * 3 > keys.len() && gm * 4 > ga, "{ga} {gm} {}", keys.len());
+        }
+    }
+
+    #[test]
+    fn pack6x1_matches_pack6() {
+        let alpha: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
+        let one = |a: &[u8]| {
+            let mut ba = [b','; 32];
+            ba[..a.len()].copy_from_slice(a);
+            let (k, ok) = unsafe { pack6x1(ba.as_ptr(), a.len()) };
+            match pack6(a) {
+                Some(e) => assert!(ok && k == e, "pack6x1 differs on {:?}", a),
+                None => assert!(!ok, "pack6x1 accepts {:?}", a),
+            }
+        };
+        one(b"");
+        for n in 1..=16usize {
+            for pos in 0..n {
+                for v in 0..=255u8 {
+                    let mut a: Vec<u8> = (0..n).map(|i| alpha[(i * 7 + n) % alpha.len()]).collect();
+                    a[pos] = v;
+                    one(&a);
+                }
+            }
+        }
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..200_000 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let n = 1 + (s % 10) as usize;
+            let a: Vec<u8> = (0..n).map(|i| alpha[((s >> (6 * i)) % 63) as usize]).collect();
+            one(&a);
         }
     }
 
