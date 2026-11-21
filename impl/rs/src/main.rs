@@ -44,11 +44,36 @@ const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 1_800_000;
 const CHUNK: usize = 4 << 20;
-const EBB: u32 = 11;
-const EB: usize = 1 << EBB; // event dedup buckets (by event_id)
+// event dedup buckets (by event_id) and person buckets: set once from the input size in `size_buckets`
+static EBB_V: AtomicU32 = AtomicU32::new(11);
+static PBB_V: AtomicU32 = AtomicU32::new(10);
+const EBB_ADD: i32 = 0; // log2 offsets over the size rule
+const PBB_ADD: i32 = 0;
+#[inline(always)]
+fn ebb() -> u32 {
+    EBB_V.load(Relaxed)
+}
+#[inline(always)]
+fn eb() -> usize {
+    1usize << ebb()
+}
+#[inline(always)]
+fn pbb() -> u32 {
+    PBB_V.load(Relaxed)
+}
+#[inline(always)]
+fn pb() -> usize {
+    1usize << pbb()
+}
+/// Bucket counts depend only on the events files' total bytes (about 80 B per event): the aim is
+/// per-bucket working sets that stay in L2.
+fn size_buckets(total_bytes: usize) {
+    let n = (total_bytes / 80).max(1) as u64;
+    let lg = |d: u64| (64 - (n.div_ceil(d).max(1) - 1).leading_zeros()) as i32; // ceil(log2(n/d))
+    EBB_V.store((lg(10_000) + EBB_ADD).clamp(11, 13) as u32, Relaxed);
+    PBB_V.store((lg(20_000) + PBB_ADD).clamp(10, 13) as u32, Relaxed);
+}
 const DDG: usize = 4; // event_id buckets per dedup task
-const PBB: u32 = 10;
-const PB: usize = 1 << PBB; // person buckets
 
 fn hasher() -> RandomState {
     RandomState::with_seeds(0x243f6a8885a308d3, 0x13198a2e03707344, 0xa4093822299f31d0, 0x082efa98ec4e6c89)
@@ -60,7 +85,7 @@ fn mix(k: u64) -> u64 {
     k ^ (k >> 29)
 }
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 static TIMING: AtomicBool = AtomicBool::new(false);
 static PROF: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 const PROF_NAMES: [&str; 13] =
@@ -773,9 +798,11 @@ fn csv_files(dir: &Path) -> Vec<B> {
 /// about 300 chunks in all, never below CHUNK.
 fn ev_chunk(files: &[B]) -> usize {
     if let Some(mb) = std::env::var("SHOP_CHUNK").ok().and_then(|s| s.parse::<usize>().ok()) {
+        size_buckets(files.iter().map(|f| f.len()).sum());
         return mb << 20;
     }
     let total: usize = files.iter().map(|f| f.len()).sum();
+    size_buckets(total);
     (total / 300).next_multiple_of(1 << 20).clamp(CHUNK, 8 * CHUNK)
 }
 
@@ -1127,7 +1154,7 @@ fn bucketize<T: Copy>(v: &[T], nb: usize, bk: impl Fn(&T) -> usize) -> (Vec<T>, 
 
 #[inline(always)]
 fn pbk(key: u64) -> usize {
-    (mix(key) >> 20) as usize & (PB - 1)
+    (mix(key) >> 20) as usize & (pb() - 1)
 }
 
 // ---------- per-bucket processing ----------
@@ -2740,7 +2767,7 @@ fn ev_after<E: Ev>(
         };
         rayon::join(
             || {
-                (0..EB / DDG).into_par_iter().for_each(|g| {
+                (0..eb() / DDG).into_par_iter().for_each(|g| {
                     let mut tm = now();
                     let totals: [usize; DDG] =
                         std::array::from_fn(|i| ev_out.iter().map(|c| (c.doff[g * DDG + i + 1] - c.doff[g * DDG + i]) as usize).sum());
@@ -2822,7 +2849,7 @@ fn ev_after<E: Ev>(
         .enumerate()
         .map(|(ci, c)| {
             let mut tm = now();
-            let mut cnt = vec![0u32; PB + 1];
+            let mut cnt = vec![0u32; pb() + 1];
             let mb = mbase[ci] as usize;
             let mut m = c.m;
             let n = m.len();
@@ -2847,10 +2874,10 @@ fn ev_after<E: Ev>(
                 }
             }
             pt(4, &mut tm);
-            for p in 0..PB {
+            for p in 0..pb() {
                 cnt[p + 1] += cnt[p];
             }
-            let tot = cnt[PB] as usize;
+            let tot = cnt[pb()] as usize;
             let mut out: Vec<E> = Vec::with_capacity(tot);
             {
                 let mut w = cnt.clone();
@@ -2872,8 +2899,8 @@ fn ev_after<E: Ev>(
     drop(dead);
     tick("dedup done");
 
-    let ngroups = (rayon::current_num_threads() * 4).clamp(1, PB);
-    let per = PB.div_ceil(ngroups);
+    let ngroups = (rayon::current_num_threads() * 4).clamp(1, pb());
+    let per = pb().div_ceil(ngroups);
     (0..ngroups)
         .into_par_iter()
         .map(|g| {
@@ -2885,7 +2912,7 @@ fn ev_after<E: Ev>(
             let mut cnt: Vec<u32> = vec![];
             let mut cl: Vec<ClickRec> = vec![];
             let mut ctmp: Vec<ClickRec> = vec![];
-            for p in g * per..((g + 1) * per).min(PB) {
+            for p in g * per..((g + 1) * per).min(pb()) {
                 let mut tm = now();
                 cl.clear();
                 for (v, o) in click_out.iter() {
@@ -2918,7 +2945,7 @@ fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
         parse_events_sol(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
     }
     pt(0, &mut tm);
-    let (d, doff) = bucketize(&d, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize);
+    let (d, doff) = bucketize(&d, eb(), |r| (mix(r.eid) >> (64 - ebb())) as usize);
     pt(1, &mut tm);
     EvChunk { m, d, doff, fb, fbn, side }
 }
@@ -3339,7 +3366,7 @@ fn main() {
                     tmp[i].key = tab.get(k);
                 }
             }
-            let r = bucketize(&tmp, PB, |x| pbk(x.key));
+            let r = bucketize(&tmp, pb(), |x| pbk(x.key));
             pt(10, &mut tm);
             r
         })
