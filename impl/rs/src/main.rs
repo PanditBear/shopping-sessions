@@ -1105,9 +1105,11 @@ struct MoverF {
 }
 impl MoverF {
     fn build(tab: &IdTab) -> Self {
+        Self::build_with(tab, UKEYC.get().copied().flatten())
+    }
+    fn build_with(tab: &IdTab, ukey: Option<u64>) -> Self {
         let nw = (tab.s.len() / 16).max(1);
         let w: Vec<AtomicU64> = (0..nw).map(|_| AtomicU64::new(0)).collect();
-        let ukey = UKEYC.get().copied().flatten();
         let gn = if ukey.is_some() { 2 * tab.mov + (1 << 16) } else { 0 };
         let mut ge = vec![0u64; 2 * gn];
         {
@@ -5457,6 +5459,87 @@ mod pack_simd_tests {
                 a[1] = body[1 + (r >> 9) as usize % 35];
             }
             chk_txt(&a, (r >> 32) as u8);
+        }
+    }
+
+    /// the per-person mover table answers what the filter and table answer, for any user_id key:
+    /// movers and non-movers, aliases from 16, persons with mixed movers, persons beyond the
+    /// table, kiosk and hashed IDs
+    #[test]
+    fn gp_table_matches_table() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+        }
+        let mut r = Rng(0x2545_F491_4F6C_DD1D);
+        for _ in 0..6 {
+            let key = r.next() & GM;
+            let enc = |idx: u64| -> u64 {
+                let m = (idx.wrapping_mul(GC1) ^ key) & GM;
+                let mut v = ((m ^ (m >> 17)).wrapping_mul(GC2)) & GM;
+                let mut b = vec![];
+                loop {
+                    b.push(b"0123456789abcdefghijklmnopqrstuvwxyz"[(v % 36) as usize]);
+                    v /= 36;
+                    if v == 0 {
+                        break;
+                    }
+                }
+                b.push(b'u');
+                b.reverse();
+                pack6(&b).unwrap()
+            };
+            let mut tab = IdTab::with_cap(1 << 16);
+            let (mut keys, mut mov) = (vec![], 0usize);
+            let gps: Vec<u64> = (0..400).chain((0..40).map(|i| (1 << 20) + i)).collect();
+            for &gp in &gps {
+                let rep = if r.below(5) == 0 { r.next() | HBIT } else { enc(gp * 512 + r.below(4)) };
+                let mixed = r.below(6) == 0;
+                for a in (0..24).chain([100 + r.below(400)]) {
+                    let k = enc(gp * 512 + a);
+                    assert_eq!(gen_val(k, UPRE).map(|v| gen_idx(v, key)), Some(gp * 512 + a));
+                    keys.push(k);
+                    let p = match r.below(4) {
+                        0 | 1 if mixed && r.below(2) == 0 => enc((gp + 1) * 512),
+                        0 | 1 => rep,
+                        2 => k,
+                        _ => continue,
+                    };
+                    let (_, new) = tab.get_or_insert(k, p);
+                    mov += (new && p != k) as usize;
+                }
+            }
+            for i in 0..200u64 {
+                let k = if i % 2 == 0 { enc((1 << 39) + i) } else { r.next() | HBIT };
+                keys.push(k);
+                if i % 3 == 0 {
+                    tab.get_or_insert(k, enc(i * 512));
+                    mov += 1;
+                }
+            }
+            tab.mov = mov;
+            let (with, without) = (MoverF::build_with(&tab, Some(key)), MoverF::build_with(&tab, None));
+            assert!(with.g.is_some() && without.g.is_none());
+            let (mut ga, mut gm) = (0usize, 0usize);
+            for &k in &keys {
+                let want = tab.get(k);
+                assert_eq!(with.person(k, &tab), want);
+                assert_eq!(without.person(k, &tab), want);
+                if let Some(p) = with.g.as_ref().unwrap().get(k) {
+                    ga += 1;
+                    gm += (p != k) as usize;
+                }
+            }
+            // the per-person table itself answers most keys, movers among them
+            assert!(ga * 3 > keys.len() && gm * 4 > ga, "{ga} {gm} {}", keys.len());
         }
     }
 
