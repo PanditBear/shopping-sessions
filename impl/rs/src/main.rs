@@ -4540,11 +4540,18 @@ fn process_runs<E: Ev>(
         &srcs[(r.src >> 32) as usize][off..off + (r.lk >> 1) as usize]
     };
     let mut a = 0;
+    let mut pf = 0;
     while a < runs.len() {
-        if let Some(nx) = runs.get(a + RD_AHEAD) {
-            let q = piece(nx).as_ptr() as *const u8;
-            prefetch(q);
-            prefetch(q.wrapping_add(64));
+        while pf < runs.len() && pf < a + RD_AHEAD {
+            let v = piece(&runs[pf]);
+            let q = v.as_ptr() as *const u8;
+            let n = (v.len() * std::mem::size_of::<E>()).min(1024);
+            let mut o = 0;
+            while o < n {
+                prefetch(q.wrapping_add(o));
+                o += 64;
+            }
+            pf += 1;
         }
         let pid = runs[a].k;
         let pd = runs[a].d as usize;
