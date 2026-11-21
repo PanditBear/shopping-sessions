@@ -1130,32 +1130,84 @@ impl Win {
 
 type CampMap = AHashMap<u64, [u64; 4]>;
 
-/// (campaign, day) accumulator: dense when the window is small, a map otherwise.
+/// One dense (campaign, day) cell: sessions, purchases (u32: each is at most the number of kept
+/// lines, which is below u32::MAX) and revenue.
+#[derive(Clone, Copy, Default)]
+struct CaCell {
+    s: u32,
+    p: u32,
+    r: u64,
+}
+
+/// (campaign, day) accumulator: dense when the window is small, a map otherwise. The touch count
+/// lives in its own u32 array (`tch`, same index as `dense`): it is bumped for every active campaign
+/// at every session start, so its array is kept small enough to stay in L2.
 struct CampAcc {
-    dense: Vec<[u64; 4]>,
+    dense: Vec<CaCell>,
+    tch: Vec<u32>,
     d0: i64,
     nd: usize,
     map: CampMap,
 }
 impl CampAcc {
     fn new(ncamp1: usize, d0: i64, nd: usize) -> Self {
-        let dense = if nd > 0 && nd * ncamp1 <= (1 << 22) { vec![[0u64; 4]; nd * ncamp1] } else { vec![] };
-        CampAcc { dense, d0, nd, map: CampMap::new() }
+        let n = if nd > 0 && nd * ncamp1 <= (1 << 22) { nd * ncamp1 } else { 0 };
+        CampAcc { dense: vec![CaCell::default(); n], tch: vec![0; n], d0, nd, map: CampMap::new() }
     }
+    /// Dense index of (c, d), if the cell is dense.
     #[inline(always)]
-    fn at(&mut self, c: u32, d: i64) -> &mut [u64; 4] {
+    fn di(&self, d: i64) -> Option<usize> {
         let di = d - self.d0;
         if !self.dense.is_empty() && di >= 0 && (di as usize) < self.nd {
-            &mut self.dense[c as usize * self.nd + di as usize]
+            Some(di as usize)
         } else {
-            self.map.entry(((c as u64) << 32) | (d as u32 as u64)).or_insert([0; 4])
+            None
+        }
+    }
+    /// Count one session attributed to campaign c that started on day d.
+    #[inline(always)]
+    fn sess(&mut self, c: u32, d: i64, purch: bool, rev: u64) {
+        match self.di(d) {
+            Some(di) => {
+                let e = &mut self.dense[c as usize * self.nd + di];
+                e.s += 1;
+                e.p += purch as u32;
+                e.r += rev;
+            }
+            None => {
+                let e = self.map.entry(((c as u64) << 32) | (d as u32 as u64)).or_insert([0; 4]);
+                e[0] += 1;
+                e[1] += purch as u64;
+                e[2] += rev;
+            }
+        }
+    }
+    /// One touch for every campaign in `act` on day d.
+    #[inline(always)]
+    fn touch(&mut self, act: &[u32], d: i64) {
+        match self.di(d) {
+            Some(di) => {
+                let nd = self.nd;
+                let t = &mut self.tch[..];
+                for &c in act {
+                    t[c as usize * nd + di] += 1;
+                }
+            }
+            None => {
+                for &c in act {
+                    self.map.entry(((c as u64) << 32) | (d as u32 as u64)).or_insert([0; 4])[3] += 1;
+                }
+            }
         }
     }
     fn merge(&mut self, o: &CampAcc) {
         for (a, b) in self.dense.iter_mut().zip(o.dense.iter()) {
-            for i in 0..4 {
-                a[i] += b[i];
-            }
+            a.s += b.s;
+            a.p += b.p;
+            a.r += b.r;
+        }
+        for (a, b) in self.tch.iter_mut().zip(o.tch.iter()) {
+            *a += *b;
         }
         for (&k, v) in &o.map {
             let e = self.map.entry(k).or_insert([0; 4]);
@@ -1166,11 +1218,9 @@ impl CampAcc {
     }
     fn rows(&self) -> Vec<(u32, i32, [u64; 4])> {
         let mut rows: Vec<(u32, i32, [u64; 4])> = vec![];
-        if !self.dense.is_empty() {
-            for (i, v) in self.dense.iter().enumerate() {
-                if v[0] != 0 || v[3] != 0 {
-                    rows.push(((i / self.nd) as u32, (self.d0 + (i % self.nd) as i64) as i32, *v));
-                }
+        for (i, (v, &t)) in self.dense.iter().zip(self.tch.iter()).enumerate() {
+            if v.s != 0 || t != 0 {
+                rows.push(((i / self.nd) as u32, (self.d0 + (i % self.nd) as i64) as i32, [v.s as u64, v.p as u64, v.r, t as u64]));
             }
         }
         for (&k, &v) in &self.map {
@@ -1470,10 +1520,7 @@ fn process_bucket<E: Ev>(
             let et = e.rts() as i64 + base;
             if first || et - prev > GAP {
                 if in_sess {
-                    let en = cm.at(s_camp, s_day);
-                    en[0] += 1;
-                    en[1] += s_purch as u64;
-                    en[2] += s_rev;
+                    cm.sess(s_camp, s_day, s_purch, s_rev);
                 }
                 first = false;
                 in_sess = true;
@@ -1500,9 +1547,7 @@ fn process_bucket<E: Ev>(
                 } else {
                     organic
                 };
-                for &c in &win.active {
-                    cm.at(c, d)[3] += 1;
-                }
+                cm.touch(&win.active, d);
                 if day.day != d {
                     flush_day(&mut day, uds);
                     day.day = d;
@@ -1522,10 +1567,7 @@ fn process_bucket<E: Ev>(
             }
         }
         if in_sess {
-            let en = cm.at(s_camp, s_day);
-            en[0] += 1;
-            en[1] += s_purch as u64;
-            en[2] += s_rev;
+            cm.sess(s_camp, s_day, s_purch, s_rev);
         }
         flush_day(&mut day, uds);
         for &c in &win.active {
