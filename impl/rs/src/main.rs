@@ -1736,6 +1736,7 @@ fn ev_after<E: Ev>(
     d0: i64,
     nd: usize,
     tick: &dyn Fn(&str),
+    sink: &(dyn Fn(usize, &[&Vec<UD>]) + Sync),
 ) -> Vec<(Vec<Vec<UD>>, CampAcc)> {
     // dedup on event_id: every line has a global index (chunk base + its index in the chunk);
     // each event_id's losers are marked in the dead bitmap. Each task takes DDG consecutive
@@ -1935,6 +1936,10 @@ fn ev_after<E: Ev>(
                 process_bucket(evs, &mut tmp, &mut cnt, &mut cl, &mut ctmp, &mut win, ncamp as u32, &mut uds, &mut cm, ws, we.wrapping_sub(ws));
                 out.push(uds);
             }
+            {
+                let refs: Vec<&Vec<UD>> = out.iter().collect();
+                sink(g, &refs);
+            }
             (out, cm)
         })
         .collect()
@@ -2087,7 +2092,8 @@ fn main() {
         .collect();
     tick("links parsed");
     // links (serial union-find) overlaps the parallel event parse; events do not need the id table
-    let ((tab, mut names_map), ev_out) = rayon::join(
+    let click_chunks = all_chunks(&csv_files(&data.join("clicks")), CHUNK);
+    let ((tab, mut names_map), (ev_out, click_raw)) = rayon::join(
         || {
             let occ: usize = link_pairs.iter().map(|v| v.len()).sum::<usize>() * 2;
             let mut names_map: AHashMap<u64, u64> = AHashMap::new();
@@ -2158,6 +2164,7 @@ fn main() {
             tick("links done");
             (tab, names_map)
         },
+        || rayon::join(
         || {
             let ev_files = csv_files(&data.join("events"));
             let ev_chunks = all_chunks(&ev_files, ev_chunk(&ev_files));
@@ -2253,28 +2260,40 @@ fn main() {
             tick("events parsed");
             ev_out
         },
+        // clicks need no link table to scan: same pool as the event parse, resolved after the join
+        || {
+            let r: Vec<Vec<ClickRec>> = click_chunks
+                .par_iter()
+                .map(|&c| {
+                    let mut tmp: Vec<ClickRec> = Vec::with_capacity(c.len() / 40);
+                    let mut tc = TsCache::new();
+                    let mut tm = now();
+                    scan::<4>(c, |&[cid, uid, cmp, ts]| {
+                        if cid.is_empty() || uid.is_empty() {
+                            return;
+                        }
+                        let Some(ci) = camp.get(cmp) else { return };
+                        let Some(t) = parse_ts_c(ts, &mut tc) else { return };
+                        if t < ws - WEEK || t >= we {
+                            return;
+                        }
+                        tmp.push(ClickRec { key: ukey(&rs, uid), ts: t, cid: pack(cid), camp: ci });
+                    });
+                    pt(9, &mut tm);
+                    tmp
+                })
+                .collect();
+            tick("clicks scanned");
+            r
+        },
+        ),
     );
 
-    // clicks
-    let click_chunks = all_chunks(&csv_files(&data.join("clicks")), CHUNK);
-    let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_chunks
-        .par_iter()
-        .map(|&c| {
-            let mut tmp: Vec<ClickRec> = Vec::with_capacity(c.len() / 40);
-            let mut tc = TsCache::new();
+    // clicks: resolve to person keys and bucket
+    let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_raw
+        .into_par_iter()
+        .map(|mut tmp| {
             let mut tm = now();
-            scan::<4>(c, |&[cid, uid, cmp, ts]| {
-                if cid.is_empty() || uid.is_empty() {
-                    return;
-                }
-                let Some(ci) = camp.get(cmp) else { return };
-                let Some(t) = parse_ts_c(ts, &mut tc) else { return };
-                if t < ws - WEEK || t >= we {
-                    return;
-                }
-                tmp.push(ClickRec { key: ukey(&rs, uid), ts: t, cid: pack(cid), camp: ci });
-            });
-            pt(9, &mut tm);
             let n = tmp.len();
             for i in 0..n {
                 if i + PFD < n {
@@ -2296,40 +2315,34 @@ fn main() {
     // person buckets
     let d0 = ws.div_euclid(DAY);
     let nd = if we > ws { ((we - 1).div_euclid(DAY) - d0 + 1) as usize } else { 0 };
-    let results = match ev_out {
-        Evs::L(v) => ev_after(v, &tab, &click_out, ws, we, ncamp, d0, nd, &tick),
-        Evs::W(v) => ev_after(v, &tab, &click_out, ws, we, ncamp, d0, nd, &tick),
-    };
-    tick("sessionized");
-
-    // outputs
     let names = Names { map: names_map };
     let ud_dir = outd.join("user_daily");
     let cd_dir = outd.join("campaign_daily");
     std::fs::create_dir_all(&ud_dir).unwrap();
     std::fs::create_dir_all(&cd_dir).unwrap();
+    let wrote = AtomicBool::new(false);
+    // each sessionize group writes its own file as soon as it finishes
+    let sink = |g: usize, groups: &[&Vec<UD>]| {
+        if groups.iter().any(|x| !x.is_empty()) {
+            wrote.store(true, Relaxed);
+            write_user_daily(&ud_dir.join(format!("part-{g}.parquet")), groups, &cat_names, &names);
+        }
+    };
+    let results = match ev_out {
+        Evs::L(v) => ev_after(v, &tab, &click_out, ws, we, ncamp, d0, nd, &tick, &sink),
+        Evs::W(v) => ev_after(v, &tab, &click_out, ws, we, ncamp, d0, nd, &tick, &sink),
+    };
+    tick("sessionized");
     let mut cm = CampAcc::new(ncamp + 1, d0, nd);
-    let mut ud_groups: Vec<&Vec<UD>> = vec![];
-    for (u, m) in &results {
-        ud_groups.extend(u.iter());
+    for (_, m) in &results {
         cm.merge(m);
     }
     let rows = cm.rows();
-    let nf = 16usize;
-    let mut files: Vec<Vec<&Vec<UD>>> = (0..nf).map(|_| vec![]).collect();
-    let mut load = vec![0usize; nf];
-    ud_groups.sort_by_key(|g| std::cmp::Reverse(g.len()));
-    for g in ud_groups {
-        let k = (0..nf).min_by_key(|&k| load[k]).unwrap();
-        load[k] += g.len();
-        files[k].push(g);
-    }
-    let any_rows = files.iter().any(|g| g.iter().any(|x| !x.is_empty()));
     rayon::join(
         || {
-            files.par_iter().enumerate().filter(|(i, g)| g.iter().any(|x| !x.is_empty()) || (*i == 0 && !any_rows)).for_each(|(i, g)| {
-                write_user_daily(&ud_dir.join(format!("part-{i}.parquet")), g, &cat_names, &names);
-            })
+            if !wrote.load(Relaxed) {
+                write_user_daily(&ud_dir.join("part-0.parquet"), &[], &cat_names, &names);
+            }
         },
         || write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows, &camp_names, &channels),
     );
