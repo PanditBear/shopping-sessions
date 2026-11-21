@@ -2431,6 +2431,77 @@ unsafe fn pack6x2(pa: *const u8, na: usize, pb: *const u8, nb: usize) -> (u64, b
     (ka, oka, kb, okb)
 }
 
+/// Bytes 0..8 and 3..11 of "2000-01-01T", and that day's start in seconds: the key every
+/// `DayCache` slot starts with (a match on it is a correct hit).
+const D0_A: u64 = u64::from_le_bytes(*b"2000-01-");
+const D0_B: u64 = u64::from_le_bytes(*b"0-01-01T");
+const D0_S: i64 = 10_957 * 86_400;
+
+#[derive(Clone, Copy)]
+struct DayEnt {
+    a: u64,
+    b: u64,
+    ds: i64,
+}
+/// Day starts (seconds) of "YYYY-MM-DDT" prefixes, keyed by bytes 0..8 and 3..11; only valid
+/// dates followed by 'T' are stored.
+struct DayCache {
+    ents: Box<[DayEnt; 256]>,
+}
+impl DayCache {
+    fn new() -> Self {
+        DayCache { ents: Box::new([DayEnt { a: D0_A, b: D0_B, ds: D0_S }; 256]) }
+    }
+}
+
+/// Load 8 bytes at `p` (little-endian).
+#[inline(always)]
+unsafe fn ldp(p: *const u8) -> u64 {
+    u64::from_le((p as *const u64).read_unaligned())
+}
+
+/// Day start in seconds of the "YYYY-MM-DDT" at `p`, given `a` = bytes 0..8 and `b` = bytes 3..11.
+#[inline(always)]
+unsafe fn day_get(a: u64, b: u64, p: *const u8, c: &mut DayCache) -> Option<i64> {
+    let e = &c.ents[(b.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize];
+    if (e.a == a) & (e.b == b) {
+        Some(e.ds)
+    } else {
+        day_miss(a, b, p, c)
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn day_miss(a: u64, b: u64, p: *const u8, c: &mut DayCache) -> Option<i64> {
+    let s = std::slice::from_raw_parts(p, 11);
+    if s[10] != b'T' {
+        return None;
+    }
+    let ds = ts_days(s)? * 86_400;
+    c.ents[(b.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize] = DayEnt { a, b, ds };
+    Some(ds)
+}
+
+/// Seconds of the day of the 8 bytes "HH:MM:SS" at `p`. One range test per byte (digits with
+/// first digits up to 2, 5, 5, and the two colons), then the hour test.
+#[inline(always)]
+unsafe fn hms(p: *const u8) -> Option<i64> {
+    const LO: u64 = u64::from_le_bytes(*b"00:00:00");
+    const HI: u64 = u64::from_le_bytes([0x7F - b'2', 0x7F - b'9', 0x7F - b':', 0x7F - b'5', 0x7F - b'9', 0x7F - b':', 0x7F - b'5', 0x7F - b'9']);
+    let t = ldp(p);
+    let v = t.wrapping_sub(LO);
+    if ((v | t.wrapping_add(HI)) & h8(0x80)) != 0 {
+        return None;
+    }
+    let v = v.wrapping_mul(10).wrapping_add(v >> 8);
+    let h = (v & 0xFF) as i64;
+    if h > 23 {
+        return None;
+    }
+    Some((h * 60 + ((v >> 24) & 0xFF) as i64) * 60 + ((v >> 48) & 0xFF) as i64)
+}
+
 /// `ts_iso` of the 20 bytes "YYYY-MM-DDTHH:MM:SSZ" at `p`, in whole seconds (the caller checks
 /// the length and byte 19).
 #[inline(always)]
@@ -2478,6 +2549,7 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
     use core::arch::x86_64::_bzhi_u64;
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
+    let mut dci = DayCache::new();
     let c0 = c.as_ptr() as usize;
     // SAFETY (bzhi): BMI2 is enabled for this build
     let bzhi = |x: u64, n: u32| unsafe { _bzhi_u64(x, n) };
@@ -2545,8 +2617,16 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
             // SAFETY: both ids start in the first window, so 16 bytes from each stay inside
             // the 128 readable bytes at p
             let (ke, oke, ku, oku) = unsafe { pack6x2(pe, ne, pu, nu) };
-            // SAFETY (iso_secs): a 20-byte field lies inside its window
-            let iso_i = if ni == 20 && unsafe { *pi.add(19) } == b'Z' { Some(unsafe { iso_secs(pi, &mut tci) }) } else { None };
+            // SAFETY (ldp, hms): a 20-byte field lies inside its window
+            let iso_i = if ni == 20 && unsafe { *pi.add(19) } == b'Z' {
+                let (dd, hs) = unsafe { (day_get(ldp(pi), ldp(pi.add(3)), pi, &mut dci), hms(pi.add(11))) };
+                Some(match (dd, hs) {
+                    (Some(d), Some(h)) => Some(d + h),
+                    _ => None,
+                })
+            } else {
+                None
+            };
             let (ingest, ik, iex) = match iso_i {
                 Some(Some(s)) => {
                     let v = s - ibase + IOFF;
