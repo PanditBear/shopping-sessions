@@ -1393,12 +1393,15 @@ fn sort_clicks(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Vec<u3
         return;
     }
     hk_scatter(cl, tmp, cnt, |c| c.key);
+    let mut pk: Vec<u64> = vec![];
+    // walk the non-empty digit ranges only: a bucket holds fewer clicks than there are digits
     let mut st = 0usize;
-    for d in 0..1usize << NBK {
-        let en = cnt[d] as usize;
+    while st < n {
+        let en = cnt[dg(tmp[st].key)] as usize;
         let m = en - st;
         if m == 1 {
             cl[st] = tmp[st];
+        } else if m > 32 && sort_one_clicker(&tmp[st..en], &mut cl[st..en], &mut pk) {
         } else if m > 1 {
             let o = &mut cl[st..en];
             o.copy_from_slice(&tmp[st..en]);
@@ -1410,6 +1413,43 @@ fn sort_clicks(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Vec<u3
         }
         st = en;
     }
+}
+
+/// A long digit range is nearly always one heavy clicker. When every click in `src` has the same key,
+/// sort (ts, index) pairs packed into u64s, gather into `out`, then order each run of equal ts by
+/// click_id bytes. Returns false (and leaves `out` alone) for a range with several keys.
+fn sort_one_clicker(src: &[ClickRec], out: &mut [ClickRec], pk: &mut Vec<u64>) -> bool {
+    let m = src.len();
+    let k0 = src[0].key;
+    let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+    for c in src {
+        if c.key != k0 {
+            return false;
+        }
+        lo = lo.min(c.ts);
+        hi = hi.max(c.ts);
+    }
+    if m >= 1 << 20 || hi.wrapping_sub(lo) as u64 >= 1 << 43 {
+        return false;
+    }
+    pk.clear();
+    pk.extend(src.iter().enumerate().map(|(j, c)| ((c.ts.wrapping_sub(lo) as u64) << 20) | j as u64));
+    pk.sort_unstable();
+    for (o, &u) in out.iter_mut().zip(pk.iter()) {
+        *o = src[(u & 0xF_FFFF) as usize];
+    }
+    let mut a = 0;
+    while a < m {
+        let mut b = a + 1;
+        while b < m && out[b].ts == out[a].ts {
+            b += 1;
+        }
+        if b - a > 1 {
+            out[a..b].sort_unstable_by(|x, y| unpack(x.cid).cmp(unpack(y.cid)));
+        }
+        a = b;
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
