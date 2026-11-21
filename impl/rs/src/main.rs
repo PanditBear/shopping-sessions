@@ -6,8 +6,106 @@ use std::mem::MaybeUninit;
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(not(target_os = "linux"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: big::Big = big::Big;
+
+/// Linux: large blocks get their own anonymous mapping marked MADV_HUGEPAGE, so the big tables
+/// fault in (and are freed at exit) as 2 MiB pages even when THP is in "madvise" mode.
+/// Everything else goes to mimalloc.
+#[cfg(target_os = "linux")]
+mod big {
+    use std::alloc::{GlobalAlloc, Layout};
+    extern "C" {
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+        fn munmap(addr: *mut u8, len: usize) -> i32;
+        fn mremap(old: *mut u8, old_len: usize, new_len: usize, flags: i32, ...) -> *mut u8;
+        fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    }
+    const BIG: usize = 4 << 20;
+    const PAGE: usize = 4096;
+    const PROT_RW: i32 = 0x1 | 0x2;
+    const MAP_PRIVATE_ANON: i32 = 0x02 | 0x20;
+    const MREMAP_MAYMOVE: i32 = 1;
+    const MADV_HUGEPAGE: i32 = 14;
+    const FAILED: *mut u8 = !0usize as *mut u8;
+    pub struct Big;
+    static MI: mimalloc::MiMalloc = mimalloc::MiMalloc;
+    #[inline]
+    fn plen(n: usize) -> usize {
+        (n + PAGE - 1) & !(PAGE - 1)
+    }
+    #[inline]
+    fn is_big(size: usize, align: usize) -> bool {
+        size >= BIG && align <= PAGE
+    }
+    unsafe fn map(n: usize) -> *mut u8 {
+        let len = plen(n);
+        let p = mmap(std::ptr::null_mut(), len, PROT_RW, MAP_PRIVATE_ANON, -1, 0);
+        if p == FAILED {
+            return std::ptr::null_mut();
+        }
+        madvise(p, len, MADV_HUGEPAGE);
+        p
+    }
+    unsafe impl GlobalAlloc for Big {
+        #[inline]
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            if is_big(l.size(), l.align()) {
+                map(l.size())
+            } else {
+                MI.alloc(l)
+            }
+        }
+        #[inline]
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            if is_big(l.size(), l.align()) {
+                map(l.size())
+            } else {
+                MI.alloc_zeroed(l)
+            }
+        }
+        #[inline]
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            if is_big(l.size(), l.align()) {
+                munmap(p, plen(l.size()));
+            } else {
+                MI.dealloc(p, l)
+            }
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, new_size: usize) -> *mut u8 {
+            let (ob, nb) = (is_big(l.size(), l.align()), is_big(new_size, l.align()));
+            match (ob, nb) {
+                (false, false) => MI.realloc(p, l, new_size),
+                (true, true) => {
+                    let (ol, nl) = (plen(l.size()), plen(new_size));
+                    if ol == nl {
+                        return p;
+                    }
+                    let q = mremap(p, ol, nl, MREMAP_MAYMOVE);
+                    if q == FAILED {
+                        return std::ptr::null_mut();
+                    }
+                    madvise(q, nl, MADV_HUGEPAGE);
+                    q
+                }
+                _ => {
+                    let nlay = Layout::from_size_align_unchecked(new_size, l.align());
+                    let q = self.alloc(nlay);
+                    if !q.is_null() {
+                        std::ptr::copy_nonoverlapping(p, q, l.size().min(new_size));
+                        self.dealloc(p, l);
+                    }
+                    q
+                }
+            }
+        }
+    }
+}
 
 type B = &'static [u8];
 
