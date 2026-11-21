@@ -3630,6 +3630,22 @@ fn ev_after_idx<E: Ev>(
                             lb.clear();
                             lg.clear();
                             for (ci, c) in ev_out.iter().enumerate() {
+                                // each chunk keeps bucket b in its own far-off stretch: fetch the count a few
+                                // chunks ahead and the records of the next chunk but one
+                                if let Some(n) = ev_out.get(ci + 4) {
+                                    if b < n.dz.dn.len() {
+                                        prefetch(n.dz.dn.as_ptr().wrapping_add(b));
+                                    }
+                                }
+                                if let Some(n) = ev_out.get(ci + 2) {
+                                    if b < n.dz.dn.len() {
+                                        let p = (n.dz.r.as_ptr() as *const DR<E>).wrapping_add(b * n.dz.cap) as *const u8;
+                                        let len = n.dz.dn[b] as usize * std::mem::size_of::<DR<E>>();
+                                        for o in (0..len.min(1024)).step_by(64) {
+                                            prefetch(p.wrapping_add(o));
+                                        }
+                                    }
+                                }
                                 let (sa, sp, oa, op) = c.dz.seg(b);
                                 for (part, p0) in [(sa, sp), (oa, op)] {
                                     for (j, x) in part.iter().enumerate() {
