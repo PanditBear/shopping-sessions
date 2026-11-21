@@ -1216,7 +1216,7 @@ fn sort_small<E: Ev>(v: &mut [E]) {
 }
 
 /// Bits of the in-bucket person digit.
-const NBK: u32 = 13;
+const NBK: u32 = 14;
 
 /// In-bucket person digit: hash bits disjoint from the bucket bits (`pbk`). Within a bucket,
 /// events and clicks are both ordered by (digit, key): every person's records stay contiguous
