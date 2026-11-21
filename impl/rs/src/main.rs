@@ -1797,6 +1797,7 @@ struct EvChunk<E> {
 fn ev_after<E: Ev>(
     mut ev_out: Vec<EvChunk<E>>,
     tab: &IdTab,
+    mf: &MoverF,
     click_out: &[(Vec<ClickRec>, Vec<u32>)],
     ws: i64,
     we: i64,
@@ -1908,9 +1909,6 @@ fn ev_after<E: Ev>(
             },
         );
     }
-    let mut tm = now();
-    let mf = MoverF::build(tab);
-    pt(4, &mut tm);
     // kept lines: user key -> person key (0 marks a dropped line; keys that miss the mover filter
     // map to themselves without a table lookup), then each chunk's kept lines
     // are grouped by person bucket inside the chunk (a cache-sized scatter; the order within a
@@ -2384,6 +2382,9 @@ fn main() {
 
     // clicks
     let click_chunks = all_chunks(&csv_files(&data.join("clicks")), CHUNK);
+    let mut tm = now();
+    let mf = MoverF::build(&tab);
+    pt(4, &mut tm);
     let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_chunks
         .par_iter()
         .map(|&c| {
@@ -2402,12 +2403,22 @@ fn main() {
                 tmp.push(ClickRec { key: ukey(&rs, uid), ts: t, cid: pack(cid), camp: ci });
             });
             pt(9, &mut tm);
+            // keys that miss the mover filter map to themselves without a table lookup
             let n = tmp.len();
             for i in 0..n {
-                if i + PFD < n {
-                    tab.pf(tmp[i + PFD].key);
+                if i + 2 * PFD < n {
+                    mf.pf(tmp[i + 2 * PFD].key);
                 }
-                tmp[i].key = tab.get(tmp[i].key);
+                if i + PFD < n {
+                    let k = tmp[i + PFD].key;
+                    if mf.hit(k) {
+                        tab.pf(k);
+                    }
+                }
+                let k = tmp[i].key;
+                if mf.hit(k) {
+                    tmp[i].key = tab.get(k);
+                }
             }
             let r = bucketize(&tmp, PB, |x| pbk(x.key));
             pt(10, &mut tm);
@@ -2424,8 +2435,8 @@ fn main() {
     let d0 = ws.div_euclid(DAY);
     let nd = if we > ws { ((we - 1).div_euclid(DAY) - d0 + 1) as usize } else { 0 };
     let results = match ev_out {
-        Evs::L(v) => ev_after(v, &tab, &click_out, ws, we, ncamp, d0, nd, &tick),
-        Evs::W(v) => ev_after(v, &tab, &click_out, ws, we, ncamp, d0, nd, &tick),
+        Evs::L(v) => ev_after(v, &tab, &mf, &click_out, ws, we, ncamp, d0, nd, &tick),
+        Evs::W(v) => ev_after(v, &tab, &mf, &click_out, ws, we, ncamp, d0, nd, &tick),
     };
     tick("sessionized");
 
