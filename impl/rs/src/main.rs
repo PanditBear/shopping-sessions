@@ -13,6 +13,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 // purged (MADV_DONTNEED in 64 KiB slices) about a second later. That splits the huge pages, and the
 // memory is faulted and zeroed again when the next phase reuses it. Peak RSS is reached before the
 // big frees, so keeping freed memory committed costs almost nothing. SHOP_PURGE=1 restores the default.
+mod f3probe;
 mod hpa {
     extern "C" {
         fn mi_option_set(option: i32, value: std::ffi::c_long);
@@ -4589,6 +4590,9 @@ enum Evs {
 }
 
 fn main() {
+    if std::env::var("SHOP_F3").is_ok() {
+        f3probe::run();
+    }
     hpa::init();
     let ep = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
     let ep0 = ep();
