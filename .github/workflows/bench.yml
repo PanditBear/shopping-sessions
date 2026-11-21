@@ -10,12 +10,18 @@ on:
       runs:
         description: "timed runs per ref"
         default: "5"
+      probe:
+        description: "1 = one SHOP_PROBE run per image"
+        default: "1"
+      perf:
+        description: "1 = perf profile of the first image's binary on the host"
+        default: "1"
 permissions:
   contents: read
 jobs:
   bench:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -29,5 +35,7 @@ jobs:
       - name: bench
         env:
           RUNS: ${{ github.event.inputs.runs || '5' }}
-          REFS: ${{ github.event.inputs.refs || '98cdde8 af124c1 1698b09' }}
+          REFS: ${{ github.event.inputs.refs || '1698b09 1698b09@MIMALLOC_ALLOW_LARGE_OS_PAGES=1 1698b09@MIMALLOC_PURGE_DELAY=-1 1698b09@MIMALLOC_ALLOW_LARGE_OS_PAGES=1@MIMALLOC_PURGE_DELAY=-1' }}
+          PROBE: ${{ github.event.inputs.probe || '1' }}
+          PERF: ${{ github.event.inputs.perf || '1' }}
         run: bash bench.sh $REFS
