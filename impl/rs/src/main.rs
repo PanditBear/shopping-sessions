@@ -1712,7 +1712,13 @@ struct EvCtx<'a> {
     we: i64,
     ibase: i64,
     rs: &'a RandomState,
+    tab: &'a IdTab,
+    mf: &'a MoverF,
 }
+
+/// lines between the mover filter prefetch and its check, and between the table prefetch and the lookup
+const RLA: usize = 4;
+const RLB: usize = 8;
 
 /// Parses one chunk of event lines. Every line with an event_id gets a record in `m` (key 0 when
 /// the line is invalid) and a dedup entry: packed event_id in `d`, others in `fb`; ingest times
@@ -1722,6 +1728,11 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
     let c0 = c.as_ptr() as usize;
+    let m0 = m.len();
+    // user key -> person key, pipelined over the last few records: keys that miss the mover filter
+    // map to themselves; the others queue a table lookup RLB records later
+    let mut q = [0u32; 32];
+    let (mut qh, mut qt) = (0usize, 0usize);
     scan7(c, |&[eid, uid, ts, ing, et, pr, price]| {
         {
             if eid.is_empty() {
@@ -1765,6 +1776,25 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
             }
             let loc = m.len() as u32;
             m.push(r);
+            let n = m.len();
+            if r.key() != 0 {
+                cx.mf.pf(r.key());
+            }
+            while qh < qt && q[qh % 32] as usize + RLA + RLB < n {
+                let j = q[qh % 32] as usize;
+                qh += 1;
+                let k = m[j].key();
+                m[j].set_key(cx.tab.get(k));
+            }
+            if n > m0 + RLA {
+                let j = n - 1 - RLA;
+                let k = m[j].key();
+                if k != 0 && cx.mf.hit(k) {
+                    cx.tab.pf(k);
+                    q[qt % 32] = j as u32;
+                    qt += 1;
+                }
+            }
             let (ik, exact) = ing32(ingest, cx.ibase);
             if !exact {
                 side.push((loc, ingest));
@@ -1775,6 +1805,18 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
             }
         }
     });
+    while qh < qt {
+        let j = q[qh % 32] as usize;
+        qh += 1;
+        let k = m[j].key();
+        m[j].set_key(cx.tab.get(k));
+    }
+    for j in m0.max(m.len().saturating_sub(RLA))..m.len() {
+        let k = m[j].key();
+        if k != 0 && cx.mf.hit(k) {
+            m[j].set_key(cx.tab.get(k));
+        }
+    }
 }
 
 struct EvChunk<E> {
@@ -1789,7 +1831,6 @@ struct EvChunk<E> {
 #[allow(clippy::too_many_arguments)]
 fn ev_after<E: Ev>(
     mut ev_out: Vec<EvChunk<E>>,
-    tab: &IdTab,
     click_out: &[(Vec<ClickRec>, Vec<u32>)],
     ws: i64,
     we: i64,
@@ -1901,11 +1942,7 @@ fn ev_after<E: Ev>(
             },
         );
     }
-    let mut tm = now();
-    let mf = MoverF::build(tab);
-    pt(4, &mut tm);
-    // kept lines: user key -> person key (0 marks a dropped line; keys that miss the mover filter
-    // map to themselves without a table lookup), then each chunk's kept lines
+    // kept lines (records already carry the person key; 0 marks a dropped line): each chunk's kept lines
     // are grouped by person bucket inside the chunk (a cache-sized scatter; the order within a
     // bucket stays the line order). The sessionizer gathers a bucket from every chunk in chunk order.
     let parts: Vec<(Vec<E>, Vec<u32>)> = ev_out
@@ -1918,21 +1955,10 @@ fn ev_after<E: Ev>(
             let mut m = c.m;
             let n = m.len();
             for i in 0..n {
-                if i + 2 * PFD < n {
-                    mf.pf(m[i + 2 * PFD].key());
-                }
-                if i + PFD < n {
-                    let k = m[i + PFD].key();
-                    if mf.hit(k) {
-                        tab.pf(k);
-                    }
-                }
                 let g = mb + i;
                 let k = m[i].key();
                 if k != 0 && dead[g >> 6].load(Relaxed) & (1u64 << (g & 63)) == 0 {
-                    let pk = if mf.hit(k) { tab.get(k) } else { k };
-                    m[i].set_key(pk);
-                    cnt[pbk(pk) + 1] += 1;
+                    cnt[pbk(k) + 1] += 1;
                 } else {
                     m[i].set_key(0);
                 }
@@ -2142,9 +2168,9 @@ fn main() {
         })
         .collect();
     tick("links parsed");
-    // links (serial union-find) overlaps the parallel event parse; events do not need the id table
-    let ((tab, mut names_map), (ev_out, click_raw)) = rayon::join(
-        || {
+    // links complete first with all threads; the event parse maps user -> person as it goes
+    let (tab, mut names_map) = {
+        {
             let occ: usize = link_pairs.iter().map(|v| v.len()).sum::<usize>() * 2;
             let mut names_map: AHashMap<u64, u64> = AHashMap::new();
             let tab = {
@@ -2275,12 +2301,15 @@ fn main() {
             drop(link_pairs);
             tick("links done");
             (tab, names_map)
-        },
-        || rayon::join(
+        }
+    };
+    let mf = MoverF::build(&tab);
+    tick("movers");
+    let (ev_out, click_raw) = rayon::join(
         || {
             let ev_files = csv_files(&data.join("events"));
             let ev_chunks = all_chunks(&ev_files, ev_chunk(&ev_files));
-            let cx = EvCtx { prod: &prod, unknown_cat, ws, we, ibase: ws.div_euclid(1000), rs: &rs };
+            let cx = EvCtx { prod: &prod, unknown_cat, ws, we, ibase: ws.div_euclid(1000), rs: &rs, tab: &tab, mf: &mf };
             if std::env::var_os("SHOP_PARSE").is_some() {
                 if lean {
                     parse_aid::<EvL>(&ev_chunks, &cx);
@@ -2398,7 +2427,6 @@ fn main() {
             tick("clicks scanned");
             r
         },
-        ),
     );
 
     // clicks: map keys through the identity table
@@ -2428,8 +2456,8 @@ fn main() {
     let d0 = ws.div_euclid(DAY);
     let nd = if we > ws { ((we - 1).div_euclid(DAY) - d0 + 1) as usize } else { 0 };
     let results = match ev_out {
-        Evs::L(v) => ev_after(v, &tab, &click_out, ws, we, ncamp, d0, nd, &tick),
-        Evs::W(v) => ev_after(v, &tab, &click_out, ws, we, ncamp, d0, nd, &tick),
+        Evs::L(v) => ev_after(v, &click_out, ws, we, ncamp, d0, nd, &tick),
+        Evs::W(v) => ev_after(v, &click_out, ws, we, ncamp, d0, nd, &tick),
     };
     tick("sessionized");
 
