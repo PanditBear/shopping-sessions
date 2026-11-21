@@ -2742,8 +2742,7 @@ fn main() {
                 // the insert table becomes the id table in place: a slot's index turns into its person key;
                 // the same pass fills the mover filter (a component of s ids has s - 1 movers)
                 let mov = nl - nroot;
-                let mfd: usize = std::env::var("SHOP_MFD").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
-                let mf = MoverF::new(mov, mfd);
+                let mf = MoverF::new(mov, 8);
                 {
                     let (root, bk, mf) = (&root[..], &idx_key[..], &mf);
                     t.s.par_chunks_mut(1 << 14).for_each(|c| {
