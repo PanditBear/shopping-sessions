@@ -998,6 +998,10 @@ impl MoverF {
 const PFD: usize = 12;
 /// prefetch distance of the user -> person passes (mover filter, then table), sized for DRAM latency
 const RPD: usize = 32;
+/// id table slices of the partitioned user -> person pass (by the top bits of the key hash, the
+/// bits that pick the table slot): 1024 slices of the 128 MB table at 60M are 128 KB each
+const RSB: u32 = 10;
+const RNS: usize = 1 << RSB;
 
 // ---------- records ----------
 
@@ -2832,6 +2836,34 @@ struct EvChunk<E> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct DLine([u64; 8]);
+
+// (slots whose event_id equals k, free slots) of a dedup table line, as 4-bit masks
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn line4(l: &DLine, k: u64) -> (u32, u32) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let v = _mm256_load_si256(l.0.as_ptr() as *const __m256i);
+        let eq = _mm256_cmpeq_epi64(v, _mm256_set1_epi64x(k as i64));
+        let z = _mm256_cmpeq_epi64(v, _mm256_setzero_si256());
+        (_mm256_movemask_pd(_mm256_castsi256_pd(eq)) as u32, _mm256_movemask_pd(_mm256_castsi256_pd(z)) as u32)
+    }
+}
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+fn line4(l: &DLine, k: u64) -> (u32, u32) {
+    let mut eq = 0;
+    let mut z = 0;
+    for j in 0..4 {
+        eq |= ((l.0[j] == k) as u32) << j;
+        z |= ((l.0[j] == 0) as u32) << j;
+    }
+    (eq, z)
+}
+
 fn ev_after<E: Ev>(
     mut ev_out: Vec<EvChunk<E>>,
     tab: &IdTab,
@@ -2878,42 +2910,54 @@ fn ev_after<E: Ev>(
                     let mut tm = now();
                     let totals: [usize; DDG] =
                         std::array::from_fn(|i| ev_out.iter().map(|c| (c.doff[g * DDG + i + 1] - c.doff[g * DDG + i]) as usize).sum());
-                    let maxcap = (totals.iter().max().unwrap() * 2).max(16).next_power_of_two();
-                    // slot: (event_id, ingest key << 32 | global index of the current winner)
-                    let mut tbuf: Vec<[u64; 2]> = vec![[0, 0]; maxcap];
+                    let maxl = (totals.iter().max().unwrap() / 2).max(4).next_power_of_two();
+                    // 64-byte lines of 4 slots: event_ids, then (ingest key << 32 | global index of the
+                    // current winner). A line fills in slot order, so a key is absent once a line has a
+                    // free slot; one line holds the probe almost always (load ~45%).
+                    let mut tbuf: Vec<DLine> = vec![DLine([0; 8]); maxl];
                     for (i, &total) in totals.iter().enumerate() {
                         let b = g * DDG + i;
-                        let cap = (total * 2).max(16).next_power_of_two();
-                        let mask = cap - 1;
-                        let t = &mut tbuf[..cap];
+                        let nl = (total / 2).max(4).next_power_of_two();
+                        let lmask = nl - 1;
+                        let t = &mut tbuf[..nl];
                         if i > 0 {
-                            t.fill([0, 0]);
+                            t.fill(DLine([0; 8]));
                         }
                         for (ci, c) in ev_out.iter().enumerate() {
                             let mb = mbase[ci];
+                            // the next chunk's segment starts at an unpredictable address: fetch its head early
+                            if let Some(nx) = ev_out.get(ci + 1) {
+                                let s = nx.doff[b] as usize;
+                                prefetch(nx.d.as_ptr().wrapping_add(s));
+                                prefetch(nx.d.as_ptr().wrapping_add(s + 4));
+                            }
                             for r in &c.d[c.doff[b] as usize..c.doff[b + 1] as usize] {
                                 let gi = mb + r.loc;
                                 let pk = ((r.ing as u64) << 32) | gi as u64;
-                                let mut p = (mix(r.eid) >> 8) as usize & mask;
+                                let mut p = (mix(r.eid) >> 8) as usize & lmask;
                                 loop {
-                                    let o = unsafe { t.get_unchecked_mut(p) };
-                                    if o[0] == 0 {
-                                        *o = [r.eid, pk];
-                                        break;
-                                    }
-                                    if o[0] == r.eid {
-                                        let ok = (o[1] >> 32) as u32;
-                                        let og = o[1] as u32;
+                                    let l = unsafe { t.get_unchecked_mut(p) };
+                                    let (meq, mz) = line4(l, r.eid);
+                                    if meq != 0 {
+                                        let j = meq.trailing_zeros() as usize + 4;
+                                        let ok = (l.0[j] >> 32) as u32;
+                                        let og = l.0[j] as u32;
                                         let win = r.ing < ok || (r.ing == ok && side_any && exact(gi, r.ing) < exact(og, ok));
                                         if win {
-                                            o[1] = pk;
+                                            l.0[j] = pk;
                                             kill(og);
                                         } else {
                                             kill(gi);
                                         }
                                         break;
                                     }
-                                    p = (p + 1) & mask;
+                                    if mz != 0 {
+                                        let j = mz.trailing_zeros() as usize;
+                                        l.0[j] = r.eid;
+                                        l.0[j + 4] = pk;
+                                        break;
+                                    }
+                                    p = (p + 1) & lmask;
                                 }
                             }
                         }
@@ -2947,55 +2991,116 @@ fn ev_after<E: Ev>(
             },
         );
     }
-    // kept lines: user key -> person key (0 marks a dropped line; keys that miss the mover filter
-    // map to themselves without a table lookup), then each chunk's kept lines
-    // are grouped by person bucket inside the chunk (a cache-sized scatter; the order within a
-    // bucket stays the line order). The sessionizer gathers a bucket from every chunk in chunk order.
-    let parts: Vec<(Vec<E>, Vec<u32>)> = ev_out
+    // kept lines: keys that miss the mover filter map to themselves and are grouped by person
+    // bucket inside their chunk (a cache-sized scatter). Keys that hit it (candidate movers) are
+    // grouped by id table slice (the top bits of their table slot) instead; each slice is then
+    // resolved on its own, so the slice of the table it probes stays cache resident, and the
+    // resolved lines are grouped by person bucket into extra parts. The sessionizer gathers a
+    // bucket from every part; the order inside a bucket does not matter.
+    let sl = |k: u64| (mix(k) >> (64 - RSB)) as usize;
+    let pass: Vec<((Vec<E>, Vec<u32>), (Vec<E>, Vec<u32>))> = ev_out
         .into_par_iter()
         .enumerate()
         .map(|(ci, c)| {
             let mut tm = now();
-            let mut cnt = vec![0u32; PB + 1];
             let mb = mbase[ci] as usize;
-            let mut m = c.m;
+            let m = c.m;
             let n = m.len();
+            // 0 dropped, 1 own key, 2 candidate mover
+            let mut cls = vec![0u8; n];
+            let mut cnt = vec![0u32; PB + 1];
+            let mut ccnt = vec![0u32; RNS + 1];
             for i in 0..n {
                 if i + 2 * RPD < n {
                     mf.pf(m[i + 2 * RPD].key());
                 }
-                if i + RPD < n {
-                    let k = m[i + RPD].key();
-                    if mf.hit(k) {
-                        tab.pf(k);
-                    }
-                }
                 let g = mb + i;
                 let k = m[i].key();
                 if k != 0 && dead[g >> 6].load(Relaxed) & (1u64 << (g & 63)) == 0 {
-                    let pk = if mf.hit(k) { tab.get(k) } else { k };
-                    m[i].set_key(pk);
-                    cnt[pbk(pk) + 1] += 1;
-                } else {
-                    m[i].set_key(0);
+                    if mf.hit(k) {
+                        cls[i] = 2;
+                        ccnt[sl(k) + 1] += 1;
+                    } else {
+                        cls[i] = 1;
+                        cnt[pbk(k) + 1] += 1;
+                    }
                 }
             }
             pt(4, &mut tm);
             for p in 0..PB {
                 cnt[p + 1] += cnt[p];
             }
+            for p in 0..RNS {
+                ccnt[p + 1] += ccnt[p];
+            }
             let tot = cnt[PB] as usize;
+            let ctot = ccnt[RNS] as usize;
+            let mut out: Vec<E> = Vec::with_capacity(tot);
+            let mut cand: Vec<E> = Vec::with_capacity(ctot);
+            {
+                let mut w = cnt.clone();
+                let mut cw = ccnt.clone();
+                let sp = out.spare_capacity_mut();
+                let cp = cand.spare_capacity_mut();
+                for (e, &t) in m.iter().zip(cls.iter()) {
+                    if t == 1 {
+                        let p = pbk(e.key());
+                        sp[w[p] as usize].write(*e);
+                        w[p] += 1;
+                    } else if t == 2 {
+                        let p = sl(e.key());
+                        cp[cw[p] as usize].write(*e);
+                        cw[p] += 1;
+                    }
+                }
+            }
+            unsafe {
+                out.set_len(tot);
+                cand.set_len(ctot);
+            }
+            pt(5, &mut tm);
+            ((out, cnt), (cand, ccnt))
+        })
+        .collect();
+    drop(dead);
+    let (mut parts, cands): (Vec<(Vec<E>, Vec<u32>)>, Vec<(Vec<E>, Vec<u32>)>) = pass.into_iter().unzip();
+    let ng = (rayon::current_num_threads() * 8).clamp(1, RNS);
+    let per = RNS.div_ceil(ng);
+    let mparts: Vec<(Vec<E>, Vec<u32>)> = (0..RNS.div_ceil(per))
+        .into_par_iter()
+        .map(|gi| {
+            let mut tm = now();
+            let (s0, s1) = (gi * per, ((gi + 1) * per).min(RNS));
+            let tot: usize = cands.iter().map(|(_, o)| (o[s1] - o[s0]) as usize).sum();
+            let mut gl: Vec<E> = Vec::with_capacity(tot);
+            let mut cnt = vec![0u32; PB + 1];
+            for s in s0..s1 {
+                let a = gl.len();
+                for (v, o) in cands.iter() {
+                    gl.extend_from_slice(&v[o[s] as usize..o[s + 1] as usize]);
+                }
+                let b = gl.len();
+                for i in a..b {
+                    if i + PFD < b {
+                        tab.pf(gl[i + PFD].key());
+                    }
+                    let pk = tab.get(gl[i].key());
+                    gl[i].set_key(pk);
+                    cnt[pbk(pk) + 1] += 1;
+                }
+            }
+            pt(4, &mut tm);
+            for p in 0..PB {
+                cnt[p + 1] += cnt[p];
+            }
             let mut out: Vec<E> = Vec::with_capacity(tot);
             {
                 let mut w = cnt.clone();
                 let sp = out.spare_capacity_mut();
-                for e in &m {
-                    let k = e.key();
-                    if k != 0 {
-                        let p = pbk(k);
-                        sp[w[p] as usize].write(*e);
-                        w[p] += 1;
-                    }
+                for e in &gl {
+                    let p = pbk(e.key());
+                    sp[w[p] as usize].write(*e);
+                    w[p] += 1;
                 }
             }
             unsafe { out.set_len(tot) };
@@ -3003,7 +3108,8 @@ fn ev_after<E: Ev>(
             (out, cnt)
         })
         .collect();
-    drop(dead);
+    drop(cands);
+    parts.extend(mparts);
     tick("dedup done");
 
     let ngroups = (rayon::current_num_threads() * 4).clamp(1, PB);
