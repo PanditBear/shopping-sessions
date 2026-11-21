@@ -177,7 +177,7 @@ jobs:
           o=$(mktemp -d); s2=$(mktemp -d)
           for i in 1 2 3; do
             echo "== solbench pass $i"
-            env DATA_DIR=$D OUTPUT_DIR=$o SCRATCH_DIR=$s2 NCPU=1 SHOP_SOLBENCH=1 SHOP_SOLREPS=5 $W/shop 2>&1 | grep -E 'solbench|panic|rror' | head -20
+            env DATA_DIR=$D OUTPUT_DIR=$o SCRATCH_DIR=$s2 NCPU=1 SHOP_SOLBENCH=1 SHOP_SOLREPS=5 SHOP_SOLABL=1 $W/shop 2>&1 | grep -E 'solbench|panic|rror' | head -20
           done
           echo "== shipped timing NCPU=4"
           env DATA_DIR=$D OUTPUT_DIR=$o SCRATCH_DIR=$s2 NCPU=4 SHOP_TIMING=1 $W/shop 2>&1 | grep -E 'written|prof' | head -20
