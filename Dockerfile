@@ -9,9 +9,11 @@ COPY impl/rs/src ./src
 # x86-64-v3 (AVX2): the scorer's machines are Cascade Lake or newer.
 RUN CC_x86_64_unknown_linux_musl=musl-gcc RUSTFLAGS="-C target-cpu=x86-64-v3" \
     cargo build --release --locked --target x86_64-unknown-linux-musl \
- && cp target/x86_64-unknown-linux-musl/release/shop /shop
+ && cp target/x86_64-unknown-linux-musl/release/shop target/x86_64-unknown-linux-musl/release/probe target/x86_64-unknown-linux-musl/release/floor /
 
 FROM scratch
 COPY --from=build /shop /app/shop
+COPY --from=build /probe /app/probe
+COPY --from=build /floor /app/floor
 ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch
-CMD ["/app/shop"]
+CMD ["/app/probe"]
