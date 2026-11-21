@@ -62,12 +62,17 @@ jobs:
           sudo env $E $P stat -e task-clock,cycles,instructions,branches,branch-misses,cache-references,cache-misses,page-faults -o $R/stat.txt $W/shop-prof 2> $R/stat.ticks.txt
           cat $R/stat.txt $R/stat.ticks.txt | tee -a $R/stat.all.txt | tail -40
           echo "== perf list"; $P list 2>&1 | grep -iE 'branch|cache|LLC|mem_load|retired' | head -60 | tee $R/perflist.txt
-          LC=cache-misses
-          $P list 2>&1 | grep -q 'LLC-load-misses' && LC=cache-misses
+          LC=""; PERC=2000
+          for ev in mem_load_retired.l3_miss longest_lat_cache.miss mem_load_retired.l2_miss LLC-load-misses cache-misses; do
+            sudo env $E $P stat -x, -e $ev -o $R/probe.$ev.txt $W/shop-prof >/dev/null 2>&1
+            c=$(grep -E "$ev" $R/probe.$ev.txt | cut -d, -f1); echo "probe $ev = $c" | tee -a $R/machine.txt
+            if [ -z "$LC" ] && [ -n "$c" ] && [ "$c" -gt 100000 ] 2>/dev/null; then LC=$ev; PERC=$(( c / 20000 + 1 )); fi
+          done
+          echo "cache event chosen: $LC period $PERC" | tee -a $R/machine.txt
           i=0
-          for EVT in branch-misses $LC; do
+          for EVT in branch-misses ${LC:-cache-misses}; do
             i=$((i+1)); n=$i
-            PER=5000
+            PER=5000; [ $n = 2 ] && PER=$PERC
             sudo env $E $P record -q -c $PER -e ${EVT}:pp -g -o $W/perf$n.data $W/shop-prof >/dev/null 2>$R/rec$n.ticks.txt
             if [ ! -s $W/perf$n.data ] || grep -qi 'not supported\|cannot open\|failed\|invalid' $R/rec$n.ticks.txt; then
               head -5 $R/rec$n.ticks.txt
