@@ -1254,12 +1254,54 @@ fn sort_evs<E: Ev>(evs: &mut [E], tmp: &mut Vec<E>, cnt: &mut Vec<u32>, span: i6
                 for (j, &k) in ks.iter().enumerate() {
                     evs[st + j] = r[(k & 0xFF) as usize];
                 }
+            } else if fast && m >= RADIX_MIN && r.iter().all(|e| e.key() == k0) {
+                radix_rts(&mut tmp[st..en], &mut evs[st..en]);
             } else {
                 evs[st..en].copy_from_slice(r);
                 sort_small(&mut evs[st..en]);
             }
         }
         st = en;
+    }
+}
+
+/// Smallest one-person range that `sort_evs` orders with `radix_rts`.
+const RADIX_MIN: usize = 2048;
+
+/// Stable LSD radix sort of `a` by rts (11-bit digits) into `b`; `a` is scratch.
+fn radix_rts<E: Ev>(a: &mut [E], b: &mut [E]) {
+    let n = a.len();
+    let mx = a.iter().map(|e| e.rts()).max().unwrap_or(0);
+    let np = ((64 - mx.leading_zeros()) as usize).div_ceil(11).max(1);
+    let mut h = vec![[0u32; 2048]; np];
+    for e in a.iter() {
+        let t = e.rts();
+        for (j, hj) in h.iter_mut().enumerate() {
+            hj[((t >> (11 * j)) & 2047) as usize] += 1;
+        }
+    }
+    let (mut src, mut dst) = (a, b);
+    let mut in_b = false;
+    for (j, hj) in h.iter_mut().enumerate() {
+        if hj.iter().any(|&c| c as usize == n) {
+            continue;
+        }
+        let mut s = 0u32;
+        for x in hj.iter_mut() {
+            let c = *x;
+            *x = s;
+            s += c;
+        }
+        for e in src.iter() {
+            let d = ((e.rts() >> (11 * j)) & 2047) as usize;
+            dst[hj[d] as usize] = *e;
+            hj[d] += 1;
+        }
+        std::mem::swap(&mut src, &mut dst);
+        in_b = !in_b;
+    }
+    if !in_b {
+        dst.copy_from_slice(src);
     }
 }
 
