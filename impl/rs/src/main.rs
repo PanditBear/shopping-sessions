@@ -1586,13 +1586,12 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names)
         rg.close().unwrap();
         buf.clear();
     };
-    // Rows ordered by name (packed keys sort like the names), so neighbours share prefixes.
-    let mut all: Vec<&UD> = groups.iter().flat_map(|g| g.iter()).collect();
-    all.sort_unstable_by_key(|r| (r.key, r.day));
-    for r in all {
-        buf.push(r);
-        if buf.len() >= RG {
-            flush(&mut buf, &mut w, false, &mut nrg);
+    for g in groups {
+        for r in g.iter() {
+            buf.push(r);
+            if buf.len() >= RG {
+                flush(&mut buf, &mut w, false, &mut nrg);
+            }
         }
     }
     flush(&mut buf, &mut w, nrg == 0, &mut nrg);
