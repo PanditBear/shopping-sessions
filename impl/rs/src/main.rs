@@ -3778,7 +3778,8 @@ fn process_runs<E: Ev>(
             for r in &runs[a..b] {
                 tmp.extend_from_slice(&evs[r.s as usize..(r.s + r.l) as usize]);
             }
-            tmp.sort_unstable_by_key(|e| e.rts());
+            // the runs are sorted (ok): a stable sort merges them instead of sorting from scratch
+            tmp.sort_by_key(|e| e.rts());
             &tmp[..]
         };
         while ci < clicks.len() && (dg(clicks[ci].key), clicks[ci].key) < (pd, pid) {
