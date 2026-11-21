@@ -4047,20 +4047,24 @@ fn ev_after_idx<E: Ev>(
                 // dense buckets: one slot per index; the slot keeps the winning copy (smallest
                 // ingest), then the slots are read in index order
                 const G: usize = 4;
-                let span = 1usize << cfg.sh;
+                // each bucket is split into sub-spans of 2^SS slots so the slot table stays cache-resident
+                const SS: u32 = 13;
+                let ss = cfg.sh.min(SS);
+                let nsub = 1usize << (cfg.sh - ss);
+                let span = 1usize << ss;
                 let mask = span as u64 - 1;
                 (0..ndb.div_ceil(G))
                     .into_par_iter()
                     .map(|g| {
                         let mut tm = now();
                         let mut t: Vec<u64> = vec![u64::MAX; span];
-                        let mut lb: Vec<E> = Vec::new();
-                        let mut lg: Vec<u64> = Vec::new();
+                        let mut sb: Vec<Vec<(DR<E>, u64)>> = (0..nsub).map(|_| Vec::new()).collect();
                         let mut em: Vec<E> = Vec::new();
                         let mut pc = PkCache { k: [0; 4], p: [0; 4], n: 0 };
                         for b in g * G..((g + 1) * G).min(ndb) {
-                            lb.clear();
-                            lg.clear();
+                            for v in sb.iter_mut() {
+                                v.clear();
+                            }
                             for (ci, c) in ev_out.iter().enumerate() {
                                 // each chunk keeps bucket b in its own far-off stretch: fetch the count a few
                                 // chunks ahead and the records of the next chunk but one
@@ -4081,34 +4085,37 @@ fn ev_after_idx<E: Ev>(
                                 let (sa, sp, oa, op) = c.dz.seg(b);
                                 for (part, p0) in [(sa, sp), (oa, op)] {
                                     for (j, x) in part.iter().enumerate() {
-                                        let q = lb.len() as u32;
-                                        lb.push(x.e);
-                                        if dside_any {
-                                            lg.push(((ci as u64) << 32) | (p0 + j) as u64);
-                                        }
-                                        let pk = ((x.ing as u64) << 32) | q as u64;
-                                        // SAFETY: the slot index is masked to span
-                                        let o = unsafe { t.get_unchecked_mut((x.i as u64 & mask) as usize) };
-                                        if *o == u64::MAX {
-                                            *o = pk;
-                                            continue;
-                                        }
-                                        let ok = (*o >> 32) as u32;
-                                        if x.ing < ok
-                                            || (x.ing == ok
-                                                && dside_any
-                                                && dexact(lg[q as usize], x.ing) < dexact(lg[*o as u32 as usize], ok))
-                                        {
-                                            *o = pk;
-                                        }
+                                        let l = if dside_any { ((ci as u64) << 32) | (p0 + j) as u64 } else { 0 };
+                                        // SAFETY: the sub-span index is masked below nsub
+                                        unsafe { sb.get_unchecked_mut(((x.i >> ss) as usize) & (nsub - 1)) }.push((*x, l));
                                     }
                                 }
                             }
                             pt(2, &mut tm);
-                            if !lb.is_empty() {
+                            for lb in sb.iter() {
+                                if lb.is_empty() {
+                                    continue;
+                                }
+                                for (q, (x, l)) in lb.iter().enumerate() {
+                                    let pk = ((x.ing as u64) << 32) | q as u64;
+                                    // SAFETY: the slot index is masked to span
+                                    let o = unsafe { t.get_unchecked_mut((x.i as u64 & mask) as usize) };
+                                    if *o == u64::MAX {
+                                        *o = pk;
+                                        continue;
+                                    }
+                                    let ok = (*o >> 32) as u32;
+                                    if x.ing < ok
+                                        || (x.ing == ok
+                                            && dside_any
+                                            && dexact(*l, x.ing) < dexact(lb[*o as u32 as usize].1, ok))
+                                    {
+                                        *o = pk;
+                                    }
+                                }
                                 for o in t.iter_mut() {
                                     if *o != u64::MAX {
-                                        let mut e = lb[*o as u32 as usize];
+                                        let mut e = lb[*o as u32 as usize].0.e;
                                         *o = u64::MAX;
                                         let k = e.key();
                                         if k != 0 {
