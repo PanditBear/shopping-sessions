@@ -89,7 +89,7 @@ jobs:
             grep -E '^\[[0-9.]+s\]' $R/rec$n.ticks.txt > $R/phase$n.ticks.txt
             prev=0.0; i=0
             while IFS= read -r line; do
-              t=$(echo "$line" | sed -E 's/^\[([0-9.]+)s\].*//'); lab=$(echo "$line" | sed -E 's/^\[[0-9.]+s\] *//' | cut -c1-40)
+              t=$(echo "$line" | sed -E 's/^\[([0-9.]+)s\].*/\1/'); lab=$(echo "$line" | sed -E 's/^\[[0-9.]+s\] *//' | cut -c1-40)
               i=$((i+1))
               a=$(echo "$T0 + $prev" | bc -l); b=$(echo "$T0 + $t" | bc -l)
               echo "### run$n phase $i: $prev .. $t s  (ends at: $lab)" >> $R/phases$n.txt
