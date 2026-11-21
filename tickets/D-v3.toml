@@ -1,0 +1,4 @@
+id = "D-v3"
+files = ["Dockerfile"]
+why = "build with target-cpu=x86-64-v3 (AVX2); scorer is Cascade Lake or newer; 7% faster at n=1, gated"
+created = "2026-11-20 19:19:06"
