@@ -2502,43 +2502,6 @@ unsafe fn hms(p: *const u8) -> Option<i64> {
     Some((h * 60 + ((v >> 24) & 0xFF) as i64) * 60 + ((v >> 48) & 0xFF) as i64)
 }
 
-/// `ts_iso` of the 20 bytes "YYYY-MM-DDTHH:MM:SSZ" at `p`, in whole seconds (the caller checks
-/// the length and byte 19).
-#[inline(always)]
-unsafe fn iso_secs(p: *const u8, c: &mut TsCache) -> Option<i64> {
-    let b = std::slice::from_raw_parts(p, 20);
-    if b[10] != b'T' {
-        return None;
-    }
-    let t = ld8(b, 11);
-    let t2 = t ^ 0x00000A00000A0000;
-    if (t & 0x0000FF0000FF0000) != 0x00003A00003A0000 || !dig8(t2) {
-        return None;
-    }
-    let v = t2.wrapping_sub(h8(0x30));
-    let v = v.wrapping_mul(10).wrapping_add(v >> 8);
-    let (h, mi, s) = ((v & 0xFF) as i64, ((v >> 24) & 0xFF) as i64, ((v >> 48) & 0xFF) as i64);
-    if h > 23 || mi > 59 || s > 59 {
-        return None;
-    }
-    let days;
-    let p8 = ld8(b, 0);
-    let tag2 = u16::from_le_bytes([b[8], b[9]]) as u32 | 0x1_0000;
-    let hi = ((p8 ^ ((tag2 as u64) << 40)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> c.sh) as usize;
-    debug_assert!(hi < c.ents.len());
-    // SAFETY: the shift leaves 64 - sh bits and ents has 1 << (64 - sh) entries
-    let ent = c.ents.get_unchecked_mut(hi);
-    if ent.p8 == p8 && ent.tag2 == tag2 {
-        days = ent.days as i64;
-    } else {
-        days = ts_days(b)?;
-        if days == days as i32 as i64 {
-            *ent = TsEnt { p8, tag2, days: days as i32 };
-        }
-    }
-    Some(days * 86_400 + (h * 60 + mi) * 60 + s)
-}
-
 /// Same records, dedup entries and side lists, in the same order, as `parse_events`, except
 /// that the category of a record with no price is 0 (no product lookup for views and carts;
 /// `Ev::pc` never reads it). One fused pass: the `scan7` line classifier with the fields kept
@@ -2550,6 +2513,7 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
     let mut dci = DayCache::new();
+    let mut dct = DayCache::new();
     let c0 = c.as_ptr() as usize;
     // SAFETY (bzhi): BMI2 is enabled for this build
     let bzhi = |x: u64, n: u32| unsafe { _bzhi_u64(x, n) };
@@ -2617,12 +2581,18 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
             // SAFETY: both ids start in the first window, so 16 bytes from each stay inside
             // the 128 readable bytes at p
             let (ke, oke, ku, oku) = unsafe { pack6x2(pe, ne, pu, nu) };
-            // SAFETY (ldp, hms): a 20-byte field lies inside its window
+            // SAFETY (ldp, hms): a 20-byte field lies inside its window. (ra, rb, rd): the
+            // ingest's date key and day start when it is a valid F1 date, else 2000-01-01's.
+            let (mut ra, mut rb, mut rd) = (D0_A, D0_B, D0_S);
             let iso_i = if ni == 20 && unsafe { *pi.add(19) } == b'Z' {
-                let (dd, hs) = unsafe { (day_get(ldp(pi), ldp(pi.add(3)), pi, &mut dci), hms(pi.add(11))) };
-                Some(match (dd, hs) {
-                    (Some(d), Some(h)) => Some(d + h),
-                    _ => None,
+                let (ia, ib) = unsafe { (ldp(pi), ldp(pi.add(3))) };
+                let (dd, hs) = unsafe { (day_get(ia, ib, pi, &mut dci), hms(pi.add(11))) };
+                Some(match dd {
+                    Some(d) => {
+                        (ra, rb, rd) = (ia, ib, d);
+                        hs.map(|h| d + h)
+                    }
+                    None => None,
                 })
             } else {
                 None
@@ -2645,8 +2615,18 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
                     break 'v;
                 }
                 let t = if nt == 20 && unsafe { *pt.add(19) } == b'Z' {
-                    match unsafe { iso_secs(pt, &mut tct) } {
-                        Some(s) => s * 1000,
+                    // same date bytes as the ingest: same day start
+                    let (ta, tb) = unsafe { (ldp(pt), ldp(pt.add(3))) };
+                    let d = if (ta == ra) & (tb == rb) {
+                        rd
+                    } else {
+                        match unsafe { day_get(ta, tb, pt, &mut dct) } {
+                            Some(d) => d,
+                            None => break 'v,
+                        }
+                    };
+                    match unsafe { hms(pt.add(11)) } {
+                        Some(h) => (d + h) * 1000,
                         None => break 'v,
                     }
                 } else if nt == 13 {
@@ -3930,5 +3910,60 @@ mod pack_simd_tests {
             chk(&a, &b);
         }
         assert_eq!(pack6(b"u_123"), Some(1055258694234669056));
+    }
+
+    #[test]
+    fn f1_fixed_matches_ts_iso() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+            fn chance(&mut self, pct: u64) -> bool {
+                self.below(100) < pct
+            }
+        }
+        let mut r = Rng(0x5EED_F1F1_0BAD_CAFE);
+        let alpha = b"0123456789:-TZtz +\"
+,";
+        let mut dc = DayCache::new();
+        let mut buf = [0u8; 32];
+        let mut ok = 0u32;
+        for i in 0..400_000u32 {
+            let y = 1990 + r.below(60);
+            let mo = 1 + r.below(13);
+            let d = 1 + r.below(31);
+            let (h, mi, s) = (r.below(25), r.below(61), r.below(61));
+            let t = format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z");
+            buf[..20].copy_from_slice(t.as_bytes());
+            let k = if i % 4 == 0 { 0 } else { 1 + r.below(3) };
+            for _ in 0..k {
+                let at = r.below(20) as usize;
+                buf[at] = if r.chance(70) { alpha[r.below(alpha.len() as u64) as usize] } else { r.next() as u8 };
+            }
+            let b = &buf[..20];
+            let want = if b[19] == b'Z' { ts_iso(b, &mut TsCache::with_bits(1)) } else { None };
+            let p = buf.as_ptr();
+            let got = if b[19] == b'Z' {
+                // SAFETY: buf has 32 bytes
+                unsafe {
+                    match (day_get(ldp(p), ldp(p.add(3)), p, &mut dc), hms(p.add(11))) {
+                        (Some(d), Some(h)) => Some((d + h) * 1000),
+                        _ => None,
+                    }
+                }
+            } else {
+                None
+            };
+            assert_eq!(got, want, "{:?}", String::from_utf8_lossy(b));
+            ok += want.is_some() as u32;
+        }
+        assert!(ok > 50_000, "{ok}");
     }
 }
