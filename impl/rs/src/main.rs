@@ -3827,8 +3827,9 @@ fn ev_after<E: Ev>(
     let cost = pb_cost(&parts, click_out);
     lpt_run(&cost, || SsW::new(ncamp, d0, nd), |p, w: &mut SsW<E>| {
         w.gather(p, &parts, click_out);
-        let mut uds = Vec::new();
+        let mut uds = Vec::with_capacity(w.ulen + w.ulen / 8 + 64);
         process_bucket(&mut w.evs, &mut w.tmp, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut uds, &mut w.cm, ws, we.wrapping_sub(ws));
+        w.ulen = uds.len();
         w.out.push(uds);
     })
     .into_iter()
@@ -3846,6 +3847,7 @@ struct SsW<E> {
     runs: Vec<Run>,
     cnt: Vec<u32>,
     cl: Vec<ClickRec>,
+    ulen: usize,
     ctmp: Vec<ClickRec>,
 }
 
@@ -3861,6 +3863,7 @@ impl<E: Ev> SsW<E> {
             cnt: vec![],
             cl: vec![],
             ctmp: vec![],
+            ulen: 0,
         }
     }
     /// Collects person bucket p's lines and clicks from every chunk.
@@ -4231,8 +4234,9 @@ fn ev_after_idx<E: Ev>(
     let cost = pb_cost(&parts, click_out);
     lpt_run(&cost, || SsW::new(ncamp, d0, nd), |p, w: &mut SsW<E>| {
         w.gather(p, &parts, click_out);
-        let mut uds = Vec::new();
+        let mut uds = Vec::with_capacity(w.ulen + w.ulen / 8 + 64);
         process_runs(&w.evs, &mut w.tmp, &mut w.runs, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut uds, &mut w.cm, ws);
+        w.ulen = uds.len();
         w.out.push(uds);
     })
     .into_iter()
