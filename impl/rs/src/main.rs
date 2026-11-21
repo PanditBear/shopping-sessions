@@ -1758,6 +1758,25 @@ fn scatter_counted<T: Copy>(v: &[T], mut cnt: Vec<u32>, bk: impl Fn(&T) -> usize
     (out, cnt)
 }
 
+fn scatter_owned<T: Copy>(v: &[T], ow: &[u32], mut cnt: Vec<u32>) -> (Vec<T>, Vec<u32>) {
+    let nb = cnt.len() - 1;
+    for i in 0..nb {
+        cnt[i + 1] += cnt[i];
+    }
+    let mut w = cnt.clone();
+    let mut out: Vec<T> = Vec::with_capacity(v.len());
+    {
+        let sp: &mut [MaybeUninit<T>] = out.spare_capacity_mut();
+        for (x, &o) in v.iter().zip(ow) {
+            sp[w[o as usize] as usize].write(*x);
+            w[o as usize] += 1;
+        }
+    }
+    assert_eq!(cnt[nb] as usize, v.len());
+    unsafe { out.set_len(v.len()) };
+    (out, cnt)
+}
+
 #[inline(always)]
 fn pbk(key: u64) -> usize {
     (mix(key) >> 20) as usize & (PB - 1)
@@ -5260,6 +5279,7 @@ fn main() {
             let n = tmp.len();
             let mut hit = vec![0u32; n + 1];
             let mut cnt = vec![0u32; nown + 1];
+            let mut ow = vec![0u32; n];
             let mut m = 0usize;
             for i in 0..n {
                 if i + RPD < n {
@@ -5269,7 +5289,9 @@ fn main() {
                 let h = mf.hit(k);
                 hit[m] = i as u32;
                 m += h as usize;
-                cnt[bkt(k) + 1] += (!h) as u32;
+                let o = bkt(k);
+                ow[i] = o as u32;
+                cnt[o + 1] += (!h) as u32;
             }
             for j in 0..m {
                 if j + RPD < m {
@@ -5278,10 +5300,12 @@ fn main() {
                 let i = hit[j] as usize;
                 let k = tab.get(tmp[i].key);
                 tmp[i].key = k;
-                cnt[bkt(k) + 1] += 1;
+                let o = bkt(k);
+                ow[i] = o as u32;
+                cnt[o + 1] += 1;
             }
             drop(hit);
-            let r = scatter_counted(&tmp, cnt, |x| bkt(x.key));
+            let r = scatter_owned(&tmp, &ow, cnt);
             pt(10, &mut tm);
             r
         })
