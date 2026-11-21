@@ -1712,13 +1712,7 @@ struct EvCtx<'a> {
     we: i64,
     ibase: i64,
     rs: &'a RandomState,
-    tab: &'a IdTab,
-    mf: &'a MoverF,
 }
-
-/// lines between the mover filter prefetch and its check, and between the table prefetch and the lookup
-const RLA: usize = 4;
-const RLB: usize = 8;
 
 /// Parses one chunk of event lines. Every line with an event_id gets a record in `m` (key 0 when
 /// the line is invalid) and a dedup entry: packed event_id in `d`, others in `fb`; ingest times
@@ -1728,11 +1722,6 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
     let c0 = c.as_ptr() as usize;
-    let m0 = m.len();
-    // user key -> person key, pipelined over the last few records: keys that miss the mover filter
-    // map to themselves; the others queue a table lookup RLB records later
-    let mut q = [0u32; 32];
-    let (mut qh, mut qt) = (0usize, 0usize);
     scan7(c, |&[eid, uid, ts, ing, et, pr, price]| {
         {
             if eid.is_empty() {
@@ -1776,25 +1765,6 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
             }
             let loc = m.len() as u32;
             m.push(r);
-            let n = m.len();
-            if r.key() != 0 {
-                cx.mf.pf(r.key());
-            }
-            while qh < qt && q[qh % 32] as usize + RLA + RLB < n {
-                let j = q[qh % 32] as usize;
-                qh += 1;
-                let k = m[j].key();
-                m[j].set_key(cx.tab.get(k));
-            }
-            if n > m0 + RLA {
-                let j = n - 1 - RLA;
-                let k = m[j].key();
-                if k != 0 && cx.mf.hit(k) {
-                    cx.tab.pf(k);
-                    q[qt % 32] = j as u32;
-                    qt += 1;
-                }
-            }
             let (ik, exact) = ing32(ingest, cx.ibase);
             if !exact {
                 side.push((loc, ingest));
@@ -1805,18 +1775,6 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
             }
         }
     });
-    while qh < qt {
-        let j = q[qh % 32] as usize;
-        qh += 1;
-        let k = m[j].key();
-        m[j].set_key(cx.tab.get(k));
-    }
-    for j in m0.max(m.len().saturating_sub(RLA))..m.len() {
-        let k = m[j].key();
-        if k != 0 && cx.mf.hit(k) {
-            m[j].set_key(cx.tab.get(k));
-        }
-    }
 }
 
 struct EvChunk<E> {
@@ -1984,15 +1942,44 @@ fn ev_after<E: Ev>(
         .collect()
 }
 
-/// Groups one chunk's records by person bucket (line order kept within a bucket) and moves the
-/// dedup and side entries to the records' new positions. Dropped lines (key 0) get the positions
-/// after all kept ones and are not stored.
-fn pscatter<E: Ev>(m: Vec<E>, d: &mut [DRec], fb: &mut [(u64, i64, u32)], side: &mut [(u32, i64)]) -> (Vec<E>, Vec<u32>) {
+/// Maps every chunk's user keys to person keys and groups its records by person bucket.
+fn scatter_all<E: Ev>(v: &mut [EvChunk<E>], tab: &IdTab, mf: &MoverF) {
+    v.par_iter_mut().for_each(|c| {
+        let mut tm = now();
+        let m = std::mem::take(&mut c.m);
+        let (m, cnt) = pscatter(m, tab, mf, &mut c.d, &mut c.fb, &mut c.side);
+        c.m = m;
+        c.cnt = cnt;
+        pt(5, &mut tm);
+    });
+}
+
+/// Maps one chunk's user keys to person keys, groups its records by person bucket (line order kept
+/// within a bucket) and moves the dedup and side entries to the records' new positions. Dropped
+/// lines (key 0) get the positions after all kept ones and are not stored.
+fn pscatter<E: Ev>(mut m: Vec<E>, tab: &IdTab, mf: &MoverF, d: &mut [DRec], fb: &mut [(u64, i64, u32)], side: &mut [(u32, i64)]) -> (Vec<E>, Vec<u32>) {
     let n = m.len();
     let mut cnt = vec![0u32; PB + 2];
-    for e in &m {
-        let k = e.key();
-        cnt[if k != 0 { pbk(k) } else { PB } + 1] += 1;
+    // user key -> person key while the chunk is warm (keys that miss the mover filter map to
+    // themselves without a table lookup), counting each person bucket
+    for i in 0..n {
+        if i + 2 * PFD < n {
+            mf.pf(m[i + 2 * PFD].key());
+        }
+        if i + PFD < n {
+            let k = m[i + PFD].key();
+            if k != 0 && mf.hit(k) {
+                tab.pf(k);
+            }
+        }
+        let k = m[i].key();
+        if k != 0 {
+            let pk = if mf.hit(k) { tab.get(k) } else { k };
+            m[i].set_key(pk);
+            cnt[pbk(pk) + 1] += 1;
+        } else {
+            cnt[PB + 1] += 1;
+        }
     }
     for p in 0..=PB {
         cnt[p + 1] += cnt[p];
@@ -2068,11 +2055,9 @@ fn ev_parse<E: Ev>(ev_chunks: &[B], cx: &EvCtx) -> Vec<EvChunk<E>> {
             let mut tm = now();
             parse_events(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
             pt(0, &mut tm);
-            let (m, cnt) = pscatter(m, &mut d, &mut fb, &mut side);
-            pt(5, &mut tm);
             let (d, doff) = bucketize(&d, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize);
             pt(1, &mut tm);
-            EvChunk { m, cnt, d, doff, fb, fbn, side }
+            EvChunk { m, cnt: vec![], d, doff, fb, fbn, side }
         })
         .collect()
 }
@@ -2206,9 +2191,9 @@ fn main() {
         })
         .collect();
     tick("links parsed");
-    // links complete first with all threads; the event parse maps user -> person as it goes
-    let (tab, mut names_map) = {
-        {
+    // links overlap the parallel event parse; person keys are mapped per event chunk after the join
+    let ((tab, mut names_map), (mut ev_out, click_raw)) = rayon::join(
+        || {
             let occ: usize = link_pairs.iter().map(|v| v.len()).sum::<usize>() * 2;
             let mut names_map: AHashMap<u64, u64> = AHashMap::new();
             let tab = {
@@ -2339,15 +2324,12 @@ fn main() {
             drop(link_pairs);
             tick("links done");
             (tab, names_map)
-        }
-    };
-    let mf = MoverF::build(&tab);
-    tick("movers");
-    let (ev_out, click_raw) = rayon::join(
+        },
+        || rayon::join(
         || {
             let ev_files = csv_files(&data.join("events"));
             let ev_chunks = all_chunks(&ev_files, ev_chunk(&ev_files));
-            let cx = EvCtx { prod: &prod, unknown_cat, ws, we, ibase: ws.div_euclid(1000), rs: &rs, tab: &tab, mf: &mf };
+            let cx = EvCtx { prod: &prod, unknown_cat, ws, we, ibase: ws.div_euclid(1000), rs: &rs };
             if std::env::var_os("SHOP_PARSE").is_some() {
                 if lean {
                     parse_aid::<EvL>(&ev_chunks, &cx);
@@ -2465,7 +2447,15 @@ fn main() {
             tick("clicks scanned");
             r
         },
+        ),
     );
+    let mf = MoverF::build(&tab);
+    tick("movers");
+    match &mut ev_out {
+        Evs::L(v) => scatter_all(v, &tab, &mf),
+        Evs::W(v) => scatter_all(v, &tab, &mf),
+    }
+    tick("events scattered");
 
     // clicks: map keys through the identity table
     let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_raw
