@@ -3936,7 +3936,6 @@ struct SsW<E> {
     out: Vec<Vec<UD>>,
     evs: Vec<E>,
     tmp: Vec<E>,
-    runs: Vec<Run>,
     srt: Vec<SRun>,
     cnt: Vec<u32>,
     cl: Vec<ClickRec>,
@@ -3951,7 +3950,6 @@ impl<E: Ev> SsW<E> {
             out: vec![],
             evs: vec![],
             tmp: vec![],
-            runs: vec![],
             srt: vec![],
             cnt: vec![],
             cl: vec![],
@@ -3973,9 +3971,7 @@ impl<E: Ev> SsW<E> {
     }
 
     /// Dense path: collects person bucket p's clicks and run descriptors, orders the runs by
-    /// (digit, key, part, offset) (the order process_runs used to rebuild from the gathered
-    /// lines), then copies each run's lines into evs in that order. Runs of one person end up
-    /// adjacent and are joined into one Run (sorted if every piece is sorted and the seams are).
+    /// (digit, key, part, offset); process_runs reads the lines straight from their tasks.
     fn gather_rd(&mut self, p: usize, dparts: &[RdPart<E>], rest: &(Vec<E>, Vec<u32>), click_out: &[(Vec<ClickRec>, Vec<u32>)]) {
         let mut tm = now();
         self.cl.clear();
@@ -4010,36 +4006,6 @@ impl<E: Ev> SsW<E> {
         pt(6, &mut tm);
         srt.sort_unstable_by_key(|r| (r.d, r.k, r.src));
         pt(7, &mut tm);
-        let nd = dparts.len();
-        let src = |r: &SRun| -> &[E] {
-            let t = (r.src >> 32) as usize;
-            let off = r.src as u32 as usize;
-            let v = if t < nd { &dparts[t].0 } else { &rest.0 };
-            &v[off..off + (r.lk >> 1) as usize]
-        };
-        let evs = &mut self.evs;
-        let runs = &mut self.runs;
-        evs.clear();
-        runs.clear();
-        for i in 0..srt.len() {
-            if let Some(nx) = srt.get(i + RD_AHEAD) {
-                let q = src(nx).as_ptr() as *const u8;
-                prefetch(q);
-                prefetch(q.wrapping_add(64));
-            }
-            let r = &srt[i];
-            let v = src(r);
-            let ok = r.lk & 1 != 0;
-            let s = evs.len();
-            match runs.last_mut() {
-                Some(last) if last.k == r.k => {
-                    last.ok = last.ok && ok && v[0].rts() >= evs[s - 1].rts();
-                    last.l += v.len() as u32;
-                }
-                _ => runs.push(Run { d: r.d, k: r.k, s: s as u32, l: v.len() as u32, ok }),
-            }
-            evs.extend_from_slice(v);
-        }
         pt(6, &mut tm);
     }
 }
@@ -4503,10 +4469,11 @@ fn ev_after_idx<E: Ev>(
 
     let offs: Vec<&[u32]> = dparts.iter().map(|x| &x.3[..]).chain(std::iter::once(&rest.1[..])).collect();
     let cost = pb_cost(&offs, click_out);
+    let srcs: Vec<&[E]> = dparts.iter().map(|x| &x.0[..]).chain(std::iter::once(&rest.0[..])).collect();
     lpt_run(&cost, || SsW::new(ncamp, d0, nd), |p, w: &mut SsW<E>| {
         w.gather_rd(p, &dparts, &rest, click_out);
         let mut uds = Vec::new();
-        process_runs(&w.evs, &mut w.tmp, &w.runs, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut uds, &mut w.cm, ws);
+        process_runs(&srcs, &mut w.tmp, &w.srt, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut uds, &mut w.cm, ws);
         w.out.push(uds);
     })
     .into_iter()
@@ -4514,24 +4481,15 @@ fn ev_after_idx<E: Ev>(
     .collect()
 }
 
-/// A stretch of one person's lines in a bucket: digit, person key, start, length, ts sorted.
-#[derive(Clone, Copy)]
-struct Run {
-    d: u32,
-    k: u64,
-    s: u32,
-    l: u32,
-    ok: bool,
-}
-
 /// process_bucket for lines that arrive mostly as one ts-sorted run per person: the runs are
-/// ordered by (digit, key) (gather_rd); a person given as one sorted run is sessionized in place,
-/// any other person (several runs, or a run out of ts order) is gathered and sorted by ts first.
+/// ordered by (digit, key) (gather_rd) and read from their source tasks (srcs, the rest lines last);
+/// a person given as one sorted run is sessionized straight from its source, any other person
+/// (several runs, or a run out of ts order) is gathered and sorted by ts first.
 #[allow(clippy::too_many_arguments)]
 fn process_runs<E: Ev>(
-    evs: &[E],
+    srcs: &[&[E]],
     tmp: &mut Vec<E>,
-    runs: &[Run],
+    runs: &[SRun],
     cnt: &mut Vec<u32>,
     clicks: &mut Vec<ClickRec>,
     ctmp: &mut Vec<ClickRec>,
@@ -4546,22 +4504,36 @@ fn process_runs<E: Ev>(
     pt(11, &mut tm);
     let mut ci = 0;
     let mut day = DayAcc { key: 0, day: 0, sessions: 0, events: 0, rev: 0, cats: vec![] };
+    let piece = |r: &SRun| -> &[E] {
+        let off = r.src as u32 as usize;
+        &srcs[(r.src >> 32) as usize][off..off + (r.lk >> 1) as usize]
+    };
     let mut a = 0;
     while a < runs.len() {
+        if let Some(nx) = runs.get(a + RD_AHEAD) {
+            let q = piece(nx).as_ptr() as *const u8;
+            prefetch(q);
+            prefetch(q.wrapping_add(64));
+        }
         let pid = runs[a].k;
         let pd = runs[a].d as usize;
         let mut b = a + 1;
         while b < runs.len() && runs[b].k == pid {
             b += 1;
         }
-        let pes: &[E] = if b == a + 1 && runs[a].ok {
-            &evs[runs[a].s as usize..(runs[a].s + runs[a].l) as usize]
+        let pes: &[E] = if b == a + 1 && runs[a].lk & 1 != 0 {
+            piece(&runs[a])
         } else {
             tmp.clear();
+            let mut ok = true;
             for r in &runs[a..b] {
-                tmp.extend_from_slice(&evs[r.s as usize..(r.s + r.l) as usize]);
+                let v = piece(r);
+                ok &= r.lk & 1 != 0 && tmp.last().map_or(true, |l| v[0].rts() >= l.rts());
+                tmp.extend_from_slice(v);
             }
-            tmp.sort_by_key(|e| e.rts()); // stable driftsort merges the sorted runs
+            if !ok {
+                tmp.sort_by_key(|e| e.rts()); // stable driftsort merges the sorted runs
+            }
             &tmp[..]
         };
         while ci < clicks.len() && (dg(clicks[ci].key), clicks[ci].key) < (pd, pid) {
