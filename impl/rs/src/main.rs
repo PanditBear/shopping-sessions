@@ -1724,6 +1724,17 @@ fn main() {
         eprintln!("{}", memstats());
         eprintln!("epoch main={:.3} end={:.3}", ep0, ep());
     }
-    // all output files are written and closed; skip freeing the large tables
+    // all output files are written and closed: leave at once, skipping the allocator's exit-time cleanup
+    // and the freeing of the large tables
+    #[cfg(unix)]
+    unsafe {
+        _exit(0)
+    }
+    #[cfg(not(unix))]
     std::process::exit(0);
+}
+
+#[cfg(unix)]
+extern "C" {
+    fn _exit(code: i32) -> !;
 }
