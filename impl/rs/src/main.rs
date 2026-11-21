@@ -3483,7 +3483,6 @@ fn main() {
         if timing {
             eprintln!("dropin end {:.3}s", ep() - t);
         }
-        hpa::rusage("dropin");
     }
     // all output files are written and closed; skip freeing the large tables
     std::process::exit(0);
