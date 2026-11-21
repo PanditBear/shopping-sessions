@@ -1858,16 +1858,22 @@ impl Bp {
     fn put(&mut self, v: u32) {
         self.acc |= (v as u64) << self.nb;
         self.nb += self.w;
-        while self.nb >= 8 {
-            self.o.push(self.acc as u8);
-            self.acc >>= 8;
-            self.nb -= 8;
+        if self.nb >= 32 {
+            self.o.extend_from_slice(&(self.acc as u32).to_le_bytes());
+            self.acc >>= 32;
+            self.nb -= 32;
         }
         self.n += 1;
     }
     fn finish(mut self) -> Vec<u8> {
         while self.n % 8 != 0 {
             self.put(0);
+        }
+        // a multiple of 8 values leaves a whole number of bytes in the accumulator
+        while self.nb > 0 {
+            self.o.push(self.acc as u8);
+            self.acc >>= 8;
+            self.nb = self.nb.saturating_sub(8);
         }
         self.o
     }
@@ -1988,6 +1994,99 @@ fn int_col(f: &mut Pqf, c: &mut Cm, rows: &[&[UD]], n: usize, get: impl Fn(&UD) 
     }
 }
 
+/// Row group with every column built in one pass over the rows (all three integer columns have small
+/// ranges); the pages and their order are the same as the column-at-a-time path.
+fn ud_fused(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names, rg: (i64, i64, i64, i64, i64, i64), persons: usize, nn: usize) -> Vec<Cm> {
+    let (dlo, dhi, slo, shi, elo, ehi) = rg;
+    let (wd, wsn, wev) = (bwid((dhi - dlo) as u64), bwid((shi - slo) as u64), bwid((ehi - elo) as u64));
+    let wc = bwid(cats.len().saturating_sub(1) as u64);
+    let mut bd = Bp::new(wd, n, &[wd as u8]);
+    let mut bs = Bp::new(wsn, n, &[wsn as u8]);
+    let mut be = Bp::new(wev, n, &[wev as u8]);
+    let mut rev: Vec<u8> = Vec::with_capacity(n * 8);
+    let mut defs = Bp::new(1, n, &[0, 0, 0, 0]);
+    let mut vals = Bp::new(wc, nn, &[wc as u8]);
+    let w = bwid(persons.saturating_sub(1) as u64);
+    let vb = ((w + 7) / 8) as usize;
+    let mut dict: Vec<u8> = Vec::with_capacity(persons * 14);
+    let mut idx: Vec<u8> = Vec::with_capacity(1 + persons * (3 + vb));
+    idx.push(w as u8);
+    let mut tmp: Vec<u8> = Vec::with_capacity(16);
+    let mut k = 0u64;
+    let mut run = 0u64;
+    let mut last = None;
+    for g in rows {
+        for r in g.iter() {
+            if last != Some(r.key) {
+                if run > 0 {
+                    uvar(&mut idx, run << 1);
+                    idx.extend_from_slice(&(k - 1).to_le_bytes()[..vb]);
+                }
+                last = Some(r.key);
+                k += 1;
+                run = 0;
+                if r.key & HBIT == 0 {
+                    tmp.clear();
+                    decode6(r.key, &mut tmp);
+                    dict.extend_from_slice(&(tmp.len() as u32).to_le_bytes());
+                    dict.extend_from_slice(&tmp);
+                } else {
+                    let s = unpack(*names.map.get(&r.key).expect("name for hashed key"));
+                    dict.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    dict.extend_from_slice(s);
+                }
+            }
+            run += 1;
+            bd.put((r.day as i64 - dlo) as u32);
+            bs.put((r.sessions as i64 - slo) as u32);
+            be.put((r.events as i64 - elo) as u32);
+            rev.extend_from_slice(&(r.rev as i64).to_le_bytes());
+            if r.top == u32::MAX {
+                defs.put(0);
+            } else {
+                defs.put(1);
+                vals.put(r.top);
+            }
+        }
+    }
+    if run > 0 {
+        uvar(&mut idx, run << 1);
+        idx.extend_from_slice(&(k - 1).to_le_bytes()[..vb]);
+    }
+    let mut cols = vec![cm(6, "user_id"), cm(1, "day"), cm(2, "sessions"), cm(2, "events"), cm(2, "revenue_cents"), cm(6, "top_category")];
+    f.page(&mut cols[0], true, persons, 0, &dict);
+    f.page(&mut cols[0], false, n, 8, &idx);
+    let mut icol = |f: &mut Pqf, c: &mut Cm, lo: i64, hi: i64, bp: Bp| {
+        let mut d: Vec<u8> = Vec::with_capacity(((hi - lo + 1) * 8) as usize);
+        for v in lo..=hi {
+            if c.ty == 1 {
+                d.extend_from_slice(&(v as i32).to_le_bytes());
+            } else {
+                d.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        f.page(c, true, (hi - lo + 1) as usize, 0, &d);
+        let b = bp.finish();
+        f.page(c, false, n, 8, &b);
+    };
+    icol(f, &mut cols[1], dlo, dhi, bd);
+    icol(f, &mut cols[2], slo, shi, bs);
+    icol(f, &mut cols[3], elo, ehi, be);
+    f.page(&mut cols[4], false, n, 0, &rev);
+    let mut cd: Vec<u8> = Vec::with_capacity(cats.iter().map(|c| c.len() + 4).sum());
+    for c in cats {
+        cd.extend_from_slice(&(c.len() as u32).to_le_bytes());
+        cd.extend_from_slice(c);
+    }
+    f.page(&mut cols[5], true, cats.len(), 0, &cd);
+    let mut b = defs.finish();
+    let dl = (b.len() - 4) as u32;
+    b[..4].copy_from_slice(&dl.to_le_bytes());
+    b.extend_from_slice(&vals.finish());
+    f.page(&mut cols[5], false, n, 8, &b);
+    cols
+}
+
 /// Writes one row group of `rows` (a list of row runs, n rows in all); returns its column chunks.
 fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names) -> Vec<Cm> {
     // pass 1: ranges and counts
@@ -2010,6 +2109,9 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
                 last = Some(r.key);
             }
         }
+    }
+    if n > 0 && dhi - dlo < (1 << 16) && shi - slo < (1 << 16) && ehi - elo < (1 << 16) && std::env::var_os("SHOP_UDOLD").is_none() {
+        return ud_fused(f, rows, n, cats, names, (dlo, dhi, slo as i64, shi as i64, elo as i64, ehi as i64), persons, nn);
     }
     let mut cols = vec![
         cm(6, "user_id"),
