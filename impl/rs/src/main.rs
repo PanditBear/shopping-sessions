@@ -4081,7 +4081,7 @@ fn ev_after_idx<E: Ev>(
                                 let (sa, sp, oa, op) = c.dz.seg(b);
                                 for (part, p0) in [(sa, sp), (oa, op)] {
                                     for (j, x) in part.iter().enumerate() {
-                                        if let Some(y) = part.get(j + 16) {
+                                        if let Some(y) = part.get(j + 32) {
                                             prefetch(t.as_ptr().wrapping_add((y.i as u64 & mask) as usize) as *const u8);
                                         }
                                         let q = lb.len() as u32;
@@ -4109,7 +4109,7 @@ fn ev_after_idx<E: Ev>(
                             }
                             pt(2, &mut tm);
                             if !lb.is_empty() {
-                                const PD: usize = 16;
+                                const PD: usize = 32;
                                 let tl = t.len();
                                 for j in 0..tl {
                                     if j + PD < tl {
