@@ -573,6 +573,137 @@ fn ts_fast(b: &[u8], c: &mut TsCache) -> Option<i64> {
     }
 }
 
+/// `ts_fast` for a field inside a buffer that ends at `hi` (an address): when 32 bytes are
+/// readable from the field start, the three common forms (F1, F2, 13-digit F3) are converted
+/// without a branch on the form, and the result is selected at the end.
+#[inline(always)]
+fn ts_u(b: &[u8], hi: usize, c: &mut TsCache) -> Option<i64> {
+    let n = b.len();
+    let p = b.as_ptr();
+    if (p as usize) + 32 > hi {
+        return ts_fast(b, c);
+    }
+    // SAFETY: [p, p + 32) is inside the buffer
+    let rd = |o: usize| unsafe { std::ptr::read_unaligned(p.add(o) as *const u64) };
+    let b19 = unsafe { *p.add(19) };
+    let b10 = unsafe { *p.add(10) };
+    let z = (n == 20) & (b19 == b'Z');
+    let o = (n == 25) & ((b19 == b'+') | (b19 == b'-'));
+    let iso = z | o;
+    if !(iso | (n == 13)) {
+        return parse_ts_c(b, c);
+    }
+    // ISO forms
+    let t = rd(11);
+    let t2 = t ^ 0x00000A00000A0000;
+    let mut iok = ((t & 0x0000FF0000FF0000) == 0x00003A00003A0000) & dig8(t2) & (b10 == b'T');
+    let v = t2.wrapping_sub(h8(0x30));
+    let v = v.wrapping_mul(10).wrapping_add(v >> 8);
+    let (h, mi, s) = ((v & 0xFF) as i64, ((v >> 24) & 0xFF) as i64, ((v >> 48) & 0xFF) as i64);
+    iok &= (h <= 23) & (mi <= 59) & (s <= 59);
+    let p8 = rd(0);
+    let tag2 = (rd(8) & 0xFFFF) as u32 | 0x1_0000;
+    let hx = ((p8 ^ ((tag2 as u64) << 40)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> c.sh) as usize;
+    let ent = &mut c.ents[hx];
+    let hit = (ent.p8 == p8) & (ent.tag2 == tag2);
+    let days = if iso & !hit {
+        let d = ts_days(b)?;
+        if d == d as i32 as i64 {
+            *ent = TsEnt { p8, tag2, days: d as i32 };
+        }
+        d
+    } else {
+        ent.days as i64
+    };
+    let w = (rd(17) >> 24) | (0x303030u64 << 40);
+    let wx = w ^ 0x0A0000;
+    let vv = wx.wrapping_sub(h8(0x30));
+    let vv = vv.wrapping_mul(10).wrapping_add(vv >> 8);
+    let (oh, om) = ((vv & 0xFF) as i64, ((vv >> 24) & 0xFF) as i64);
+    let ook = ((w & 0xFF0000) == 0x3A0000) & dig8(wx) & (oh <= 23) & (om <= 59);
+    let mag = (oh * 60 + om) * 60_000;
+    let off = if b19 == b'-' { -mag } else { mag };
+    let off = if o { off } else { 0 };
+    iok &= !o | ook;
+    let ival = days * DAY + ((h * 60 + mi) * 60 + s) * 1000 - off;
+    // 13-digit F3
+    let hw = (rd(0) << 24) | 0x303030;
+    let lw = rd(5);
+    let nok = dig8(hw) & dig8(lw);
+    let nval = (parse8(hw) * 100_000_000 + parse8(lw)) as i64;
+    let m = 0u64.wrapping_sub(iso as u64);
+    let val = ((ival as u64 & m) | (nval as u64 & !m)) as i64;
+    let ok = (iok & iso) | (nok & !iso);
+    if ok {
+        Some(val)
+    } else {
+        None
+    }
+}
+
+/// `pack6` for a field inside a buffer that ends at `hi`: with 16 readable bytes the codes of
+/// all bytes come from a few vector ops.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+fn pack6_u(b: &[u8], hi: usize) -> Option<u64> {
+    use core::arch::x86_64::*;
+    let n = b.len();
+    let p = b.as_ptr();
+    if (p as usize) + 16 > hi || n.wrapping_sub(1) >= 10 {
+        return pack6(b);
+    }
+    // SAFETY: AVX2 is enabled for this build; [p, p + 16) is inside the buffer
+    unsafe {
+        let v = _mm_loadu_si128(p as *const __m128i);
+        let m0f = _mm_set1_epi8(0x0F);
+        let hn = _mm_and_si128(_mm_srli_epi16(v, 4), m0f);
+        let ln = _mm_and_si128(v, m0f);
+        let lut_lo = _mm_setr_epi8(5, 7, 7, 7, 7, 7, 7, 7, 7, 7, 6, 2, 2, 2, 2, 10);
+        let lut_hi = _mm_setr_epi8(0, 0, 0, 1, 2, 12, 2, 4, 0, 0, 0, 0, 0, 0, 0, 0);
+        let lut_off = _mm_setr_epi8(0, 0, 0, 0x2F, 0x36, 0x36, 0x3B, 0x3B, 0, 0, 0, 0, 0, 0, 0, 0);
+        let inv = _mm_cmpeq_epi8(_mm_and_si128(_mm_shuffle_epi8(lut_lo, ln), _mm_shuffle_epi8(lut_hi, hn)), _mm_setzero_si128());
+        let inn = _mm_cmpgt_epi8(_mm_set1_epi8(n as i8), _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15));
+        let bad = _mm_and_si128(inv, inn);
+        if _mm_testz_si128(bad, bad) == 0 {
+            return None;
+        }
+        let u = _mm_sub_epi8(v, _mm_shuffle_epi8(lut_off, hn));
+        let u = _mm_sub_epi8(u, _mm_and_si128(_mm_cmpeq_epi8(v, _mm_set1_epi8(0x5F)), _mm_set1_epi8(4)));
+        let u = _mm_and_si128(u, inn);
+        let m1 = _mm_maddubs_epi16(u, _mm_set1_epi16(0x0140));
+        let m2 = _mm_madd_epi16(m1, _mm_set1_epi32(0x0001_1000));
+        let x = _mm_cvtsi128_si64(m2) as u64;
+        let l2 = _mm_extract_epi32(m2, 2) as u32 as u64;
+        Some(((x & 0xFF_FFFF) << 36) | ((x >> 32) << 12) | (l2 >> 12))
+    }
+}
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
+#[inline(always)]
+fn pack6_u(b: &[u8], _hi: usize) -> Option<u64> {
+    pack6(b)
+}
+
+/// `parse_price` for a field inside a buffer that starts at `lo`: up to 8 digits as one word.
+#[inline(always)]
+fn price_u(b: &[u8], lo: usize) -> Option<u32> {
+    let n = b.len();
+    let p = b.as_ptr() as usize;
+    if n.wrapping_sub(1) >= 8 || p + n < lo + 8 {
+        return parse_price(b);
+    }
+    // SAFETY: [p + n - 8, p + n) lies inside the buffer
+    let w = unsafe { std::ptr::read_unaligned((p + n - 8) as *const u64) };
+    let low = (1u64 << (8 * (8 - n as u32))) - 1;
+    let w2 = (w & !low) | (h8(0x30) & low);
+    let ok = dig8(w2);
+    let v = parse8(w2);
+    if ok & (v >= 1) & (v <= 10_000_000) {
+        Some(v as u32)
+    } else {
+        None
+    }
+}
+
 /// 1 for "view" or "cart", 2 for "purchase", 0 otherwise.
 #[inline(always)]
 fn et_code(b: &[u8]) -> u32 {
@@ -1695,18 +1826,19 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
     let c0 = c.as_ptr() as usize;
+    let c1 = c0 + c.len();
     scan7(c, |&[eid, uid, ts, ing, et, pr, price]| {
         {
             if eid.is_empty() {
                 return;
             }
-            let ingest = ts_fast(ing, &mut tci).unwrap_or(i64::MAX);
+            let ingest = ts_u(ing, c1, &mut tci).unwrap_or(i64::MAX);
             let mut r = E::nil();
             'v: {
                 if uid.is_empty() || pr.is_empty() {
                     break 'v;
                 }
-                let Some(t) = ts_fast(ts, &mut tct) else { break 'v };
+                let Some(t) = ts_u(ts, c1, &mut tct) else { break 'v };
                 if t < cx.ws || t >= cx.we {
                     break 'v;
                 }
@@ -1717,7 +1849,7 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
                 };
                 let mut pv = 0u32;
                 if purch {
-                    match parse_price(price) {
+                    match price_u(price, c0) {
                         Some(p) => pv = p,
                         None => break 'v,
                     }
@@ -1726,7 +1858,7 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
                     break 'v;
                 }
                 let cat = cx.prod.get_fast(pr, c0).unwrap_or(cx.unknown_cat);
-                let key = match pack6(uid) {
+                let key = match pack6_u(uid, c1) {
                     Some(k) => k,
                     None => {
                         let k = cx.rs.hash_one(uid) | HBIT;
@@ -1742,7 +1874,7 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
             if !exact {
                 side.push((loc, ingest));
             }
-            match pack6(eid) {
+            match pack6_u(eid, c1) {
                 Some(k) => d.push(DRec { eid: k, ing: ik, loc }),
                 None => fb.push((pack(eid), ingest, loc)),
             }
@@ -2201,27 +2333,74 @@ fn main() {
             if std::env::var_os("SHOP_PARTS").is_some() {
                 // measurement aid: each per-field step alone over the real fields
                 let mut fs: [Vec<B>; 7] = Default::default();
+                let mut fh: Vec<(usize, usize, usize)> = vec![];
                 for &c in &ev_chunks {
                     scan::<7>(c, |f| {
                         for k in 0..7 {
                             fs[k].push(f[k]);
                         }
                     });
+                    fh.push((c.as_ptr() as usize, c.as_ptr() as usize + c.len(), fs[0].len()));
+                }
+                let small = std::env::var("SHOP_PARTS").map_or(false, |v| v == "s");
+                if small {
+                    for v in fs.iter_mut() {
+                        v.truncate(20000);
+                    }
+                    fh.truncate(1);
+                    fh[0].2 = 20000;
+                }
+                fn each<F: FnMut(B, usize, usize) -> u64>(fs: &[Vec<B>; 7], fh: &[(usize, usize, usize)], k: usize, mut f: F) -> u64 {
+                    let mut a = 0u64;
+                    let mut st = 0;
+                    for &(lo, hi, en) in fh {
+                        for b in &fs[k][st..en] {
+                            a = a.wrapping_add(f(b, lo, hi));
+                        }
+                        st = en;
+                    }
+                    a
                 }
                 let tm = |name: &str, f: &mut dyn FnMut() -> u64| {
                     let mut best = f64::MAX;
                     let mut r = 0;
-                    for _ in 0..3 {
+                    let reps = if small { 100 } else { 1 };
+                    let nl = fs[0].len() as f64 * reps as f64;
+                    for _ in 0..5 {
                         let t = std::time::Instant::now();
-                        r = f();
+                        for _ in 0..reps {
+                            r ^= f();
+                        }
                         best = best.min(t.elapsed().as_secs_f64());
                     }
-                    eprintln!("part {name} {:.3}s ({})", best, r & 1);
+                    eprintln!("part {name} {:.2}ns ({})", best / nl * 1e9, r & 1);
                 };
                 tm("ts", &mut || {
                     let mut c = TsCache::new();
                     fs[2].iter().map(|b| parse_ts_c(b, &mut c).unwrap_or(0) as u64).fold(0, u64::wrapping_add)
                 });
+                tm("ts_u", &mut || {
+                    let mut c = TsCache::new();
+                    each(&fs, &fh, 1, |b, lo, hi| { let _ = (lo, hi); ts_u(b, hi, &mut c).unwrap_or(0) as u64 })
+                });
+                tm("ts_fast", &mut || {
+                    let mut c = TsCache::new();
+                    each(&fs, &fh, 2, |b, _, _| ts_fast(b, &mut c).unwrap_or(0) as u64)
+                });
+                tm("ingest_u", &mut || {
+                    let mut c = TsCache::new();
+                    each(&fs, &fh, 1, |b, lo, hi| { let _ = (lo, hi); ts_u(b, hi, &mut c).unwrap_or(0) as u64 })
+                });
+                tm("ingest_fast", &mut || {
+                    let mut c = TsCache::new();
+                    each(&fs, &fh, 3, |b, _, _| ts_fast(b, &mut c).unwrap_or(0) as u64)
+                });
+                tm("pack-uid_u", &mut || each(&fs, &fh, 1, |b, lo, hi| { let _ = (lo, hi); pack6_u(b, hi).unwrap_or(0) }));
+                tm("pack-eid_u", &mut || each(&fs, &fh, 1, |b, lo, hi| { let _ = (lo, hi); pack6_u(b, hi).unwrap_or(0) }));
+                tm("prod_fast", &mut || each(&fs, &fh, 1, |b, lo, hi| { let _ = (lo, hi); prod.get_fast(b, lo).unwrap_or(0) as u64 }));
+                tm("price_u", &mut || each(&fs, &fh, 1, |b, lo, hi| { let _ = (lo, hi); price_u(b, lo).unwrap_or(0) as u64 }));
+                tm("price_old", &mut || each(&fs, &fh, 6, |b, _, _| parse_price(b).unwrap_or(0) as u64));
+                tm("pack-uid_old", &mut || each(&fs, &fh, 1, |b, _, _| pack6(b).unwrap_or(0)));
                 tm("ingest", &mut || {
                     let mut c = TsCache::new();
                     fs[3].iter().map(|b| parse_ts_c(b, &mut c).unwrap_or(0) as u64).fold(0, u64::wrapping_add)
@@ -2469,6 +2648,114 @@ mod tests {
     }
 
     /// scan7 (vector windows, mask quote rule) yields exactly the lines and fields of scan::<7>
+
+    fn gen_field(r: &mut Rng) -> Vec<u8> {
+        let pick = r.below(12);
+        let y = 1969 + r.below(140);
+        let mo = 1 + r.below(12);
+        let d = 1 + r.below(31);
+        let (hh, mm, ss) = (r.below(24), r.below(60), r.below(60));
+        let mut v: Vec<u8> = match pick {
+            0..=3 => format!("{y:04}-{mo:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z").into_bytes(),
+            4..=5 => {
+                let sg = if r.below(2) == 0 { '+' } else { '-' };
+                format!("{y:04}-{mo:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}{sg}{:02}:{:02}", r.below(25), r.below(61)).into_bytes()
+            }
+            6..=8 => {
+                let len = if r.below(2) == 0 { 13 } else { 1 + r.below(22) as usize };
+                (0..len).map(|_| b'0' + r.below(10) as u8).collect()
+            }
+            9 => format!("{y}-02-29T00:00:00Z").into_bytes(),
+            10 => (0..r.below(30)).map(|_| b"0123456789-:TZz+ .e,\r\"x\xc3\xa9"[r.below(25) as usize]).collect(),
+            _ => format!("{:013}", r.next() % 10_000_000_000_000).into_bytes(),
+        };
+        // mutations
+        for _ in 0..r.below(3) {
+            if v.is_empty() {
+                break;
+            }
+            let i = r.below(v.len() as u64) as usize;
+            match r.below(6) {
+                0 => v[i] = b"0123456789-:TZz+ .e\r\"/;"[r.below(22) as usize],
+                1 => v[i] = r.below(256) as u8,
+                2 => {
+                    v.truncate(i);
+                }
+                3 => v.insert(i, b'0' + r.below(10) as u8),
+                4 => v.push(b"Z0:+-"[r.below(5) as usize]),
+                _ => {}
+            }
+        }
+        v
+    }
+
+    /// field at random offsets in a buffer; `tight` puts it at the very end
+    fn with_buf<R>(f: &[u8], tight: bool, r: &mut Rng, g: impl FnOnce(&[u8], usize, usize) -> R) -> R {
+        let pre = r.below(40) as usize;
+        let post = if tight { 0 } else { r.below(40) as usize };
+        let mut buf = vec![0u8; pre];
+        buf.extend((0..pre).map(|_| 0x77));
+        buf.truncate(pre);
+        buf.extend_from_slice(f);
+        buf.extend((0..post).map(|_| b'9'));
+        let lo = buf.as_ptr() as usize;
+        let hi = lo + buf.len();
+        let fs = &buf[pre..pre + f.len()];
+        g(fs, lo, hi)
+    }
+
+    #[test]
+    fn field_parsers_match_reference() {
+        let mut r = Rng(0x1234_5678_9abc_def1);
+        let mut c1 = TsCache::new();
+        let mut c2 = TsCache::with_bits(2);
+        for it in 0..3_000_000u64 {
+            let f = gen_field(&mut r);
+            let tight = r.below(4) == 0;
+            with_buf(&f, tight, &mut r, |b, lo, hi| {
+                let cache = if it % 2 == 0 { &mut c1 } else { &mut c2 };
+                assert_eq!(ts_u(b, hi, cache), parse_ts_c(b, &mut TsCache::with_bits(1)), "ts {:?}", String::from_utf8_lossy(b));
+                                let _ = lo;
+            });
+        }
+    }
+
+    #[test]
+    fn id_price_et_match_reference() {
+        let mut r = Rng(0x9e37_79b9_7f4a_7c15);
+        let alpha = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
+        let junk = b"@[`{:/^-. \"\x7f\x80\xc3\xff,\r\n";
+        for _ in 0..3_000_000u64 {
+            let n = r.below(13) as usize;
+            let mut f: Vec<u8> = (0..n).map(|_| alpha[r.below(63) as usize]).collect();
+            if r.below(3) == 0 && n > 0 {
+                let i = r.below(n as u64) as usize;
+                f[i] = if r.below(2) == 0 { junk[r.below(junk.len() as u64) as usize] } else { r.below(256) as u8 };
+            }
+            let tight = r.below(4) == 0;
+            with_buf(&f, tight, &mut r, |b, _lo, hi| {
+                assert_eq!(pack6_u(b, hi), pack6_slow(b), "pack {:?}", b);
+            });
+            // prices
+            let pn = r.below(12) as usize;
+            let mut pf: Vec<u8> = (0..pn).map(|_| b'0' + r.below(10) as u8).collect();
+            if r.below(2) == 0 && pn > 0 {
+                let k = r.below(pn as u64) as usize;
+                pf[k..].iter_mut().for_each(|x| *x = b'0');
+                if r.below(2) == 0 {
+                    pf[0] = b'1';
+                }
+            }
+            if r.below(4) == 0 && pn > 0 {
+                let i = r.below(pn as u64) as usize;
+                pf[i] = junk[r.below(junk.len() as u64) as usize];
+            }
+            with_buf(&pf, r.below(4) == 0, &mut r, |b, lo, _hi| {
+                assert_eq!(price_u(b, lo), parse_price(b), "price {:?}", b);
+            });
+        }
+    }
+
     #[test]
     fn scan7_matches_scan() {
         assert!(cfg!(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), "build with -C target-cpu=x86-64-v3");
