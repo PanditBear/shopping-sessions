@@ -1,0 +1,4 @@
+id = "D-ts"
+files = ["impl/rs/src/main.rs"]
+why = "event chunk size scales with input (about 300 chunks, 4-32 MB) and the event_id dedup takes one pass; measured 60M on CI: internal 5.40 to 5.18 s (7763), 4.38 to 4.28 s (9V74); 20M 1.21 to 1.19 s"
+created = "2026-11-20 21:47:47"
