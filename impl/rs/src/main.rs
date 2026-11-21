@@ -903,6 +903,18 @@ impl MoverF {
     }
 }
 
+fn inst<R: Send>(n: usize, f: impl FnOnce() -> R + Send) -> R {
+    if n == 0 || n >= rayon::current_num_threads() {
+        return f();
+    }
+    rayon::ThreadPoolBuilder::new().num_threads(n).build().unwrap().install(f)
+}
+fn envn(k: &str, d: usize) -> usize {
+    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+}
+static PFDV: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(12);
+#[allow(non_snake_case)]
+fn PFDf() -> usize { PFDV.load(std::sync::atomic::Ordering::Relaxed) }
 const PFD: usize = 12;
 
 // ---------- records ----------
@@ -1799,7 +1811,7 @@ fn ev_after<E: Ev>(
                 Err(_) => (k as i64 - IOFF + ibase) * 1000,
             }
         };
-        rayon::join(
+        inst(envn("SHOP_T_DD", 0), || rayon::join(
             || {
                 (0..EB / DDG).into_par_iter().for_each(|g| {
                     let mut tm = now();
@@ -1872,7 +1884,7 @@ fn ev_after<E: Ev>(
                 }
                 pt(3, &mut tm);
             },
-        );
+        ));
     }
     let mut tm = now();
     let mf = MoverF::build(tab);
@@ -1881,21 +1893,22 @@ fn ev_after<E: Ev>(
     // map to themselves without a table lookup), then each chunk's kept lines
     // are grouped by person bucket inside the chunk (a cache-sized scatter; the order within a
     // bucket stays the line order). The sessionizer gathers a bucket from every chunk in chunk order.
-    let parts: Vec<(Vec<E>, Vec<u32>)> = ev_out
+    let parts: Vec<(Vec<E>, Vec<u32>)> = inst(envn("SHOP_T_RS", 0), || ev_out
         .into_par_iter()
         .enumerate()
         .map(|(ci, c)| {
             let mut tm = now();
+            let pfd = PFDf();
             let mut cnt = vec![0u32; PB + 1];
             let mb = mbase[ci] as usize;
             let mut m = c.m;
             let n = m.len();
             for i in 0..n {
-                if i + 2 * PFD < n {
-                    mf.pf(m[i + 2 * PFD].key());
+                if i + 2 * pfd < n {
+                    mf.pf(m[i + 2 * pfd].key());
                 }
-                if i + PFD < n {
-                    let k = m[i + PFD].key();
+                if i + pfd < n {
+                    let k = m[i + pfd].key();
                     if mf.hit(k) {
                         tab.pf(k);
                     }
@@ -1932,13 +1945,13 @@ fn ev_after<E: Ev>(
             pt(5, &mut tm);
             (out, cnt)
         })
-        .collect();
+        .collect());
     drop(dead);
     tick("dedup done");
 
-    let ngroups = (rayon::current_num_threads() * 4).clamp(1, PB);
+    let ngroups = (rayon::current_num_threads() * envn("SHOP_NG", 4)).clamp(1, PB);
     let per = PB.div_ceil(ngroups);
-    (0..ngroups)
+    inst(envn("SHOP_T_SS", 0), || (0..ngroups)
         .into_par_iter()
         .map(|g| {
             let mut cm = CampAcc::new(ncamp + 1, d0, nd);
@@ -1966,7 +1979,7 @@ fn ev_after<E: Ev>(
             }
             (out, cm)
         })
-        .collect()
+        .collect())
 }
 
 fn ev_parse<E: Ev>(ev_chunks: &[B], cx: &EvCtx) -> Vec<EvChunk<E>> {
@@ -2020,11 +2033,12 @@ enum Evs {
 }
 
 fn main() {
+    PFDV.store(envn("SHOP_PFD", 12), std::sync::atomic::Ordering::Relaxed);
     let ep = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
     let ep0 = ep();
     let data = std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into());
     let outd = std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into());
-    let ncpu: usize = std::env::var("NCPU").ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(0);
+    let ncpu: usize = std::env::var("SHOP_NCPU").or_else(|_| std::env::var("NCPU")).ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(0);
     let mut tb = rayon::ThreadPoolBuilder::new().stack_size(8 << 20);
     if ncpu > 0 {
         tb = tb.num_threads(ncpu);
@@ -2101,7 +2115,7 @@ fn main() {
     tick("prod/camp loaded");
     let rs = hasher();
 
-    let link_chunks = all_chunks(&csv_files(&data.join("links")), CHUNK);
+    let link_chunks = all_chunks(&csv_files(&data.join("links")), envn("SHOP_LCH", 4) << 20);
     let link_pairs: Vec<Vec<[u64; 4]>> = link_chunks
         .par_iter()
         .map(|&c| {
@@ -2133,12 +2147,13 @@ fn main() {
                     }
                     x
                 }
+                let pfd = PFDf();
                 let mut edges: Vec<(u32, u32)> = Vec::with_capacity(occ / 2);
                 for v in &link_pairs {
                     for (n, e) in v.iter().enumerate() {
-                        if n + PFD / 2 < v.len() {
-                            t.pf(v[n + PFD / 2][0]);
-                            t.pf(v[n + PFD / 2][2]);
+                        if n + pfd / 2 < v.len() {
+                            t.pf(v[n + pfd / 2][0]);
+                            t.pf(v[n + pfd / 2][2]);
                         }
                         let mut g = |k: u64, r: u64| -> u32 {
                             let (id, new) = t.get_or_insert(k, idx_key.len() as u64);
@@ -2285,7 +2300,7 @@ fn main() {
     );
 
     // clicks
-    let click_chunks = all_chunks(&csv_files(&data.join("clicks")), CHUNK);
+    let click_chunks = all_chunks(&csv_files(&data.join("clicks")), envn("SHOP_CCH", 4) << 20);
     let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_chunks
         .par_iter()
         .map(|&c| {
@@ -2305,9 +2320,10 @@ fn main() {
             });
             pt(9, &mut tm);
             let n = tmp.len();
+            let pfd = PFDf();
             for i in 0..n {
-                if i + PFD < n {
-                    tab.pf(tmp[i + PFD].key);
+                if i + pfd < n {
+                    tab.pf(tmp[i + pfd].key);
                 }
                 tmp[i].key = tab.get(tmp[i].key);
             }
