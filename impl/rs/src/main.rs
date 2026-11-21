@@ -1334,6 +1334,16 @@ impl<E: Ev> Dz<E> {
             None => None,
         }
     }
+    /// the dense index of an event id whose base-36 value `val` is already decoded and valid
+    #[inline(always)]
+    fn idx_val(&self, val: u64) -> Option<u64> {
+        let i = gen_idx(val, self.key);
+        if self.on & (i < self.lim) {
+            Some(i)
+        } else {
+            None
+        }
+    }
     #[inline(always)]
     fn put(&mut self, i: u64, ing: u32, e: E, exact: bool, ingest: i64) {
         let b = (i >> self.sh) as usize;
@@ -3066,6 +3076,85 @@ unsafe fn pack6x1(pa: *const u8, na: usize) -> (u64, bool) {
     (k, bad == 0 && na.wrapping_sub(1) < 10)
 }
 
+/// `pack6x1` stays for the event-id miss path; this is the hot-path fused pass.
+/// Per `n & 15`: the shuffle that right-aligns an event id's body (bytes 1..n) in bytes 0..8 of a
+/// lane (0x80 = zero byte), and the identity shuffle that keeps the first `n` bytes of a user id.
+const fn shuf_tabs() -> ([[u8; 16]; 16], [[u8; 16]; 16]) {
+    let mut e = [[0x80u8; 16]; 16];
+    let mut u = [[0x80u8; 16]; 16];
+    let mut n = 0usize;
+    while n < 16 {
+        let mut j = 0usize;
+        while j < 16 {
+            if j < n {
+                u[n][j] = j as u8;
+            }
+            if n >= 2 && n <= 9 && j < 8 && j + n >= 9 {
+                e[n][j] = (j + n - 8) as u8;
+            }
+            j += 1;
+        }
+        n += 1;
+    }
+    (e, u)
+}
+static SHUF_E: [[u8; 16]; 16] = shuf_tabs().0;
+static SHUF_U: [[u8; 16]; 16] = shuf_tabs().1;
+
+/// One 256-bit pass over an event id (low lane) and a user id (high lane); 16 bytes are read at
+/// each pointer. Returns (event ok, event base-36 value, user key, user ok):
+/// the first two equal `gen_val_txt(pe, ne, b'e')` (ok iff it is Some), the last two equal
+/// `pack6x2`'s user half.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn fuse_eu(pe: *const u8, ne: usize, pu: *const u8, nu: usize) -> (bool, u64, u64, bool) {
+    use core::arch::x86_64::*;
+    let x = _mm256_set_m128i(_mm_loadu_si128(pu as *const __m128i), _mm_loadu_si128(pe as *const __m128i));
+    // SAFETY: `& 15` keeps both table indices in range (lengths outside the table only matter
+    // through the scalar length checks below, which reject them)
+    let m = _mm256_set_m128i(
+        _mm_loadu_si128(SHUF_U.as_ptr().add(nu & 15) as *const __m128i),
+        _mm_loadu_si128(SHUF_E.as_ptr().add(ne & 15) as *const __m128i),
+    );
+    // event body right-aligned at bytes 0..8, user id's first nu bytes kept; other bytes zero
+    let x = _mm256_shuffle_epi8(x, m);
+    let l4 = _mm256_set1_epi8(0x0F);
+    let hn = _mm256_and_si256(_mm256_srli_epi16(x, 4), l4);
+    let ln = _mm256_and_si256(x, l4);
+    // low lane: [0-9a-z] (hi nibble 3 -> class 1, 6 -> 2, 7 -> 4); high lane: [0-9A-Z_a-z] as pack6x2
+    let hi_t = _mm256_set_m128i(
+        _mm_setr_epi8(0, 0, 0, 1, 2, 4, 2, 8, 0, 0, 0, 0, 0, 0, 0, 0),
+        _mm_setr_epi8(0, 0, 0, 1, 0, 0, 2, 4, 0, 0, 0, 0, 0, 0, 0, 0),
+    );
+    let lo_t = _mm256_set_m128i(
+        _mm_setr_epi8(0x0D, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0E, 0x02, 0x02, 0x02, 0x02, 0x06),
+        _mm_setr_epi8(5, 7, 7, 7, 7, 7, 7, 7, 7, 7, 6, 2, 2, 2, 2, 2),
+    );
+    let cls = _mm256_and_si256(_mm256_shuffle_epi8(hi_t, hn), _mm256_shuffle_epi8(lo_t, ln));
+    let invalid = _mm256_cmpeq_epi8(cls, _mm256_setzero_si256());
+    // CODE values: byte minus a per-high-nibble offset (event: '0'-'9' -> 0..9, 'a'-'z' -> 10..35;
+    // user: '_' 4 less than the other 0x5_ bytes)
+    let off_t = _mm256_set_m128i(
+        _mm_setr_epi8(0, 0, 0, 0x2F, 0x36, 0x36, 0x3B, 0x3B, 0, 0, 0, 0, 0, 0, 0, 0),
+        _mm_setr_epi8(0, 0, 0, 0x30, 0, 0, 0x57, 0x57, 0, 0, 0, 0, 0, 0, 0, 0),
+    );
+    let us = _mm256_and_si256(_mm256_cmpeq_epi8(x, _mm256_set1_epi8(0x5F)), _mm256_set1_epi8(4));
+    let c = _mm256_sub_epi8(_mm256_sub_epi8(x, _mm256_shuffle_epi8(off_t, hn)), us);
+    // padding bytes (m < 0) are zero here and code 0; they only need to be ignored in `invalid`
+    let bad = (_mm256_movemask_epi8(invalid) as u32) & !(_mm256_movemask_epi8(m) as u32);
+    let w = _mm256_maddubs_epi16(c, _mm256_set_m128i(_mm_set1_epi16(0x0140), _mm_set1_epi16(0x0124)));
+    let dw = _mm256_madd_epi16(w, _mm256_set_m128i(_mm_set1_epi32(0x0001_1000), _mm_set1_epi32(0x0001_0510)));
+    let hi = _mm256_extracti128_si256(dw, 1);
+    let k3 = |q: u64, d2: u32| ((q & 0xFFFF_FFFF) << 36) | ((q >> 32) << 12) | (d2 as u64 >> 12);
+    let ku = k3(_mm_cvtsi128_si64(hi) as u64, _mm_extract_epi32(hi, 2) as u32);
+    let q = _mm_cvtsi128_si64(_mm256_castsi256_si128(dw)) as u64;
+    let val = (q & 0xFFFF_FFFF) * 1_679_616 + (q >> 32);
+    let oku = (bad >> 16) == 0 && nu.wrapping_sub(1) < 10;
+    // SAFETY: 16 bytes at pe are readable, so are bytes 0 and 1
+    let oke = ((bad & 0xFFFF) == 0) & (ne.wrapping_sub(2) < 8) & (core::ptr::read_volatile(pe) == b'e') & (core::ptr::read_volatile(pe.add(1)) != b'0') & (val <= GM);
+    (oke, val, ku, oku)
+}
+
 // Bytes 0..8 and 3..11 of "2000-01-01T", and that day's start in seconds: the key every
 /// `DayCache` slot starts with (a match on it is a correct hit).
 const D0_A: u64 = u64::from_le_bytes(*b"2000-01-");
@@ -3251,7 +3340,7 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
             let (ppr, npr) = fld(pb, xb, e5 + 1, l);
             // SAFETY: both ids start in the first window, so 16 bytes from each stay inside
             // the 128 readable bytes at p
-            let (ke, oke, ku, oku) = unsafe { pack6x2(pe, ne, pu, nu) };
+            let (oke, val, ku, oku) = unsafe { fuse_eu(pe, ne, pu, nu) };
             // SAFETY (ldp, hms): a 20-byte field lies inside its window. (ra, rb, rd): the
             // ingest's date key and day start when it is a valid F1 date, else 2000-01-01's.
             let (mut ra, mut rb, mut rd) = (D0_A, D0_B, D0_S);
@@ -3334,17 +3423,20 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
                 let key = if oku { ku } else { ev_key_slow(sl(pu, nu), cx.rs, fbn) };
                 r = E::mk(key, (t - ws) as u64, pv, cat);
             }
-            // SAFETY: 16 bytes from pe are readable (see pack6x2)
-            if let Some(i) = unsafe { dz.idx_txt(pe, ne) } {
-                dz.put(i, ik, r, iex, ingest);
-                continue 'ln;
+            if oke {
+                if let Some(i) = dz.idx_val(val) {
+                    dz.put(i, ik, r, iex, ingest);
+                    continue 'ln;
+                }
             }
             let loc = m.len() as u32;
             m.push(r);
             if !iex {
                 side.push((loc, ingest));
             }
-            if oke {
+            // SAFETY: 16 bytes from pe are readable (see pack6x2's callers above)
+            let (ke, okk) = unsafe { pack6x1(pe, ne) };
+            if okk {
                 d.push(DRec { eid: ke, ing: ik, loc });
             } else {
                 fb.push((pack(sl(pe, ne)), ingest, loc));
@@ -5825,6 +5917,98 @@ mod pack_simd_tests {
             }
             // the per-person table itself answers most keys, movers among them
             assert!(ga * 3 > keys.len() && gm * 4 > ga, "{ga} {gm} {}", keys.len());
+        }
+    }
+
+    #[test]
+    fn fuse_eu_matches() {
+        let body: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        let alpha: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
+        let mut dz = Dz::<EvL>::off();
+        dz.on = true;
+        dz.key = 0x0123_4567_89AB & GM;
+        dz.lim = GM / 2;
+        let edge: [u8; 16] = [0x00, b'/', b'0', b'9', b':', b'@', b'A', b'Z', b'_', b'`', b'a', b'z', b'{', 0x7f, 0x80, 0xff];
+        let one = |a: &[u8], u: &[u8], pad: u8| {
+            let mut be = [pad; 32];
+            be[..a.len()].copy_from_slice(a);
+            let mut bu = [pad; 32];
+            bu[..u.len()].copy_from_slice(u);
+            let (oke, val, ku, oku) = unsafe { fuse_eu(be.as_ptr(), a.len(), bu.as_ptr(), u.len()) };
+            let want = unsafe { gen_val_txt(be.as_ptr(), a.len(), b'e') };
+            assert_eq!(oke.then_some(val), want, "eid differs on {:?}", String::from_utf8_lossy(a));
+            if want.is_some() {
+                let wi = unsafe { dz.idx_txt(be.as_ptr(), a.len()) };
+                let gi = dz.idx_val(val);
+                assert_eq!(gi, wi);
+            }
+            let (_, _, wk, wok) = unsafe { pack6x2(be.as_ptr(), a.len(), bu.as_ptr(), u.len()) };
+            assert_eq!(oku, wok, "uid ok differs on {:?}", u);
+            if wok {
+                assert_eq!(ku, wk);
+            }
+        };
+        for n in 0..=16usize {
+            for pos in 0..n {
+                for &v in edge.iter().chain(body.iter()) {
+                    for lead in [b'e', b'x'] {
+                        let mut a: Vec<u8> = (0..n).map(|i| if i == 0 { lead } else { body[(i * 7 + n) % 36] }).collect();
+                        a[pos] = v;
+                        let u: Vec<u8> = (0..n).map(|i| alpha[(i * 5 + n) % 63]).collect();
+                        for pad in [b',', 0u8, 0xFF] {
+                            one(&a, &u, pad);
+                            one(&u, &a, pad);
+                        }
+                    }
+                }
+            }
+            // leading zero body and plain all-zero / all-z
+            for fill in [b'0', b'z', b'1'] {
+                let mut a = vec![fill; n];
+                if n > 0 {
+                    a[0] = b'e';
+                }
+                one(&a, b"u_1", b',');
+                if n > 1 {
+                    a[1] = b'0';
+                    one(&a, b"u_1", b',');
+                }
+            }
+        }
+        let b36 = |mut x: u64| {
+            let mut d = vec![];
+            while x > 0 {
+                d.push(body[(x % 36) as usize]);
+                x /= 36;
+            }
+            d.reverse();
+            let mut s = vec![b'e'];
+            s.extend(d);
+            s
+        };
+        for x in [0, 1, 35, 36, GM - 1, GM, GM + 1, GM + 36, 36u64.pow(8) - 1, 36u64.pow(7)] {
+            one(&b36(x), b"u_9", b',');
+        }
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for _ in 0..1_500_000 {
+            let n = (rnd() % 14) as usize;
+            let a: Vec<u8> = (0..n)
+                .map(|i| match rnd() % 40 {
+                    0 => rnd() as u8,
+                    1 if i > 0 => alpha[(rnd() % 63) as usize],
+                    _ if i == 0 && rnd() % 16 != 0 => b'e',
+                    _ => body[(rnd() % 36) as usize],
+                })
+                .collect();
+            let m = (rnd() % 14) as usize;
+            let u: Vec<u8> = (0..m).map(|_| if rnd() % 30 == 0 { rnd() as u8 } else { alpha[(rnd() % 63) as usize] }).collect();
+            one(&a, &u, (rnd() & 0xFF) as u8);
         }
     }
 
