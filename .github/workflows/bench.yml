@@ -19,6 +19,12 @@ on:
       exitprobe:
         description: "1 = split exit time: teardown vs docker, native run, kernel profile"
         default: "0"
+      events:
+        description: "events in the generated dataset"
+        default: "20000000"
+      clicks:
+        description: "clicks in the generated dataset"
+        default: "5000000"
 permissions:
   contents: read
 jobs:
@@ -42,4 +48,6 @@ jobs:
           PROBE: ${{ github.event.inputs.probe || '0' }}
           PERF: ${{ github.event.inputs.perf || '0' }}
           EXITPROBE: ${{ github.event.inputs.exitprobe || '0' }}
+          EVENTS: ${{ github.event.inputs.events || '20000000' }}
+          CLICKS: ${{ github.event.inputs.clicks || '5000000' }}
         run: bash bench.sh $REFS
