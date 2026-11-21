@@ -1916,8 +1916,6 @@ fn ev_after<E: Ev>(
     }
     let mut tm = now();
     let mf = MoverF::build(tab);
-    // prefetch distance of the resolve loop (table lookups miss DRAM on a small-cache host)
-    let rpf: usize = std::env::var("SHOP_RPF").ok().and_then(|v| v.parse().ok()).unwrap_or(PFD).max(1);
     pt(4, &mut tm);
     // kept lines: user key -> person key (0 marks a dropped line; keys that miss the mover filter
     // map to themselves without a table lookup), then each chunk's kept lines
@@ -1933,11 +1931,11 @@ fn ev_after<E: Ev>(
             let mut m = c.m;
             let n = m.len();
             for i in 0..n {
-                if i + 2 * rpf < n {
-                    mf.pf(m[i + 2 * rpf].key());
+                if i + 2 * PFD < n {
+                    mf.pf(m[i + 2 * PFD].key());
                 }
-                if i + rpf < n {
-                    let k = m[i + rpf].key();
+                if i + PFD < n {
+                    let k = m[i + PFD].key();
                     if mf.hit(k) {
                         tab.pf(k);
                     }
