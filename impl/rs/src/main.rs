@@ -525,10 +525,12 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], dict: &[B], cats: &[B]) {
     let mut w = SerializedFileWriter::new(f, schema, props()).unwrap();
     const RG: usize = 1 << 20;
     let mut buf: Vec<&UD> = Vec::with_capacity(RG);
-    let flush = |buf: &mut Vec<&UD>, w: &mut SerializedFileWriter<File>| {
-        if buf.is_empty() {
+    let mut nrg = 0usize;
+    let flush = |buf: &mut Vec<&UD>, w: &mut SerializedFileWriter<File>, force: bool, nrg: &mut usize| {
+        if buf.is_empty() && !force {
             return;
         }
+        *nrg += 1;
         let mut rg = w.next_row_group().unwrap();
         let users: Vec<ByteArray> = buf.iter().map(|r| ba(dict[r.pid as usize])).collect();
         let mut c = rg.next_column().unwrap().unwrap();
@@ -570,11 +572,11 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], dict: &[B], cats: &[B]) {
         for r in g.iter() {
             buf.push(r);
             if buf.len() >= RG {
-                flush(&mut buf, &mut w);
+                flush(&mut buf, &mut w, false, &mut nrg);
             }
         }
     }
-    flush(&mut buf, &mut w);
+    flush(&mut buf, &mut w, nrg == 0, &mut nrg);
     w.close().unwrap();
 }
 
@@ -587,7 +589,7 @@ fn write_campaign_daily(path: &Path, rows: &[(u32, i32, [u64; 4])], names: &[B],
     );
     let f = File::create(path).unwrap();
     let mut w = SerializedFileWriter::new(f, schema, props()).unwrap();
-    if !rows.is_empty() {
+    {
         let mut rg = w.next_row_group().unwrap();
         let v: Vec<ByteArray> = rows.iter().map(|r| ba(names[r.0 as usize])).collect();
         let mut c = rg.next_column().unwrap().unwrap();
@@ -644,6 +646,18 @@ fn main() {
         }
     };
 
+    if let Ok(m) = std::env::var("SHOP_PROBE") {
+        let ev_chunks = all_chunks(&csv_files(&data.join("events")));
+        tick("probe mapped");
+        let n: usize = ev_chunks.par_iter().map(|c| c.iter().fold(0usize, |a,&b| a + b as usize)).sum();
+        tick(&format!("probe touched {n}"));
+        if m == "1" { return; }
+        let n: usize = ev_chunks.par_iter().map(|&c| { let mut k=0usize; lines(c, |l| { if split_fields::<7>(l).is_some() { k+=1; } }); k }).sum();
+        tick(&format!("probe split {n}"));
+        let n: usize = ev_chunks.par_iter().map(|&c| { let mut k=0usize; lines(c, |l| { if let Some(f)=split_fields::<7>(l) { if parse_ts(f[2]).is_some() {k+=1;} } }); k }).sum();
+        tick(&format!("probe split+ts {n}"));
+        return;
+    }
     let mf = std::fs::read_to_string(data.join("manifest.json")).unwrap_or_default();
     let ws = manifest_ts(&mf, "window_start").unwrap_or(0);
     let we = manifest_ts(&mf, "window_end").unwrap_or(0);
@@ -909,9 +923,10 @@ fn main() {
         load[k] += g.len();
         files[k].push(g);
     }
+    let any_rows = files.iter().any(|g| g.iter().any(|x| !x.is_empty()));
     rayon::join(
         || {
-            files.par_iter().enumerate().for_each(|(i, g)| {
+            files.par_iter().enumerate().filter(|(i, g)| g.iter().any(|x| !x.is_empty()) || (*i == 0 && !any_rows)).for_each(|(i, g)| {
                 write_user_daily(&ud_dir.join(format!("part-{i}.parquet")), g, &dict, &cat_names);
             })
         },
