@@ -2264,20 +2264,53 @@ fn sort_clicks_rdx(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Ve
         unsafe { tmp.set_len(n) };
     });
     std::mem::swap(cl, tmp);
-    // after the digit pass cnt[HD + d] is the end of range d
+    // after the digit pass cnt[HD + d] is the end of range d. Each range is in ts quantum order. A
+    // range with two keys (a digit collision) is split stably by key, so each half stays in ts
+    // quantum order and only needs the near-linear isort_one.
+    fn sort_ck(r: &mut [ClickRec]) {
+        r.sort_unstable_by(|a, b| (a.key, a.ts).cmp(&(b.key, b.ts)).then_with(|| cid_cmp(a, b)));
+    }
+    let mut hb = [cl[0]; 64];
     let mut st = 0usize;
     while st < n {
         let en = cnt[HD + dg(cl[st].key)] as usize;
         let r = &mut cl[st..en];
-        let k0 = r[0].key;
-        if r.len() > 1 && !(r.iter().all(|c| c.key == k0) && isort_one(r)) {
-            if r.len() <= 32 {
-                isort_by(r, click_less);
-            } else {
-                r.sort_unstable_by(|a, b| (a.key, a.ts).cmp(&(b.key, b.ts)).then_with(|| cid_cmp(a, b)));
-            }
-        }
         st = en;
+        if r.len() < 2 {
+            continue;
+        }
+        let k0 = r[0].key;
+        let Some(p) = r.iter().position(|c| c.key != k0) else {
+            if !isort_one(r) {
+                sort_ck(r);
+            }
+            continue;
+        };
+        let k1 = r[p].key;
+        if r.len() <= hb.len() && r[p..].iter().all(|c| c.key == k0 || c.key == k1) {
+            let lo = k0.min(k1);
+            let (mut w, mut h) = (0usize, 0usize);
+            for i in 0..r.len() {
+                let c = r[i];
+                r[w] = c;
+                hb[h] = c;
+                let m = (c.key == lo) as usize;
+                w += m;
+                h += 1 - m;
+            }
+            r[w..].copy_from_slice(&hb[..h]);
+            let (a, b) = r.split_at_mut(w);
+            if !isort_one(a) {
+                sort_ck(a);
+            }
+            if !isort_one(b) {
+                sort_ck(b);
+            }
+        } else if r.len() <= 32 {
+            isort_by(r, click_less);
+        } else {
+            sort_ck(r);
+        }
     }
     true
 }
