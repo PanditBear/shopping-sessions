@@ -7,7 +7,56 @@ use std::path::Path;
 use std::sync::Arc;
 
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: cnt::Counting = cnt::Counting;
+
+// diag: bytes requested in allocations of at least 64 KiB, per phase
+mod cnt {
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub static ABYTES: AtomicU64 = AtomicU64::new(0);
+    pub static ZBYTES: AtomicU64 = AtomicU64::new(0);
+    pub static FBYTES: AtomicU64 = AtomicU64::new(0);
+    pub static NBIG: AtomicU64 = AtomicU64::new(0);
+    const BIG: usize = 1 << 16;
+    pub struct Counting;
+    unsafe impl GlobalAlloc for Counting {
+        #[inline]
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            if l.size() >= BIG {
+                ABYTES.fetch_add(l.size() as u64, Relaxed);
+                NBIG.fetch_add(1, Relaxed);
+            }
+            mimalloc::MiMalloc.alloc(l)
+        }
+        #[inline]
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            if l.size() >= BIG {
+                ABYTES.fetch_add(l.size() as u64, Relaxed);
+                ZBYTES.fetch_add(l.size() as u64, Relaxed);
+                NBIG.fetch_add(1, Relaxed);
+            }
+            mimalloc::MiMalloc.alloc_zeroed(l)
+        }
+        #[inline]
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            if l.size() >= BIG {
+                FBYTES.fetch_add(l.size() as u64, Relaxed);
+            }
+            mimalloc::MiMalloc.dealloc(p, l)
+        }
+        #[inline]
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
+            if l.size() >= BIG {
+                FBYTES.fetch_add(l.size() as u64, Relaxed);
+            }
+            if n >= BIG {
+                ABYTES.fetch_add(n as u64, Relaxed);
+                NBIG.fetch_add(1, Relaxed);
+            }
+            mimalloc::MiMalloc.realloc(p, l, n)
+        }
+    }
+}
 
 // mimalloc's arenas are already 2 MiB-aligned with MADV_HUGEPAGE, but by default freed memory is
 // purged (MADV_DONTNEED in 64 KiB slices) about a second later. That splits the huge pages, and the
@@ -36,6 +85,51 @@ mod hpa {
         };
         eprintln!("thp {label}: anon {} MB, anonhuge {} MB, rss {} MB", f("Anonymous:") >> 10, f("AnonHugePages:") >> 10, f("Rss:") >> 10);
     }
+
+    // diag: process CPU, page faults, anon RSS and big-allocation bytes since the previous tick (Linux only)
+    #[cfg(target_os = "linux")]
+    pub fn rusage(label: &str) {
+        use std::sync::atomic::Ordering::Relaxed;
+        use std::sync::Mutex;
+        extern "C" {
+            fn getrusage(who: i32, r: *mut i64) -> i32;
+        }
+        static PREV: Mutex<[i64; 9]> = Mutex::new([0; 9]);
+        let mut r = [0i64; 64];
+        if unsafe { getrusage(0, r.as_mut_ptr()) } != 0 {
+            return;
+        }
+        let sm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+        let v: Vec<i64> = sm.split_whitespace().map(|x| x.parse().unwrap_or(0)).collect();
+        let anon = if v.len() > 2 { (v[1] - v[2]) * 4096 } else { 0 };
+        let ab = super::cnt::ABYTES.load(Relaxed) as i64;
+        let zb = super::cnt::ZBYTES.load(Relaxed) as i64;
+        let fb = super::cnt::FBYTES.load(Relaxed) as i64;
+        let nb = super::cnt::NBIG.load(Relaxed) as i64;
+        let c = [r[0] * 1_000_000 + r[1], r[2] * 1_000_000 + r[3], r[8], r[9], anon, ab, zb, fb, nb];
+        let mut p = PREV.lock().unwrap();
+        const M: f64 = 1048576.0;
+        eprintln!(
+            "ru {label}: ut {:.3} st {:.3} minflt {} majflt {} anon {:+.0} MB alloc {:.0} MB zeroed {:.0} MB freed {:.0} MB nbig {} | tot ut {:.3} st {:.3} minflt {} anon {:.0} MB live {:.0} MB",
+            (c[0] - p[0]) as f64 / 1e6,
+            (c[1] - p[1]) as f64 / 1e6,
+            c[2] - p[2],
+            c[3] - p[3],
+            (c[4] - p[4]) as f64 / M,
+            (c[5] - p[5]) as f64 / M,
+            (c[6] - p[6]) as f64 / M,
+            (c[7] - p[7]) as f64 / M,
+            c[8] - p[8],
+            c[0] as f64 / 1e6,
+            c[1] as f64 / 1e6,
+            c[2],
+            c[4] as f64 / M,
+            (c[5] - c[7]) as f64 / M
+        );
+        *p = c;
+    }
+    #[cfg(not(target_os = "linux"))]
+    pub fn rusage(_: &str) {}
 }
 
 type B = &'static [u8];
@@ -4735,6 +4829,9 @@ fn main() {
             eprintln!("[{:.2}s] {}", t0.elapsed().as_secs_f64(), s);
         }
         hpa::diag(s);
+        if timing {
+            hpa::rusage(s);
+        }
     };
 
     let mf = std::fs::read_to_string(data.join("manifest.json")).unwrap_or_default();
@@ -5084,6 +5181,7 @@ fn main() {
     let mut tm = now();
     let mf = MoverF::build(&tab);
     pt(4, &mut tm);
+    tick("mf built");
     let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_chunks
         .par_iter()
         .map(|&c| {
@@ -5184,6 +5282,7 @@ fn main() {
             eprintln!("dropin end {:.3}s", ep() - t);
         }
     }
+    tick("exit");
     // all output files are written and closed; skip freeing the large tables
     std::process::exit(0);
 }
