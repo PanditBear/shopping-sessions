@@ -1969,41 +1969,64 @@ fn ev_after<E: Ev>(
         .collect()
 }
 
-fn ev_parse<E: Ev>(ev_chunks: &[B], cx: &EvCtx) -> Vec<EvChunk<E>> {
-    ev_chunks
-        .par_iter()
-        .map(|&c| {
-            let mut m: Vec<E> = Vec::with_capacity(c.len() / 64);
-            let mut d: Vec<DRec> = Vec::with_capacity(c.len() / 64);
-            let (mut fb, mut fbn, mut side) = (vec![], vec![], vec![]);
-            let mut tm = now();
-            parse_events(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
-            pt(0, &mut tm);
-            let (d, doff) = bucketize(&d, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize);
-            pt(1, &mut tm);
-            EvChunk { m, d, doff, fb, fbn, side }
-        })
-        .collect()
+/// Parses one chunk and groups its dedup records by event_id bucket.
+fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
+    let mut m: Vec<E> = Vec::with_capacity(c.len() / 64);
+    let mut d: Vec<DRec> = Vec::with_capacity(c.len() / 64);
+    let (mut fb, mut fbn, mut side) = (vec![], vec![], vec![]);
+    let mut tm = now();
+    parse_events(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
+    pt(0, &mut tm);
+    let (d, doff) = bucketize(&d, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize);
+    pt(1, &mut tm);
+    EvChunk { m, d, doff, fb, fbn, side }
 }
 
-/// measurement aid: event parsing alone, serial, into reused buffers
+fn ev_parse<E: Ev>(ev_chunks: &[B], cx: &EvCtx) -> Vec<EvChunk<E>> {
+    ev_chunks.par_iter().map(|&c| ev_chunk_parse(c, cx)).collect()
+}
+
+/// measurement aid: event parsing alone, serial (SHOP_PARSE=reps); prints the best time and a
+/// checksum of everything the parse produces
 fn parse_aid<E: Ev>(ev_chunks: &[B], cx: &EvCtx) {
-    let (mut m, mut d): (Vec<E>, Vec<DRec>) = (Vec::with_capacity(CHUNK / 32), Vec::with_capacity(CHUNK / 32));
-    let (mut fb, mut fbn, mut side) = (vec![], vec![], vec![]);
-    for rep in 0..3 {
+    let reps = std::env::var("SHOP_PARSE").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(3).max(1);
+    let mut best = f64::MAX;
+    let mut sum = 0u64;
+    for rep in 0..reps {
         let t = std::time::Instant::now();
-        let mut n = 0usize;
-        for &c in ev_chunks {
-            m.clear();
-            d.clear();
-            fb.clear();
-            fbn.clear();
-            side.clear();
-            parse_events(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
-            n += m.len();
+        let all: Vec<EvChunk<E>> = ev_chunks.iter().map(|&c| ev_chunk_parse(c, cx)).collect();
+        let el = t.elapsed().as_secs_f64();
+        let mut h = 0u64;
+        let mut add = |x: u64| h = mix(h ^ x).wrapping_add(x);
+        for r in &all {
+            add(r.m.len() as u64);
+            for e in &r.m {
+                add(e.key() ^ (e.rts() << 1));
+                if let Some((p, cat)) = e.pc() {
+                    add(p ^ ((cat as u64) << 32));
+                }
+            }
+            for x in &r.d {
+                add(x.eid ^ ((x.ing as u64) << 1) ^ ((x.loc as u64) << 40));
+            }
+            for &x in &r.doff {
+                add(x as u64);
+            }
+            for x in &r.fb {
+                add(x.0 ^ (x.1 as u64) ^ ((x.2 as u64) << 40));
+            }
+            for x in &r.fbn {
+                add(x.0 ^ x.1);
+            }
+            for x in &r.side {
+                add(x.0 as u64 ^ x.1 as u64);
+            }
         }
-        eprintln!("parse rep{} {:.3}s ({} recs)", rep, t.elapsed().as_secs_f64(), n);
+        best = best.min(el);
+        sum = h;
+        eprintln!("parse rep{} {:.3}s", rep, el);
     }
+    eprintln!("parse best {:.3}s sum {:016x}", best, sum);
 }
 
 fn fbn_merge<E: Ev>(v: &[EvChunk<E>], names_map: &mut AHashMap<u64, u64>) {
@@ -2197,6 +2220,7 @@ fn main() {
                 } else {
                     parse_aid::<EvW>(&ev_chunks, &cx);
                 }
+                std::process::exit(0);
             }
             if std::env::var_os("SHOP_PARTS").is_some() {
                 // measurement aid: each per-field step alone over the real fields
