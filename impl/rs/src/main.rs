@@ -2964,28 +2964,45 @@ fn main() {
             let mut tmp: Vec<ClickRec> = Vec::with_capacity(c.len() / 40);
             let mut tm = now();
             static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            if *OLD.get_or_init(|| std::env::var_os("SHOP_CKOLD").is_some()) {
-                parse_clicks_old(c, &camp, &rs, ws, we, &mut tmp);
-            } else {
-                parse_clicks_sol(c, &camp, &rs, ws, we, &mut tmp);
-            }
-            pt(9, &mut tm);
-            // keys that miss the mover filter map to themselves without a table lookup
-            let n = tmp.len();
-            for i in 0..n {
-                if i + 2 * RPD < n {
-                    mf.pf(tmp[i + 2 * RPD].key);
+            let old = *OLD.get_or_init(|| std::env::var_os("SHOP_CKOLD").is_some());
+            // parse in line-aligned pieces and resolve each piece's users while its records are
+            // still in cache; keys that miss the mover filter map to themselves without a table lookup
+            let piece = if old { c.len().max(1) } else { 64 << 10 };
+            let mut s = 0usize;
+            while s < c.len() {
+                let mut e = (s + piece).min(c.len());
+                if e < c.len() {
+                    e = match memchr(b'\n', &c[e..]) {
+                        Some(i) => e + i + 1,
+                        None => c.len(),
+                    };
                 }
-                if i + RPD < n {
-                    let k = tmp[i + RPD].key;
+                let a = tmp.len();
+                if old {
+                    parse_clicks_old(&c[s..e], &camp, &rs, ws, we, &mut tmp);
+                } else {
+                    parse_clicks_sol(&c[s..e], &camp, &rs, ws, we, &mut tmp);
+                }
+                pt(9, &mut tm);
+                let v = &mut tmp[a..];
+                let n = v.len();
+                for i in 0..n {
+                    if i + 2 * RPD < n {
+                        mf.pf(v[i + 2 * RPD].key);
+                    }
+                    if i + RPD < n {
+                        let k = v[i + RPD].key;
+                        if mf.hit(k) {
+                            tab.pf(k);
+                        }
+                    }
+                    let k = v[i].key;
                     if mf.hit(k) {
-                        tab.pf(k);
+                        v[i].key = tab.get(k);
                     }
                 }
-                let k = tmp[i].key;
-                if mf.hit(k) {
-                    tmp[i].key = tab.get(k);
-                }
+                pt(10, &mut tm);
+                s = e;
             }
             let r = bucketize(&tmp, PB, |x| pbk(x.key));
             pt(10, &mut tm);
