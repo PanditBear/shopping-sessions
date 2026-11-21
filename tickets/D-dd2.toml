@@ -1,0 +1,4 @@
+id = "D-dd2"
+files = ["impl/rs/src/main.rs"]
+why = "dedup tables sized for L2 and a sequential collect pass instead of random record derefs; fewer cache misses on the scorer's smaller caches"
+created = "2026-11-20 19:46:26"
