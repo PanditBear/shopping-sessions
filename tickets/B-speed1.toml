@@ -1,0 +1,4 @@
+id = "B-speed1"
+files = ["impl/rs/"]
+why = "Speed round 1: lock-free identity table, per-bucket hash dedup, ts prefix cache; 20M 5.7s->4.3s native; all gates pass incl t20m ref"
+created = "2026-11-20 18:20:32"
