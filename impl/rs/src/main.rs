@@ -3188,7 +3188,7 @@ unsafe fn ts25(p: *const u8, ra: u64, rb: u64, rd: i64, c: &mut DayCache) -> Opt
 /// as pointer and length, both ids packed in one vector, ISO times straight to seconds.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
 #[inline(never)]
-fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
+fn parse_events_sol<E: Ev, const P: u8>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
     use core::arch::x86_64::_bzhi_u64;
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
@@ -3206,6 +3206,8 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
     let base = c.as_ptr();
     let mut pos = 0usize;
     let mut sbuf: Vec<[B; 7]> = Vec::new();
+    // measurement aid (P > 0, SHOP_SOLP): folds what a cut-down variant computes
+    let mut sink = 0u64;
     'ln: while pos + 128 <= len {
         // SAFETY: pos + 128 <= len, and the second window starts at most 64 bytes in
         let p = unsafe { base.add(pos) };
@@ -3249,6 +3251,11 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
             let (pet, net) = fld(pb, xb, e3 + 1, e4);
             let (pp, np) = fld(pb, xb, e4 + 1, e5);
             let (ppr, npr) = fld(pb, xb, e5 + 1, l);
+            if P == 2 {
+                let lens = ne | nu << 8 | nt << 16 | ni << 24 | net << 32 | np << 40 | npr << 48;
+                sink = sink.wrapping_add((pe as u64) ^ (pp as u64) ^ lens as u64);
+                continue 'ln;
+            }
             // SAFETY: both ids start in the first window, so 16 bytes from each stay inside
             // the 128 readable bytes at p
             let (ke, oke, ku, oku) = unsafe { pack6x2(pe, ne, pu, nu) };
@@ -3334,8 +3341,18 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
                 let key = if oku { ku } else { ev_key_slow(sl(pu, nu), cx.rs, fbn) };
                 r = E::mk(key, (t - ws) as u64, pv, cat);
             }
+            if P == 3 {
+                std::hint::black_box(r);
+                sink = sink.wrapping_add(ke ^ (ik as u64) ^ (iex as u64) ^ ingest as u64);
+                continue 'ln;
+            }
             // SAFETY: 16 bytes from pe are readable (see pack6x2)
             if let Some(i) = unsafe { dz.idx_txt(pe, ne) } {
+                if P == 1 {
+                    std::hint::black_box(r);
+                    sink = sink.wrapping_add((i as u64) ^ (ik as u64) ^ (iex as u64) ^ ingest as u64);
+                    continue 'ln;
+                }
                 dz.put(i, ik, r, iex, ingest);
                 continue 'ln;
             }
@@ -3360,10 +3377,95 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
     if pos < len {
         scan::<7>(&c[pos..], |f| ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side, dz));
     }
+    std::hint::black_box(sink);
+}
+
+/// measurement aid (SHOP_SOLP): newline count over the chunk with the kernel's 64-byte masks
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+fn solp_nl(c: B) -> u64 {
+    let (mut n, mut i) = (0u64, 0usize);
+    while i + 64 <= c.len() {
+        // SAFETY: i + 64 <= len
+        let (_, _, nm) = masks64(unsafe { c.as_ptr().add(i) });
+        n += nm.count_ones() as u64;
+        i += 64;
+    }
+    n + c[i..].iter().filter(|&&b| b == b'\n').count() as u64
+}
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+fn solp_nl(c: B) -> u64 {
+    memchr::memchr_iter(b'\n', c).count() as u64
+}
+
+/// measurement aid (SHOP_SOLP): one chunk through a cut-down kernel P (see parse_events_sol)
+fn solp_chunk<E: Ev, const P: u8>(c: B, cx: &EvCtx) -> u64 {
+    let mut dz = Dz::new(idx_cfg(), c.len());
+    let cap = if dz.on { c.len() / 4096 } else { c.len() / 64 };
+    let mut m: Vec<E> = Vec::with_capacity(cap);
+    let mut d: Vec<DRec> = Vec::with_capacity(cap);
+    let (mut fb, mut fbn, mut side) = (vec![], vec![], vec![]);
+    parse_events_sol::<E, P>(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side, &mut dz);
+    (m.len() + d.len() + fb.len()) as u64
+}
+
+/// process CPU seconds (user + system) from /proc/self/stat; 0 where unavailable
+fn proc_cpu() -> f64 {
+    let s = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let f: Vec<&str> = s.rsplit(')').next().unwrap_or("").split_whitespace().collect();
+    let g = |i: usize| f.get(i).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
+    (g(11) + g(12)) / 100.0
+}
+
+/// measurement aid (SHOP_SOLP=a|b|e|c|d, SHOP_SOLREPS): the event scan cut down to one layer,
+/// over all chunks on the pool. a: newline masks only, b: line structure and field bounds,
+/// e: full field parse with no dense index or store, c: plus the dense index (no store),
+/// d: the real chunk parse. Prints wall, process CPU and summed per-chunk time per rep.
+fn solp<E: Ev>(ev_chunks: &[B], cx: &EvCtx, mode: &str) {
+    let reps: usize = std::env::var("SHOP_SOLREPS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    let kern = std::sync::atomic::AtomicU64::new(0);
+    for rep in 0..reps {
+        kern.store(0, Relaxed);
+        let (t0, c0) = (std::time::Instant::now(), proc_cpu());
+        let timed = |f: &dyn Fn() -> u64| {
+            let t = std::time::Instant::now();
+            let r = f();
+            kern.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            r
+        };
+        let (sum, keep): (u64, Vec<EvChunk<E>>) = match mode {
+            "a" => (ev_chunks.par_iter().map(|&c| timed(&|| solp_nl(c))).sum(), vec![]),
+            "b" => (ev_chunks.par_iter().map(|&c| timed(&|| solp_chunk::<E, 2>(c, cx))).sum(), vec![]),
+            "e" => (ev_chunks.par_iter().map(|&c| timed(&|| solp_chunk::<E, 3>(c, cx))).sum(), vec![]),
+            "c" => (ev_chunks.par_iter().map(|&c| timed(&|| solp_chunk::<E, 1>(c, cx))).sum(), vec![]),
+            _ => {
+                let v: Vec<EvChunk<E>> = ev_chunks
+                    .par_iter()
+                    .map(|&c| {
+                        let t = std::time::Instant::now();
+                        let r = ev_chunk_parse(c, cx);
+                        kern.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+                        r
+                    })
+                    .collect();
+                (v.iter().map(|r| r.m.len() as u64).sum(), v)
+            }
+        };
+        let (w, cpu) = (t0.elapsed().as_secs_f64(), proc_cpu() - c0);
+        drop(keep);
+        eprintln!(
+            "solp mode={mode} rep={rep} wall_ms={:.1} cpu_ms={:.0} kern_ms={:.1} chunks={} sum={sum}",
+            w * 1e3,
+            cpu * 1e3,
+            kern.load(Relaxed) as f64 / 1e6,
+            ev_chunks.len()
+        );
+    }
+    let lines: u64 = ev_chunks.par_iter().map(|&c| solp_nl(c)).sum();
+    eprintln!("solp mode={mode} lines={lines} threads={}", rayon::current_num_threads());
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
-fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
+fn parse_events_sol<E: Ev, const P: u8>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
     let c0 = c.as_ptr() as usize;
@@ -3434,7 +3536,7 @@ fn sol_bench<E: Ev>(ev_chunks: &[B], cx: &EvCtx) {
             };
             let new = |b: &mut EvBufs<E>| {
                 let t = std::time::Instant::now();
-                parse_events_sol(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side, &mut Dz::off());
+                parse_events_sol::<_, 0>(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side, &mut Dz::off());
                 t.elapsed().as_secs_f64()
             };
             if i % 2 == 0 {
@@ -4463,7 +4565,7 @@ fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
     if *OLD.get_or_init(|| std::env::var_os("SHOP_EVOLD").is_some()) {
         parse_events(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
     } else {
-        parse_events_sol(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side, &mut dz);
+        parse_events_sol::<_, 0>(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side, &mut dz);
     }
     pt(0, &mut tm);
     let (d, doff) = bucketize(&d, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize);
@@ -4671,6 +4773,21 @@ fn main() {
 
     tick("prod/camp loaded");
     let rs = hasher();
+    if let Ok(mode) = std::env::var("SHOP_SOLP") {
+        // measurement aid: event scan layers alone (no links work competing for the pool)
+        let ev_files = csv_files(&data.join("events"));
+        let ev_chunks = all_chunks(&ev_files, ev_chunk(&ev_files));
+        let _ = IDXC.set(idx_find(&ev_files, &ev_chunks));
+        let _ = UKEYC.set(idx_cfg().and_then(|c| ukey_find(&ev_chunks, c.key)));
+        tick("solp setup");
+        let cx = EvCtx { prod: &prod, unknown_cat, ws, we, ibase: ws.div_euclid(1000), rs: &rs };
+        if lean {
+            solp::<EvL>(&ev_chunks, &cx, &mode);
+        } else {
+            solp::<EvW>(&ev_chunks, &cx, &mode);
+        }
+        std::process::exit(0);
+    }
 
     let link_chunks = all_chunks(&csv_files(&data.join("links")), CHUNK);
     let link_pairs: Vec<Vec<[u64; 4]>> = link_chunks
@@ -5464,7 +5581,7 @@ mod tests {
     fn sol_cmp<E: Ev>(c: B, cx: &EvCtx) -> Result<(usize, usize), String> {
         let (mut a, mut b) = (EvBufs::<E>::new(), EvBufs::<E>::new());
         parse_events(c, cx, &mut a.m, &mut a.d, &mut a.fb, &mut a.fbn, &mut a.side);
-        parse_events_sol(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side, &mut Dz::off());
+        parse_events_sol::<_, 0>(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side, &mut Dz::off());
         match a.diff(&b) {
             Some(e) => Err(e),
             None => Ok((a.m.len(), a.m.iter().filter(|e| e.pc().is_some()).count())),
