@@ -4072,7 +4072,7 @@ struct SRun {
 }
 
 /// How many descriptors ahead gather_rd prefetches a run's first lines.
-const RD_AHEAD: usize = 3;
+const RD_AHEAD: usize = 6;
 
 /// One dense dedup task's output: its kept lines in index order, its run descriptors grouped by
 /// person bucket, their bucket offsets, and the bucket offsets of the lines they cover.
