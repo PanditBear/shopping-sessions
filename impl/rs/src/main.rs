@@ -2781,61 +2781,39 @@ fn ev_after<E: Ev>(
                     let totals: [usize; DDG] =
                         std::array::from_fn(|i| ev_out.iter().map(|c| (c.doff[g * DDG + i + 1] - c.doff[g * DDG + i]) as usize).sum());
                     let maxcap = (totals.iter().max().unwrap() * 2).max(16).next_power_of_two();
-                    // 8-byte slot: hash fingerprint << 32 | 1-based index of the current winner in
-                    // the bucket (its records in chunk order); 0 is empty. Half the bytes of a
-                    // (event_id, key) slot, so the table stays in L2; the record itself is read
-                    // only when the fingerprint matches (a duplicate, or a rare false match).
-                    let mut tbuf: Vec<u64> = vec![0; maxcap];
-                    let mut st: Vec<u32> = vec![0; ev_out.len() + 1];
+                    // slot: (event_id, ingest key << 32 | global index of the current winner)
+                    let mut tbuf: Vec<[u64; 2]> = vec![[0, 0]; maxcap];
                     for (i, &total) in totals.iter().enumerate() {
                         let b = g * DDG + i;
                         let cap = (total * 2).max(16).next_power_of_two();
                         let mask = cap - 1;
                         let t = &mut tbuf[..cap];
                         if i > 0 {
-                            t.fill(0);
+                            t.fill([0, 0]);
                         }
-                        let mut a = 0u32;
                         for (ci, c) in ev_out.iter().enumerate() {
-                            st[ci] = a;
-                            a += c.doff[b + 1] - c.doff[b];
-                        }
-                        st[ev_out.len()] = a;
-                        // record and global index of the 1-based bucket index j
-                        let at = |j: u32| -> (DRec, u32) {
-                            let ci = st.partition_point(|&s| s < j) - 1;
-                            let c = &ev_out[ci];
-                            let r = c.d[(c.doff[b] + (j - 1 - st[ci])) as usize];
-                            (r, mbase[ci] + r.loc)
-                        };
-                        let mut j = 0u32;
-                        for (ci, c) in ev_out.iter().enumerate() {
+                            let mb = mbase[ci];
                             for r in &c.d[c.doff[b] as usize..c.doff[b + 1] as usize] {
-                                j += 1;
-                                let h = mix(r.eid);
-                                let fp = (h >> 21) as u32;
-                                let mut p = (h >> 8) as usize & mask;
+                                let gi = mb + r.loc;
+                                let pk = ((r.ing as u64) << 32) | gi as u64;
+                                let mut p = (mix(r.eid) >> 8) as usize & mask;
                                 loop {
                                     let o = unsafe { t.get_unchecked_mut(p) };
-                                    if *o == 0 {
-                                        *o = ((fp as u64) << 32) | j as u64;
+                                    if o[0] == 0 {
+                                        *o = [r.eid, pk];
                                         break;
                                     }
-                                    if (*o >> 32) as u32 == fp {
-                                        let oj = *o as u32;
-                                        let (or, og) = at(oj);
-                                        if or.eid == r.eid {
-                                            let gi = mbase[ci] + r.loc;
-                                            let ok = or.ing;
-                                            let win = r.ing < ok || (r.ing == ok && side_any && exact(gi, r.ing) < exact(og, ok));
-                                            if win {
-                                                *o = ((fp as u64) << 32) | j as u64;
-                                                kill(og);
-                                            } else {
-                                                kill(gi);
-                                            }
-                                            break;
+                                    if o[0] == r.eid {
+                                        let ok = (o[1] >> 32) as u32;
+                                        let og = o[1] as u32;
+                                        let win = r.ing < ok || (r.ing == ok && side_any && exact(gi, r.ing) < exact(og, ok));
+                                        if win {
+                                            o[1] = pk;
+                                            kill(og);
+                                        } else {
+                                            kill(gi);
                                         }
+                                        break;
                                     }
                                     p = (p + 1) & mask;
                                 }
