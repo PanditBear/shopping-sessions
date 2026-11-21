@@ -1,0 +1,4 @@
+id = "D-fast"
+files = ["impl/rs/src/main.rs"]
+why = "sorts order persons by a hashed in-bucket digit so each digit range is one person and sorts by (ts, index) words; event_id packing reads one word; measured 1.813 to 1.710 s median wall on CI"
+created = "2026-11-20 21:11:01"
