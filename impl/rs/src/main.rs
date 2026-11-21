@@ -44,6 +44,7 @@ const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 1_800_000;
 const CHUNK: usize = 4 << 20;
+const LCHUNK: usize = 1 << 20; // link chunks: the link parse is short, so balance matters more
 const EBB: u32 = 11;
 const EB: usize = 1 << EBB; // event dedup buckets (by event_id)
 const DDG: usize = 4; // event_id buckets per dedup task
@@ -78,7 +79,35 @@ fn pt(i: usize, t: &mut Option<std::time::Instant>) {
     if let Some(s) = t {
         let n = std::time::Instant::now();
         PROF[i].fetch_add((n - *s).as_nanos() as u64, Relaxed);
+        tr(i as u32, *s, n);
         *s = n;
+    }
+}
+// measurement aid (SHOP_TRACE=file): every timed span as (thread, phase, start ns, end ns)
+static TRACE: AtomicBool = AtomicBool::new(false);
+static TRV: std::sync::Mutex<Vec<(u32, u32, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+static TR0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+fn tr(ph: u32, s: std::time::Instant, e: std::time::Instant) {
+    if TRACE.load(Relaxed) {
+        let t0 = *TR0.get().unwrap();
+        let tid = rayon::current_thread_index().map(|i| i as u32).unwrap_or(99);
+        let v = (tid, ph, s.saturating_duration_since(t0).as_nanos() as u64, e.saturating_duration_since(t0).as_nanos() as u64);
+        TRV.lock().unwrap().push(v);
+    }
+}
+fn tspan(ph: u32, s: Option<std::time::Instant>) {
+    if let Some(s) = s {
+        tr(ph, s, std::time::Instant::now());
+    }
+}
+fn tdump() {
+    if let Some(p) = std::env::var_os("SHOP_TRACE") {
+        use std::io::Write;
+        let v = TRV.lock().unwrap();
+        let mut f = std::io::BufWriter::new(File::create(p).unwrap());
+        for &(t, ph, s, e) in v.iter() {
+            writeln!(f, "{t} {ph} {s} {e}").unwrap();
+        }
     }
 }
 
@@ -938,12 +967,14 @@ impl MoverF {
         let nw = (tab.s.len() / 16).max(1);
         let w: Vec<AtomicU64> = (0..nw).map(|_| AtomicU64::new(0)).collect();
         tab.s.par_chunks(1 << 15).for_each(|c| {
+            let tmf = now();
             for e in c {
                 if e[0] != 0 && e[0] != e[1] {
                     let h = mix(e[0]);
                     w[h as usize & (nw - 1)].fetch_or(Self::bits(h), Relaxed);
                 }
             }
+            tspan(17, tmf);
         });
         MoverF { w, mask: nw - 1 }
     }
@@ -2339,24 +2370,68 @@ struct EvChunk<E> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn ev_after<E: Ev>(
-    mut ev_out: Vec<EvChunk<E>>,
-    tab: &IdTab,
-    mf: &MoverF,
-    click_out: &[(Vec<ClickRec>, Vec<u32>)],
-    ws: i64,
-    we: i64,
-    ncamp: usize,
-    d0: i64,
-    nd: usize,
-    tick: &dyn Fn(&str),
-) -> Vec<(Vec<Vec<UD>>, CampAcc)> {
+/// Click lines in the window with a known campaign, per chunk (user keys not yet resolved).
+fn ck_scan(click_chunks: &[B], camp: &IdLookup, rs: &RandomState, ws: i64, we: i64) -> Vec<Vec<ClickRec>> {
+    click_chunks
+        .par_iter()
+        .map(|&c| {
+            let mut tmp: Vec<ClickRec> = Vec::with_capacity(c.len() / 40);
+            let mut tc = TsCache::new();
+            let mut tm = now();
+            scan::<4>(c, |&[cid, uid, cmp, ts]| {
+                if cid.is_empty() || uid.is_empty() {
+                    return;
+                }
+                let Some(ci) = camp.get(cmp) else { return };
+                let Some(t) = parse_ts_c(ts, &mut tc) else { return };
+                if t < ws - WEEK || t >= we {
+                    return;
+                }
+                tmp.push(ClickRec { key: ukey(rs, uid), ts: t, cid: pack(cid), camp: ci });
+            });
+            pt(9, &mut tm);
+            tmp
+        })
+        .collect()
+}
+
+/// Resolves each click chunk's user keys to person keys and groups it by person bucket.
+fn ck_res(ck: Vec<Vec<ClickRec>>, mf: &MoverF, tab: &IdTab) -> Vec<(Vec<ClickRec>, Vec<u32>)> {
+    ck.into_par_iter()
+        .map(|mut tmp| {
+            let mut tm = now();
+            // keys that miss the mover filter map to themselves without a table lookup
+            let n = tmp.len();
+            for i in 0..n {
+                if i + 2 * RPD < n {
+                    mf.pf(tmp[i + 2 * RPD].key);
+                }
+                if i + RPD < n {
+                    let k = tmp[i + RPD].key;
+                    if mf.hit(k) {
+                        tab.pf(k);
+                    }
+                }
+                let k = tmp[i].key;
+                if mf.hit(k) {
+                    tmp[i].key = tab.get(k);
+                }
+            }
+            let r = bucketize(&tmp, PB, |x| pbk(x.key));
+            pt(10, &mut tm);
+            r
+        })
+        .collect()
+}
+
+/// Event-id dedup: the global line index base of each chunk, and the dead bitmap of losers.
+fn ev_dedup<E: Ev>(ev_out: &[EvChunk<E>], ws: i64) -> (Vec<u32>, Vec<AtomicU64>) {
     // dedup on event_id: every line has a global index (chunk base + its index in the chunk);
     // each event_id's losers are marked in the dead bitmap. Each task takes DDG consecutive
     // event_id buckets, one small (L2-sized) table at a time.
     let mut mbase: Vec<u32> = Vec::with_capacity(ev_out.len() + 1);
     let mut acc = 0usize;
-    for c in &ev_out {
+    for c in ev_out {
         mbase.push(acc as u32);
         acc += c.m.len();
     }
@@ -2454,62 +2529,85 @@ fn ev_after<E: Ev>(
             },
         );
     }
+    (mbase, dead)
+}
+
+fn ev_after<E: Ev>(
+    ev_out: Vec<EvChunk<E>>,
+    dd: (Vec<u32>, Vec<AtomicU64>),
+    ck: Vec<Vec<ClickRec>>,
+    tab: &IdTab,
+    mf: &MoverF,
+    ws: i64,
+    we: i64,
+    ncamp: usize,
+    d0: i64,
+    nd: usize,
+    tick: &dyn Fn(&str),
+) -> Vec<(Vec<Vec<UD>>, CampAcc)> {
+    let (mbase, dead) = dd;
     // kept lines: user key -> person key (0 marks a dropped line; keys that miss the mover filter
     // map to themselves without a table lookup), then each chunk's kept lines
     // are grouped by person bucket inside the chunk (a cache-sized scatter; the order within a
     // bucket stays the line order). The sessionizer gathers a bucket from every chunk in chunk order.
-    let parts: Vec<(Vec<E>, Vec<u32>)> = ev_out
-        .into_par_iter()
-        .enumerate()
-        .map(|(ci, c)| {
-            let mut tm = now();
-            let mut cnt = vec![0u32; PB + 1];
-            let mb = mbase[ci] as usize;
-            let mut m = c.m;
-            let n = m.len();
-            for i in 0..n {
-                if i + 2 * RPD < n {
-                    mf.pf(m[i + 2 * RPD].key());
-                }
-                if i + RPD < n {
-                    let k = m[i + RPD].key();
-                    if mf.hit(k) {
-                        tab.pf(k);
+    // (the click resolve runs alongside: both need only the id table)
+    let (click_out, parts) = rayon::join(
+        || ck_res(ck, mf, tab),
+        || -> Vec<(Vec<E>, Vec<u32>)> {
+            ev_out
+                .into_par_iter()
+                .enumerate()
+                .map(|(ci, c)| {
+                    let mut tm = now();
+                    let mut cnt = vec![0u32; PB + 1];
+                    let mb = mbase[ci] as usize;
+                    let mut m = c.m;
+                    let n = m.len();
+                    for i in 0..n {
+                        if i + 2 * RPD < n {
+                            mf.pf(m[i + 2 * RPD].key());
+                        }
+                        if i + RPD < n {
+                            let k = m[i + RPD].key();
+                            if mf.hit(k) {
+                                tab.pf(k);
+                            }
+                        }
+                        let g = mb + i;
+                        let k = m[i].key();
+                        if k != 0 && dead[g >> 6].load(Relaxed) & (1u64 << (g & 63)) == 0 {
+                            let pk = if mf.hit(k) { tab.get(k) } else { k };
+                            m[i].set_key(pk);
+                            cnt[pbk(pk) + 1] += 1;
+                        } else {
+                            m[i].set_key(0);
+                        }
                     }
-                }
-                let g = mb + i;
-                let k = m[i].key();
-                if k != 0 && dead[g >> 6].load(Relaxed) & (1u64 << (g & 63)) == 0 {
-                    let pk = if mf.hit(k) { tab.get(k) } else { k };
-                    m[i].set_key(pk);
-                    cnt[pbk(pk) + 1] += 1;
-                } else {
-                    m[i].set_key(0);
-                }
-            }
-            pt(4, &mut tm);
-            for p in 0..PB {
-                cnt[p + 1] += cnt[p];
-            }
-            let tot = cnt[PB] as usize;
-            let mut out: Vec<E> = Vec::with_capacity(tot);
-            {
-                let mut w = cnt.clone();
-                let sp = out.spare_capacity_mut();
-                for e in &m {
-                    let k = e.key();
-                    if k != 0 {
-                        let p = pbk(k);
-                        sp[w[p] as usize].write(*e);
-                        w[p] += 1;
+                    pt(4, &mut tm);
+                    for p in 0..PB {
+                        cnt[p + 1] += cnt[p];
                     }
-                }
-            }
-            unsafe { out.set_len(tot) };
-            pt(5, &mut tm);
-            (out, cnt)
-        })
-        .collect();
+                    let tot = cnt[PB] as usize;
+                    let mut out: Vec<E> = Vec::with_capacity(tot);
+                    {
+                        let mut w = cnt.clone();
+                        let sp = out.spare_capacity_mut();
+                        for e in &m {
+                            let k = e.key();
+                            if k != 0 {
+                                let p = pbk(k);
+                                sp[w[p] as usize].write(*e);
+                                w[p] += 1;
+                            }
+                        }
+                    }
+                    unsafe { out.set_len(tot) };
+                    pt(5, &mut tm);
+                    (out, cnt)
+                })
+                .collect()
+        },
+    );
     drop(dead);
     tick("dedup done");
 
@@ -2678,9 +2776,12 @@ fn main() {
     tb.build_global().unwrap();
     let data = Path::new(&data);
     let outd = Path::new(&outd);
-    let timing = std::env::var("SHOP_TIMING").is_ok();
+    let timing = std::env::var("SHOP_TIMING").is_ok() || std::env::var_os("SHOP_TRACE").is_some();
     TIMING.store(timing, Relaxed);
+    TRACE.store(std::env::var_os("SHOP_TRACE").is_some(), Relaxed);
     let t0 = std::time::Instant::now();
+    TR0.set(t0).ok();
+    let tmain = now();
     let tick = |s: &str| {
         if timing {
             eprintln!("[{:.2}s] {}", t0.elapsed().as_secs_f64(), s);
@@ -2692,79 +2793,108 @@ fn main() {
     let ws = manifest_ts(&mf, "window_start").unwrap_or(0);
     let we = manifest_ts(&mf, "window_end").unwrap_or(0);
 
-    // products
-    let mut prod_raw: Vec<(B, B)> = vec![];
-    if let Some(f) = leak_file(&data.join("products.csv")) {
-        for c in chunks(f, CHUNK) {
-            scan::<2>(c, |&[p, c]| prod_raw.push((p, c)));
-        }
-    }
-    let mut cat_names: Vec<B> = prod_raw.iter().map(|x| x.1).collect();
-    cat_names.push(b"unknown");
-    cat_names.sort();
-    cat_names.dedup();
-    let unknown_cat = cat_names.binary_search(&(b"unknown" as B)).unwrap() as u32;
-    // 16-byte event records need a window of at most 2^32 ms and at most 256 categories
-    let lean = std::env::var_os("SHOP_WIDE").is_none() && cat_names.len() <= 256 && we.saturating_sub(ws) <= 1i64 << 32;
-    // first occurrence wins in a map insert loop? original used insert (last wins); keep last wins
-    let mut prod_items: Vec<(B, u32)> = vec![];
-    {
-        let mut seen: AHashMap<B, usize> = AHashMap::new();
-        for &(p, c) in &prod_raw {
-            let cat = cat_names.binary_search(&c).unwrap() as u32;
-            match seen.get(p) {
-                Some(&i) => prod_items[i].1 = cat,
-                None => {
-                    seen.insert(p, prod_items.len());
-                    prod_items.push((p, cat));
+    let rs = hasher();
+    // products and campaigns load while the link files parse; the event and click files are
+    // listed and mapped at the same time (none of these needs another)
+    let ((cat_names, unknown_cat, lean, prod, camp_names, channels, camp, ncamp), ((ev_chunks, click_chunks), link_pairs)) = rayon::join(
+        || {
+            // products
+            let mut prod_raw: Vec<(B, B)> = vec![];
+            if let Some(f) = leak_file(&data.join("products.csv")) {
+                for c in chunks(f, CHUNK) {
+                    scan::<2>(c, |&[p, c]| prod_raw.push((p, c)));
                 }
             }
-        }
-    }
-    let prod = IdLookup::new(b"p", &prod_items);
-
-    // campaigns
-    let mut camp_items: Vec<(B, u32)> = vec![];
-    let mut camp_names: Vec<B> = vec![];
-    let mut channels: Vec<B> = vec![];
-    if let Some(f) = leak_file(&data.join("campaigns.csv")) {
-        let mut seen: AHashMap<B, u32> = AHashMap::new();
-        for c in chunks(f, CHUNK) {
-            scan::<2>(c, |&[id, ch]| {
-                if !seen.contains_key(id) {
-                    seen.insert(id, camp_names.len() as u32);
-                    camp_items.push((id, camp_names.len() as u32));
-                    camp_names.push(id);
-                    channels.push(ch);
+            let mut cat_names: Vec<B> = prod_raw.iter().map(|x| x.1).collect();
+            cat_names.push(b"unknown");
+            cat_names.sort();
+            cat_names.dedup();
+            let unknown_cat = cat_names.binary_search(&(b"unknown" as B)).unwrap() as u32;
+            // 16-byte event records need a window of at most 2^32 ms and at most 256 categories
+            let lean = std::env::var_os("SHOP_WIDE").is_none() && cat_names.len() <= 256 && we.saturating_sub(ws) <= 1i64 << 32;
+            // first occurrence wins in a map insert loop? original used insert (last wins); keep last wins
+            let mut prod_items: Vec<(B, u32)> = vec![];
+            {
+                let mut seen: AHashMap<B, usize> = AHashMap::new();
+                for &(p, c) in &prod_raw {
+                    let cat = cat_names.binary_search(&c).unwrap() as u32;
+                    match seen.get(p) {
+                        Some(&i) => prod_items[i].1 = cat,
+                        None => {
+                            seen.insert(p, prod_items.len());
+                            prod_items.push((p, cat));
+                        }
+                    }
                 }
-            });
-        }
-    }
-    let camp = IdLookup::new(b"c_", &camp_items);
-    let ncamp = camp_names.len();
-    camp_names.push(b"organic");
-    channels.push(b"organic");
+            }
+            let prod = IdLookup::new(b"p", &prod_items);
 
-    tick("prod/camp loaded");
-    let rs = hasher();
-
-    let link_chunks = all_chunks(&csv_files(&data.join("links")), CHUNK);
-    let link_pairs: Vec<Vec<[u64; 4]>> = link_chunks
-        .par_iter()
-        .map(|&c| {
-            let mut v = vec![];
-            scan::<2>(c, |&[a, b]| {
-                if !a.is_empty() && !b.is_empty() {
-                    v.push([ukey(&rs, a), pack(a), ukey(&rs, b), pack(b)]);
+            // campaigns
+            let mut camp_items: Vec<(B, u32)> = vec![];
+            let mut camp_names: Vec<B> = vec![];
+            let mut channels: Vec<B> = vec![];
+            if let Some(f) = leak_file(&data.join("campaigns.csv")) {
+                let mut seen: AHashMap<B, u32> = AHashMap::new();
+                for c in chunks(f, CHUNK) {
+                    scan::<2>(c, |&[id, ch]| {
+                        if !seen.contains_key(id) {
+                            seen.insert(id, camp_names.len() as u32);
+                            camp_items.push((id, camp_names.len() as u32));
+                            camp_names.push(id);
+                            channels.push(ch);
+                        }
+                    });
                 }
-            });
-            v
-        })
-        .collect();
+            }
+            let camp = IdLookup::new(b"c_", &camp_items);
+            let ncamp = camp_names.len();
+            camp_names.push(b"organic");
+            channels.push(b"organic");
+
+            tspan(12, tmain);
+            tick("prod/camp loaded");
+            (cat_names, unknown_cat, lean, prod, camp_names, channels, camp, ncamp)
+        },
+        || {
+            rayon::join(
+                || {
+                    let tef = now();
+                    let ev_files = csv_files(&data.join("events"));
+                    let ev_chunks = all_chunks(&ev_files, ev_chunk(&ev_files));
+                    tspan(22, tef);
+                    let tcf = now();
+                    let click_chunks = all_chunks(&csv_files(&data.join("clicks")), CHUNK);
+                    tspan(23, tcf);
+                    (ev_chunks, click_chunks)
+                },
+                || {
+                    let tlf = now();
+                    let link_chunks = all_chunks(&csv_files(&data.join("links")), LCHUNK);
+                    tspan(24, tlf);
+                    let link_pairs: Vec<Vec<[u64; 4]>> = link_chunks
+                        .par_iter()
+                        .map(|&c| {
+                            let tlp = now();
+                            let mut v = vec![];
+                            scan::<2>(c, |&[a, b]| {
+                                if !a.is_empty() && !b.is_empty() {
+                                    v.push([ukey(&rs, a), pack(a), ukey(&rs, b), pack(b)]);
+                                }
+                            });
+                            tspan(13, tlp);
+                            v
+                        })
+                        .collect();
+                    link_pairs
+                },
+            )
+        },
+    );
     tick("links parsed");
     // links (serial union-find) overlaps the parallel event parse; events do not need the id table
-    let ((tab, mut names_map), ev_out) = rayon::join(
+    let ((tab, mut names_map), (ev_out, dd, ck_tmp)) = rayon::join(
         || {
+            let mut tlk = now();
             let occ: usize = link_pairs.iter().map(|v| v.len()).sum::<usize>() * 2;
             let mut names_map: AHashMap<u64, u64> = AHashMap::new();
             let tab = {
@@ -2802,6 +2932,8 @@ fn main() {
                     }
                 }
                 tick(&format!("links inserted {}", idx_key.len()));
+                tspan(14, tlk);
+                tlk = now();
                 for (a, b) in edges {
                     let ra = find(&mut parent, a);
                     let rb = find(&mut parent, b);
@@ -2809,6 +2941,8 @@ fn main() {
                         parent[ra as usize] = rb;
                     }
                 }
+                tspan(15, tlk);
+                tlk = now();
                 let nl = idx_key.len();
                 let mut best: Vec<u32> = (0..nl as u32).collect();
                 for g in 0..nl {
@@ -2831,12 +2965,11 @@ fn main() {
                 ft
             };
             drop(link_pairs);
+            tspan(16, tlk);
             tick("links done");
             (tab, names_map)
         },
         || {
-            let ev_files = csv_files(&data.join("events"));
-            let ev_chunks = all_chunks(&ev_files, ev_chunk(&ev_files));
             let cx = EvCtx { prod: &prod, unknown_cat, ws, we, ibase: ws.div_euclid(1000), rs: &rs };
             if std::env::var_os("SHOP_PARSE").is_some() {
                 if lean {
@@ -2936,71 +3069,40 @@ fn main() {
             }
             let ev_out = if lean { Evs::L(ev_parse(&ev_chunks, &cx)) } else { Evs::W(ev_parse(&ev_chunks, &cx)) };
             tick("events parsed");
-            ev_out
+            // the event-id dedup tables and the click parse need no id table either
+            let (dd, ck_tmp) = rayon::join(
+                || match &ev_out {
+                    Evs::L(v) => ev_dedup(v, ws),
+                    Evs::W(v) => ev_dedup(v, ws),
+                },
+                || ck_scan(&click_chunks, &camp, &rs, ws, we),
+            );
+            tick("clicks parsed");
+            (ev_out, dd, ck_tmp)
         },
     );
 
-    // clicks
-    let click_chunks = all_chunks(&csv_files(&data.join("clicks")), CHUNK);
-    let mut tm = now();
-    let mf = MoverF::build(&tab);
-    pt(4, &mut tm);
-    let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_chunks
-        .par_iter()
-        .map(|&c| {
-            let mut tmp: Vec<ClickRec> = Vec::with_capacity(c.len() / 40);
-            let mut tc = TsCache::new();
-            let mut tm = now();
-            scan::<4>(c, |&[cid, uid, cmp, ts]| {
-                if cid.is_empty() || uid.is_empty() {
-                    return;
-                }
-                let Some(ci) = camp.get(cmp) else { return };
-                let Some(t) = parse_ts_c(ts, &mut tc) else { return };
-                if t < ws - WEEK || t >= we {
-                    return;
-                }
-                tmp.push(ClickRec { key: ukey(&rs, uid), ts: t, cid: pack(cid), camp: ci });
-            });
-            pt(9, &mut tm);
-            // keys that miss the mover filter map to themselves without a table lookup
-            let n = tmp.len();
-            for i in 0..n {
-                if i + 2 * RPD < n {
-                    mf.pf(tmp[i + 2 * RPD].key);
-                }
-                if i + RPD < n {
-                    let k = tmp[i + RPD].key;
-                    if mf.hit(k) {
-                        tab.pf(k);
-                    }
-                }
-                let k = tmp[i].key;
-                if mf.hit(k) {
-                    tmp[i].key = tab.get(k);
-                }
-            }
-            let r = bucketize(&tmp, PB, |x| pbk(x.key));
-            pt(10, &mut tm);
-            r
-        })
-        .collect();
-    tick("clicks parsed");
+    let tfm = now();
     match &ev_out {
         Evs::L(v) => fbn_merge(v, &mut names_map),
         Evs::W(v) => fbn_merge(v, &mut names_map),
     }
+    tspan(18, tfm);
+    let mut tm = now();
+    let mf = MoverF::build(&tab);
+    pt(4, &mut tm);
 
     // person buckets
     let d0 = ws.div_euclid(DAY);
     let nd = if we > ws { ((we - 1).div_euclid(DAY) - d0 + 1) as usize } else { 0 };
     let results = match ev_out {
-        Evs::L(v) => ev_after(v, &tab, &mf, &click_out, ws, we, ncamp, d0, nd, &tick),
-        Evs::W(v) => ev_after(v, &tab, &mf, &click_out, ws, we, ncamp, d0, nd, &tick),
+        Evs::L(v) => ev_after(v, dd, ck_tmp, &tab, &mf, ws, we, ncamp, d0, nd, &tick),
+        Evs::W(v) => ev_after(v, dd, ck_tmp, &tab, &mf, ws, we, ncamp, d0, nd, &tick),
     };
     tick("sessionized");
 
     // outputs
+    let tpl = now();
     let names = Names { map: names_map };
     let ud_dir = outd.join("user_daily");
     let cd_dir = outd.join("campaign_daily");
@@ -3023,13 +3125,20 @@ fn main() {
         files[k].push(g);
     }
     let any_rows = files.iter().any(|g| g.iter().any(|x| !x.is_empty()));
+    tspan(19, tpl);
     rayon::join(
         || {
             files.par_iter().enumerate().filter(|(i, g)| g.iter().any(|x| !x.is_empty()) || (*i == 0 && !any_rows)).for_each(|(i, g)| {
+                let tw = now();
                 write_user_daily(&ud_dir.join(format!("part-{i}.parquet")), g, &cat_names, &names);
+                tspan(20, tw);
             })
         },
-        || write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows, &camp_names, &channels),
+        || {
+            let tw = now();
+            write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows, &camp_names, &channels);
+            tspan(21, tw);
+        },
     );
     tick("written");
     if timing {
@@ -3039,6 +3148,7 @@ fn main() {
     if timing {
         eprintln!("epoch main={:.3} end={:.3}", ep0, ep());
     }
+    tdump();
     // all output files are written and closed; skip freeing the large tables
     std::process::exit(0);
 }
