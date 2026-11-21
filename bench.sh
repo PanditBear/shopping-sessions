@@ -4,6 +4,7 @@
 # A ref may carry image ENV lines: REF@VAR=val@VAR2=val (same binary, different environment).
 # Env: RUNS (timed runs per ref), CPUS, MEM, EVENTS, CLICKS, SEED, PROBE=1 (one SHOP_PROBE run per image),
 #      PERF=1 (profile the first image's binary on the host with perf),
+#      EXITPROBE=4 (what blocks after the container exits: stack samples, tmpfs output, cold cache),
 #      EXITPROBE=3 (time after the container exits, 60M run vs empty dataset, with docker events),
 #      EXITPROBE=2 (exit time of the first image under different docker cpu and memory limits),
 #      EXITPROBE=1 (split the time after the binary's last tick: process teardown vs docker, plus a native run).
@@ -225,5 +226,55 @@ if [ "${EXITPROBE:-}" = 3 ]; then
       sudo rm -rf $out $scr
     done
   done
+  set -e
+fi
+
+if [ "${EXITPROBE:-}" = 4 ]; then
+  echo "== exit probe 4 (s): variant end>finished finished>return"
+  set +e
+  ep() { date -d "$1" +%s.%N; }
+  cat > $W/samp.sh <<'SAMP'
+#!/bin/bash
+# sample kernel stacks of non-shop tasks that are blocked or running, only while no shop process exists;
+# stops when the file named by $1 appears
+while [ ! -f "$1" ]; do
+  if ! pgrep -x shop >/dev/null; then
+    for d in /proc/[0-9]*; do
+      st=$(awk '{print $3}' $d/stat 2>/dev/null); [ "$st" = D ] || [ "$st" = R ] || continue
+      c=$(cat $d/comm 2>/dev/null); case $c in samp.sh|awk|cat|pgrep|bash|sleep|head|cut|tr) continue;; esac
+      k=$(head -6 $d/stack 2>/dev/null | awk '{print $2}' | cut -d+ -f1 | tr '\n' '<')
+      echo "$st $c $k"
+    done
+  fi
+  sleep 0.01
+done
+SAMP
+  chmod +x $W/samp.sh
+  for v in base60 tmpout60 cold60 base60; do
+    for k in 1 2 3; do
+      out=$(mktemp -d); scr=$(mktemp -d); chmod 777 $out $scr; nm=xs-$v-$k-$RANDOM
+      [ $v = tmpout60 ] && sudo mount -t tmpfs -o size=4g,mode=777 tmpfs $out
+      [ $v = cold60 ] && { sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null; }
+      sf=$W/stop-$v-$k-$RANDOM; sudo $W/samp.sh $sf > $W/samp-$v-$k.txt 2>/dev/null &
+      docker run --name $nm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 \
+        --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 \
+        --cpus $CPUS --memory $MEM --memory-swap $MEM --user 1000:1000 \
+        -v $W/data:/data:ro -v $out:/output -v $scr:/scratch \
+        -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
+        -e NCPU=$CPUS -e SHOP_TIMING=1 ${IMGS[0]} 2>$W/xerr.txt
+      t1=$(date +%s.%N); sudo touch $sf; wait
+      fa=$(ep "$(docker inspect -f '{{.State.FinishedAt}}' $nm)"); docker rm $nm >/dev/null
+      ee=$(grep -o 'end=[0-9.]*' $W/xerr.txt | cut -d= -f2)
+      printf 'xs %s %.3f %.3f samples %s\n' $v "$(echo "$fa - $ee" | bc)" "$(echo "$t1 - $fa" | bc)" "$(wc -l < $W/samp-$v-$k.txt)"
+      [ $v = tmpout60 ] && sudo umount $out
+      sudo rm -rf $out $scr
+    done
+  done
+  echo "-- top blocked/running stacks after exit, base60 runs (count state comm stack)"
+  cat $W/samp-base60-*.txt | sort | uniq -c | sort -rn | head -25
+  echo "-- same, cold60"
+  cat $W/samp-cold60-*.txt | sort | uniq -c | sort -rn | head -12
+  echo "-- same, tmpout60"
+  cat $W/samp-tmpout60-*.txt | sort | uniq -c | sort -rn | head -12
   set -e
 fi
