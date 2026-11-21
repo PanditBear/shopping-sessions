@@ -1485,20 +1485,21 @@ fn codec() -> Compression {
     }
 }
 
-fn props() -> Arc<WriterProperties> {
+fn props(user_daily: bool) -> Arc<WriterProperties> {
     // Dictionary encoding on the low-cardinality columns makes the output about 2.5x smaller for no
     // measurable write time, and fewer bytes means less writeback when the container exits. user_id stays
-    // plain: its dictionary (or a delta encoding) costs more write time than the smaller output saves.
-    // A dictionary that outgrows the default page limit falls back to plain on its own.
-    Arc::new(
-        WriterProperties::builder()
-            .set_compression(codec())
-            .set_dictionary_enabled(true)
-            .set_column_dictionary_enabled(ColumnPath::from("user_id"), false)
-            .set_statistics_enabled(EnabledStatistics::None)
-            .set_write_batch_size(65536)
-            .build(),
-    )
+    // plain: its dictionary (or a delta encoding) costs more bytes than plain on name-sorted rows.
+    // In user_daily, events as byte-split int64 and revenue_cents as plain int64 compress smaller than
+    // dictionary indices, whose bit-packing is not byte aligned. A dictionary that outgrows the default
+    // page limit falls back to plain on its own.
+    let mut b = WriterProperties::builder().set_dictionary_enabled(true).set_column_dictionary_enabled(ColumnPath::from("user_id"), false);
+    if user_daily {
+        b = b
+            .set_column_dictionary_enabled(ColumnPath::from("events"), false)
+            .set_column_encoding(ColumnPath::from("events"), parquet::basic::Encoding::BYTE_STREAM_SPLIT)
+            .set_column_dictionary_enabled(ColumnPath::from("revenue_cents"), false);
+    }
+    Arc::new(b.set_compression(codec()).set_statistics_enabled(EnabledStatistics::None).set_write_batch_size(65536).build())
 }
 
 fn ba(b: &[u8]) -> ByteArray {
@@ -1528,7 +1529,7 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names)
         .unwrap(),
     );
     let f = File::create(path).unwrap();
-    let mut w = SerializedFileWriter::new(f, schema, props()).unwrap();
+    let mut w = SerializedFileWriter::new(f, schema, props(true)).unwrap();
     const RG: usize = 1 << 20;
     let mut buf: Vec<&UD> = Vec::with_capacity(RG);
     let mut nrg = 0usize;
@@ -1585,12 +1586,13 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names)
         rg.close().unwrap();
         buf.clear();
     };
-    for g in groups {
-        for r in g.iter() {
-            buf.push(r);
-            if buf.len() >= RG {
-                flush(&mut buf, &mut w, false, &mut nrg);
-            }
+    // Rows ordered by name (packed keys sort like the names), so neighbours share prefixes.
+    let mut all: Vec<&UD> = groups.iter().flat_map(|g| g.iter()).collect();
+    all.sort_unstable_by_key(|r| (r.key, r.day));
+    for r in all {
+        buf.push(r);
+        if buf.len() >= RG {
+            flush(&mut buf, &mut w, false, &mut nrg);
         }
     }
     flush(&mut buf, &mut w, nrg == 0, &mut nrg);
@@ -1605,7 +1607,7 @@ fn write_campaign_daily(path: &Path, rows: &[(u32, i32, [u64; 4])], names: &[B],
         .unwrap(),
     );
     let f = File::create(path).unwrap();
-    let mut w = SerializedFileWriter::new(f, schema, props()).unwrap();
+    let mut w = SerializedFileWriter::new(f, schema, props(false)).unwrap();
     {
         let mut rg = w.next_row_group().unwrap();
         let v: Vec<ByteArray> = rows.iter().map(|r| ba(names[r.0 as usize])).collect();
