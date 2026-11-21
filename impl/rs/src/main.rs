@@ -1165,14 +1165,24 @@ use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 
 fn props() -> Arc<WriterProperties> {
-    Arc::new(
-        WriterProperties::builder()
-            .set_compression(Compression::UNCOMPRESSED)
-            .set_dictionary_enabled(false)
-            .set_statistics_enabled(EnabledStatistics::None)
-            .set_write_batch_size(65536)
-            .build(),
-    )
+    let enc: u32 = std::env::var("SHOP_ENC").ok().and_then(|v| v.parse().ok()).unwrap_or(63);
+    let mut b = WriterProperties::builder()
+        .set_compression(Compression::UNCOMPRESSED)
+        .set_statistics_enabled(EnabledStatistics::None)
+        .set_write_batch_size(65536);
+    b = b.set_dictionary_enabled(false).set_dictionary_page_size_limit(64 << 20);
+    let cols = ["user_id", "day", "sessions", "events", "revenue_cents", "top_category"];
+    for (i, c) in cols.iter().enumerate() {
+        if enc & (1 << i) != 0 {
+            b = b.set_column_dictionary_enabled(parquet::schema::types::ColumnPath::from(*c), true);
+        }
+    }
+    if enc & 64 != 0 {
+        b = b.set_column_encoding(parquet::schema::types::ColumnPath::from("user_id"), parquet::basic::Encoding::DELTA_BYTE_ARRAY);
+    } else if enc & 128 != 0 {
+        b = b.set_column_encoding(parquet::schema::types::ColumnPath::from("user_id"), parquet::basic::Encoding::DELTA_LENGTH_BYTE_ARRAY);
+    }
+    Arc::new(b.build())
 }
 
 fn ba(b: &[u8]) -> ByteArray {
