@@ -25,6 +25,45 @@ mod hpa {
         }
     }
 
+    // diag: per-tick rusage and anon MB (Linux only)
+    #[cfg(target_os = "linux")]
+    pub fn nothp() {
+        extern "C" {
+            fn prctl(option: i32, a2: u64, a3: u64, a4: u64, a5: u64) -> i32;
+        }
+        if std::env::var_os("SHOP_NOTHP").is_some_and(|v| v == "1") {
+            unsafe { prctl(41, 1, 0, 0, 0) };
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    pub fn nothp() {}
+    #[cfg(target_os = "linux")]
+    fn snap() -> (f64, f64, i64, i64) {
+        extern "C" {
+            fn getrusage(who: i32, r: *mut i64) -> i32;
+        }
+        let mut r = [0i64; 64];
+        unsafe { getrusage(0, r.as_mut_ptr()) };
+        let st = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+        let v: Vec<i64> = st.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+        let anon = if v.len() > 2 { (v[1] - v[2]) * 4 / 1024 } else { 0 };
+        ((r[0] * 1_000_000 + r[1]) as f64 / 1e6, (r[2] * 1_000_000 + r[3]) as f64 / 1e6, r[8], anon)
+    }
+    #[cfg(target_os = "linux")]
+    static PEAK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    #[cfg(target_os = "linux")]
+    pub fn ru(label: &str, total: bool) {
+        let (u, s, f, a) = snap();
+        PEAK.fetch_max(a, std::sync::atomic::Ordering::Relaxed);
+        if total {
+            eprintln!("rutotal utime {:.3} stime {:.3} minflt {} peakanon {}", u, s, f, PEAK.load(std::sync::atomic::Ordering::Relaxed));
+        } else {
+            eprintln!("ru {label}: utime {:.3} stime {:.3} minflt {} anon {}", u, s, f, a);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    pub fn ru(_: &str, _: bool) {}
+
     // SHOP_THP=1: anonymous and huge-page memory of the process after each phase (Linux only)
     pub fn diag(label: &str) {
         if !cfg!(target_os = "linux") || std::env::var_os("SHOP_THP").is_none() {
@@ -5027,6 +5066,7 @@ enum Evs {
 }
 
 fn main() {
+    hpa::nothp();
     hpa::init();
     let ep = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
     let ep0 = ep();
@@ -5048,6 +5088,7 @@ fn main() {
             eprintln!("[{:.2}s] {}", t0.elapsed().as_secs_f64(), s);
         }
         hpa::diag(s);
+        hpa::ru(s, false);
     };
 
     let mf = std::fs::read_to_string(data.join("manifest.json")).unwrap_or_default();
@@ -5483,6 +5524,7 @@ fn main() {
         || write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows, &camp_names, &channels),
     );
     tick("written");
+    hpa::ru("", true);
     if timing {
         let v: Vec<String> = (0..PROF.len()).map(|i| format!("{}={:.2}", PROF_NAMES[i], PROF[i].load(Relaxed) as f64 / 1e9)).collect();
         eprintln!("prof(cpu s): {}", v.join(" "));
