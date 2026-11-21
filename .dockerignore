@@ -2,6 +2,3 @@
 !impl/rs/Cargo.toml
 !impl/rs/Cargo.lock
 !impl/rs/src
-!impl/launcher/Cargo.toml
-!impl/launcher/Cargo.lock
-!impl/launcher/src
