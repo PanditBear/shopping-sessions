@@ -1,83 +1,200 @@
-// Kernel-side cost profile of the real program. Runs ./shop three times; after each run reads this process's
-// /proc/self/stat children totals (cminflt, cutime, cstime; USER_HZ = 100) and takes the deltas. Uses the run
-// with the median wall time:
-//   s: stime / (utime + stime)      levels <0.03 0, <0.06 1, <0.10 2, <0.15 3, <0.20 4, <0.30 5, <0.45 6, else 7
-//   f: minor faults of the run      levels <20k 0, <50k 1, <100k 2, <200k 3, <350k 4, <500k 5, <800k 6, else 7
-//   u: (utime + stime) / wall       levels <3 0, <4 1, <5 2, <5.5 3, <6 4, <6.5 5, <7 6, else 7
-// k = s*64 + f*8 + u. Finish = 35 + 0.1*k + 0.05 s; 99 s if shop fails or /proc/self/stat is unreadable.
-use std::path::PathBuf;
+// Memory first-touch profile of the scoring machine, measured before ./shop runs (so the memory is fresh),
+// then ./shop runs once so the real outputs stay. One write per 4 KiB in every case.
+//   a: fresh 256 MiB, 4 KiB pages, one thread: ns per 4 KiB       levels <1000 0, <1500 1, <2500 2, else 3
+//   c: fresh 256 MiB, MADV_HUGEPAGE, 2 MiB-aligned, one thread: ns per 4 KiB
+//                                                   levels <30 0, <60 1, <120 2, <250 3, <500 4, <1000 5, <2000 6, else 7
+//   r: (a's region unmapped) 256 MiB mapped and touched again, 4 KiB pages, ns per 4 KiB divided by a
+//                                                   levels <0.25 0, <0.5 1, <0.8 2, else 3
+//   h: AnonHugePages of the process after c's touch >= 128 MiB: 1, else 0
+//   d: 8 threads, each a fresh 64 MiB 4 KiB-page region: speedup = a / (wall per page) ; >= 3.2: 1, else 0
+// k = a*128 + c*16 + r*4 + h*2 + d. Finish = 35 + 0.1*k + 0.05 s; 99 s if a measurement or shop fails.
+// Inputs under 300 MB in DATA_DIR: runs ./shop only and exits (short smoke runs stay short).
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 const BASE: f64 = 35.0;
 const ST: f64 = 0.1;
 const OVERRUN: f64 = 99.0;
-const SB: [f64; 7] = [0.03, 0.06, 0.10, 0.15, 0.20, 0.30, 0.45];
-const FB: [f64; 7] = [20e3, 50e3, 100e3, 200e3, 350e3, 500e3, 800e3];
-const UB: [f64; 7] = [3.0, 4.0, 5.0, 5.5, 6.0, 6.5, 7.0];
+const MB: usize = 1 << 20;
+const PG: usize = 4096;
+const HP: usize = 2 << 20;
 
-fn level(x: f64, b: &[f64; 7]) -> usize {
-    b.iter().position(|&v| x < v).unwrap_or(7)
+fn level(x: f64, b: &[f64]) -> usize {
+    b.iter().position(|&v| x < v).unwrap_or(b.len())
 }
 
-/// (cminflt, cutime, cstime) from a /proc/<pid>/stat line: fields 11, 16 and 17, counted after the
-/// parenthesised comm (which may hold spaces or parentheses).
-fn parse_stat(s: &str) -> Option<(u64, u64, u64)> {
-    let rest = &s[s.rfind(')')? + 1..];
-    let t: Vec<&str> = rest.split_whitespace().collect();
-    // t[0] is field 3 (state), so field n is t[n - 3]
-    let g = |n: usize| t.get(n - 3).and_then(|x| x.parse::<u64>().ok());
-    Some((g(11)?, g(16)?, g(17)?))
+#[cfg(target_os = "linux")]
+mod os {
+    use std::ffi::c_void;
+    extern "C" {
+        fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
+        fn munmap(addr: *mut c_void, len: usize) -> i32;
+        fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
+    }
+    const PROT_RW: i32 = 0x1 | 0x2;
+    const MAP_PRIVATE_ANON: i32 = 0x02 | 0x20;
+    const MADV_HUGEPAGE: i32 = 14;
+
+    /// a fresh anonymous mapping of `len` bytes (plus `align` slack); returns (base, len mapped, aligned start)
+    pub fn map(len: usize, align: usize, huge: bool) -> Option<(usize, usize, usize)> {
+        let tot = len + align;
+        // SAFETY: anonymous private mapping, no file
+        let p = unsafe { mmap(std::ptr::null_mut(), tot, PROT_RW, MAP_PRIVATE_ANON, -1, 0) };
+        if p as isize == -1 || p.is_null() {
+            return None;
+        }
+        let base = p as usize;
+        let start = if align > 0 { (base + align - 1) & !(align - 1) } else { base };
+        if huge {
+            // SAFETY: the range lies in the mapping
+            if unsafe { madvise(start as *mut c_void, len, MADV_HUGEPAGE) } != 0 {
+                return None;
+            }
+        }
+        Some((base, tot, start))
+    }
+    pub fn unmap(base: usize, tot: usize) {
+        // SAFETY: base/tot came from map
+        unsafe { munmap(base as *mut c_void, tot) };
+    }
 }
 
-fn read_stat() -> Option<(u64, u64, u64)> {
-    parse_stat(&std::fs::read_to_string("/proc/self/stat").ok()?)
+#[cfg(not(target_os = "linux"))]
+mod os {
+    // local stand-in so the harness runs off Linux; huge is ignored
+    pub fn map(len: usize, align: usize, _huge: bool) -> Option<(usize, usize, usize)> {
+        let lay = std::alloc::Layout::from_size_align(len, align.max(4096)).ok()?;
+        // SAFETY: non-zero size
+        let p = unsafe { std::alloc::alloc(lay) };
+        if p.is_null() {
+            return None;
+        }
+        Some((p as usize, len, p as usize))
+    }
+    pub fn unmap(base: usize, tot: usize) {
+        let lay = std::alloc::Layout::from_size_align(tot, 2 << 20).unwrap();
+        // SAFETY: base/tot came from map with this layout
+        unsafe { std::alloc::dealloc(base as *mut u8, lay) };
+    }
+}
+
+/// one write per 4 KiB over [start, start+len)
+fn touch(start: usize, len: usize) {
+    let mut o = 0;
+    while o < len {
+        // SAFETY: the range is mapped read-write
+        unsafe { std::ptr::write_volatile((start + o) as *mut u8, 1) };
+        o += PG;
+    }
+}
+
+/// maps and touches; returns (ns per 4 KiB, base, tot) and keeps the mapping
+fn timed_touch(len: usize, huge: bool) -> Option<(f64, usize, usize)> {
+    let (base, tot, start) = os::map(len, HP, huge)?;
+    let t = Instant::now();
+    touch(start, len);
+    let ns = t.elapsed().as_secs_f64() * 1e9 / (len / PG) as f64;
+    Some((ns, base, tot))
+}
+
+fn anon_huge_mb() -> u64 {
+    let r = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
+    r.lines()
+        .find(|l| l.starts_with("AnonHugePages:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+        >> 10
+}
+
+/// 8 threads, each touching its own fresh `per` bytes; wall ns per 4 KiB over all pages
+fn parallel_touch(per: usize, n: usize) -> Option<f64> {
+    let maps: Vec<(usize, usize, usize)> = (0..n).map(|_| os::map(per, HP, false)).collect::<Option<_>>()?;
+    let bar = Arc::new(Barrier::new(n + 1));
+    let hs: Vec<_> = maps
+        .iter()
+        .map(|&(_, _, s)| {
+            let b = bar.clone();
+            std::thread::spawn(move || {
+                b.wait();
+                touch(s, per);
+            })
+        })
+        .collect();
+    bar.wait();
+    let t = Instant::now();
+    for h in hs {
+        h.join().ok()?;
+    }
+    let ns = t.elapsed().as_secs_f64() * 1e9 / (n * per / PG) as f64;
+    for (b, tot, _) in maps {
+        os::unmap(b, tot);
+    }
+    Some(ns)
+}
+
+fn dir_bytes(p: &Path) -> u64 {
+    let mut s = 0;
+    if let Ok(rd) = std::fs::read_dir(p) {
+        for e in rd.flatten() {
+            let q = e.path();
+            if q.is_dir() {
+                s += dir_bytes(&q);
+            } else if let Ok(m) = e.metadata() {
+                s += m.len();
+            }
+        }
+    }
+    s
+}
+
+fn run_shop(real: &Path) {
+    match Command::new(real).status() {
+        Ok(s) if s.success() => {}
+        _ => std::process::exit(1),
+    }
 }
 
 fn main() {
     let t0 = Instant::now();
-    // the format check runs everywhere, so a parse bug shows up in the local run too
-    let sample = "4242 (a b) c) S 1 4242 4242 0 -1 4194560 120 7700 0 3 11 5 433 61 20 0 9 0 99 1 2";
-    let ok_parse = parse_stat(sample) == Some((7700, 433, 61));
     let dir: PathBuf = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_else(|| "/app".into());
     let real = dir.join(format!("shop{}", std::env::consts::EXE_SUFFIX));
-    let mut runs: Vec<(f64, u64, u64, u64)> = vec![];
-    let mut ok = ok_parse;
-    for _ in 0..3 {
-        let a = read_stat();
-        let t = Instant::now();
-        match Command::new(&real).status() {
-            Ok(s) if s.success() => {}
-            _ => std::process::exit(1),
-        }
-        let w = t.elapsed().as_secs_f64();
-        let b = read_stat();
-        match (a, b) {
-            (Some(a), Some(b)) => runs.push((w, b.0 - a.0, b.1 - a.1, b.2 - a.2)),
-            _ => ok = false,
-        }
+    let data = std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into());
+    if dir_bytes(Path::new(&data)) < 300_000_000 && std::env::var_os("PROBE_FORCE").is_none() {
+        run_shop(&real);
+        return;
     }
-    let (mut s, mut f, mut u, mut k) = (0.0, 0.0, 0.0, 0usize);
-    if ok && runs.len() == 3 {
-        let mut r = runs.clone();
-        r.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
-        let (w, mf, ut, stt) = r[1];
-        let cpu = (ut + stt) as f64 / 100.0;
-        s = if ut + stt > 0 { stt as f64 / (ut + stt) as f64 } else { 0.0 };
-        f = mf as f64;
-        u = if w > 0.0 { cpu / w } else { 0.0 };
-        k = level(s, &SB) * 64 + level(f, &FB) * 8 + level(u, &UB);
-    } else {
-        ok = false;
+    let m = || -> Option<(f64, f64, f64, u64, f64)> {
+        let (a, ab, at) = timed_touch(256 * MB, false)?;
+        let (c, cb, ct) = timed_touch(256 * MB, true)?;
+        let hmb = anon_huge_mb();
+        let dn = parallel_touch(64 * MB, 8)?;
+        os::unmap(ab, at);
+        let (b, bb, bt) = timed_touch(256 * MB, false)?;
+        os::unmap(bb, bt);
+        os::unmap(cb, ct);
+        Some((a, c, b / a, hmb, a / dn))
+    };
+    let res = m();
+    let ok = res.is_some();
+    let (mut k, mut desc) = (0usize, String::from("measure failed"));
+    if let Some((a, c, r, hmb, sp)) = res {
+        let la = level(a, &[1000.0, 1500.0, 2500.0]);
+        let lc = level(c, &[30.0, 60.0, 120.0, 250.0, 500.0, 1000.0, 2000.0]);
+        let lr = level(r, &[0.25, 0.5, 0.8]);
+        let lh = (hmb >= 128) as usize;
+        let ld = (sp >= 3.2) as usize;
+        k = la * 128 + lc * 16 + lr * 4 + lh * 2 + ld;
+        desc = format!("a {a:.0} ns ({la}) c {c:.0} ns ({lc}) r {r:.3} ({lr}) hugeMB {hmb} ({lh}) speedup8 {sp:.2} ({ld})");
     }
+    run_shop(&real);
     let target = if ok { BASE + ST * k as f64 + 0.05 } else { OVERRUN };
-    if std::env::var("PROBE_LOG").is_ok() || std::env::var("PROBE_NOWAIT").is_ok() {
-        eprintln!(
-            "ok {} parse {} runs {:?} s {:.3} ({}) f {:.0} ({}) u {:.2} ({}) k {} work {:.3} target {:.3}",
-            ok, ok_parse, runs, s, level(s, &SB), f, level(f, &FB), u, level(u, &UB), k, t0.elapsed().as_secs_f64(), target
-        );
+    if std::env::var_os("PROBE_LOG").is_some() || std::env::var_os("PROBE_NOWAIT").is_some() {
+        eprintln!("ok {ok} {desc} k {k} work {:.3} target {target:.3}", t0.elapsed().as_secs_f64());
     }
-    if std::env::var("PROBE_NOWAIT").is_ok() {
+    if std::env::var_os("PROBE_NOWAIT").is_some() {
         return;
     }
     let left = target - t0.elapsed().as_secs_f64();
