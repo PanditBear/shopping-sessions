@@ -731,11 +731,13 @@ fn chunks(data: B, sz: usize) -> Vec<B> {
 #[cfg(target_os = "linux")]
 static INPUT_MAPS: std::sync::Mutex<Vec<&'static memmap2::Mmap>> = std::sync::Mutex::new(Vec::new());
 
-/// SHOP_DROPIN: drop the page-table entries of the input mappings (MADV_DONTNEED) so process teardown has
-/// fewer 4K PTEs to zap. The mappings are private, read-only and file-backed, so any later read of an input
-/// byte just faults the same page back in from the page cache. `par` splits the work over the rayon pool.
+/// Drop the page-table entries of the input mappings (MADV_DONTNEED) on all cores once the output is
+/// written, so the single-threaded process teardown has about 1.4M fewer 4K PTEs to zap at 60M (GHA
+/// 44886103884: exit -0.016 s, wall -0.05 s). The mappings are private, read-only and file-backed, so a
+/// later read of an input byte would just fault the same page back in from the page cache.
+/// SHOP_DROPIN=off skips it.
 #[cfg(target_os = "linux")]
-fn drop_inputs(par: bool) {
+fn drop_inputs() {
     let maps: Vec<&'static memmap2::Mmap> = INPUT_MAPS.lock().unwrap().clone();
     let mut parts: Vec<(&'static memmap2::Mmap, usize, usize)> = vec![];
     const CH: usize = 64 << 20;
@@ -747,17 +749,12 @@ fn drop_inputs(par: bool) {
             o += n;
         }
     }
-    let f = |&(m, o, n): &(&'static memmap2::Mmap, usize, usize)| {
+    parts.par_iter().for_each(|&(m, o, n)| {
         let _ = unsafe { m.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, o, n) };
-    };
-    if par {
-        parts.par_iter().for_each(f);
-    } else {
-        parts.iter().for_each(f);
-    }
+    });
 }
 #[cfg(not(target_os = "linux"))]
-fn drop_inputs(_: bool) {}
+fn drop_inputs() {}
 
 fn leak_file(p: &Path) -> Option<B> {
     let f = File::open(p).ok()?;
@@ -3427,10 +3424,6 @@ fn main() {
         })
         .collect();
     tick("clicks parsed");
-    let dropin = std::env::var("SHOP_DROPIN").unwrap_or_default();
-    if dropin == "bg" {
-        std::thread::spawn(|| drop_inputs(false));
-    }
     match &ev_out {
         Evs::L(v) => fbn_merge(v, &mut names_map),
         Evs::W(v) => fbn_merge(v, &mut names_map),
@@ -3484,9 +3477,9 @@ fn main() {
     if timing {
         eprintln!("epoch main={:.3} end={:.3}", ep0, ep());
     }
-    if dropin == "end" {
+    if std::env::var("SHOP_DROPIN").map_or(true, |v| v != "off") {
         let t = ep();
-        drop_inputs(true);
+        drop_inputs();
         if timing {
             eprintln!("dropin end {:.3}s", ep() - t);
         }
