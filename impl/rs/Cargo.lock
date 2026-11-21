@@ -537,6 +537,7 @@ dependencies = [
  "mimalloc",
  "parquet",
  "rayon",
+ "zstd",
 ]
 
 [[package]]
