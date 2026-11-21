@@ -1877,6 +1877,13 @@ impl CampAcc {
             }
         }
     }
+    /// Pulls the cell of (c, d) into cache ahead of `sess`.
+    #[inline(always)]
+    fn pre(&self, c: u32, d: i64) {
+        if let Some(di) = self.di(d) {
+            prefetch(self.dense.as_ptr().wrapping_add(c as usize * self.nd + di));
+        }
+    }
     /// One touch for every campaign in `act` on day d.
     #[inline(always)]
     fn touch(&mut self, act: &[u32], d: i64) {
@@ -2405,6 +2412,7 @@ fn process_bucket<E: Ev>(
                 } else {
                     organic
                 };
+                cm.pre(s_camp, d);
                 cm.touch(&win.active, d);
                 if day.day != d {
                     flush_day(&mut day, uds);
@@ -4380,6 +4388,7 @@ fn person_sess<E: Ev>(
             } else {
                 organic
             };
+            cm.pre(s_camp, d);
             cm.touch(&win.active, d);
             if day.day != d {
                 flush_day(day, uds);
