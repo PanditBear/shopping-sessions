@@ -1795,15 +1795,17 @@ fn ev_after<E: Ev>(
             },
         );
     }
-    // kept lines: user key -> person key (0 marks a dropped line), counted per (chunk, bucket)
-    let mut cnts: Vec<Vec<u32>> = ev_out
-        .par_iter_mut()
+    // kept lines: user key -> person key (0 marks a dropped line), then each chunk's kept lines
+    // are grouped by person bucket inside the chunk (a cache-sized scatter; the order within a
+    // bucket stays the line order). The sessionizer gathers a bucket from every chunk in chunk order.
+    let parts: Vec<(Vec<E>, Vec<u32>)> = ev_out
+        .into_par_iter()
         .enumerate()
         .map(|(ci, c)| {
             let mut tm = now();
-            let mut cnt = vec![0u32; PB];
+            let mut cnt = vec![0u32; PB + 1];
             let mb = mbase[ci] as usize;
-            let m = &mut c.m;
+            let mut m = c.m;
             let n = m.len();
             for i in 0..n {
                 if i + PFD < n {
@@ -1814,80 +1816,63 @@ fn ev_after<E: Ev>(
                 if k != 0 && dead[g >> 6].load(Relaxed) & (1u64 << (g & 63)) == 0 {
                     let pk = tab.get(k);
                     m[i].set_key(pk);
-                    cnt[pbk(pk)] += 1;
+                    cnt[pbk(pk) + 1] += 1;
                 } else {
                     m[i].set_key(0);
                 }
             }
             pt(4, &mut tm);
-            cnt
+            for p in 0..PB {
+                cnt[p + 1] += cnt[p];
+            }
+            let tot = cnt[PB] as usize;
+            let mut out: Vec<E> = Vec::with_capacity(tot);
+            {
+                let mut w = cnt.clone();
+                let sp = out.spare_capacity_mut();
+                for e in &m {
+                    let k = e.key();
+                    if k != 0 {
+                        let p = pbk(k);
+                        sp[w[p] as usize].write(*e);
+                        w[p] += 1;
+                    }
+                }
+            }
+            unsafe { out.set_len(tot) };
+            pt(5, &mut tm);
+            (out, cnt)
         })
         .collect();
     drop(dead);
-    // one scatter of every kept line into a person-bucket-major array
-    let mut bstart = vec![0usize; PB + 1];
-    for p in 0..PB {
-        let mut a = bstart[p];
-        for cnt in cnts.iter_mut() {
-            let x = cnt[p] as usize;
-            cnt[p] = a as u32;
-            a += x;
-        }
-        bstart[p + 1] = a;
-    }
-    let tot = bstart[PB];
-    let mut evg: Vec<E> = Vec::with_capacity(tot);
-    {
-        let gp = SPtr(evg.as_mut_ptr());
-        ev_out.par_iter().zip(cnts.into_par_iter()).for_each(|(c, mut pos)| {
-            let mut tm = now();
-            for e in &c.m {
-                if e.key() != 0 {
-                    let p = pbk(e.key());
-                    unsafe { gp.at(pos[p] as usize).write(*e) };
-                    pos[p] += 1;
-                }
-            }
-            pt(5, &mut tm);
-        });
-    }
-    unsafe { evg.set_len(tot) };
-    drop(ev_out);
     tick("dedup done");
 
     let ngroups = (rayon::current_num_threads() * 4).clamp(1, PB);
     let per = PB.div_ceil(ngroups);
-    let mut gsl: Vec<(usize, &mut [E])> = Vec::with_capacity(ngroups);
-    {
-        let mut rest: &mut [E] = &mut evg;
-        for g in 0..ngroups {
-            let (a, b) = (bstart[(g * per).min(PB)], bstart[((g + 1) * per).min(PB)]);
-            let (x, y) = rest.split_at_mut(b - a);
-            gsl.push((g, x));
-            rest = y;
-        }
-    }
-    gsl
+    (0..ngroups)
         .into_par_iter()
-        .map(|(g, sl)| {
+        .map(|g| {
             let mut cm = CampAcc::new(ncamp + 1, d0, nd);
             let mut win = Win { cnt: vec![0; ncamp + 1], pos: vec![0; ncamp + 1], active: vec![] };
             let mut out = vec![];
+            let mut evs: Vec<E> = vec![];
             let mut tmp: Vec<E> = vec![];
             let mut cnt: Vec<u32> = vec![];
             let mut cl: Vec<ClickRec> = vec![];
             let mut ctmp: Vec<ClickRec> = vec![];
-            let g0 = bstart[(g * per).min(PB)];
             for p in g * per..((g + 1) * per).min(PB) {
                 let mut tm = now();
                 cl.clear();
                 for (v, o) in click_out.iter() {
                     cl.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
                 }
+                evs.clear();
+                for (v, o) in parts.iter() {
+                    evs.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
+                }
                 pt(6, &mut tm);
-                let evs = &mut sl[bstart[p] - g0..bstart[p + 1] - g0];
                 let mut uds = Vec::new();
-                process_bucket(evs, &mut tmp, &mut cnt, &mut cl, &mut ctmp, &mut win, ncamp as u32, &mut uds, &mut cm, ws, we.wrapping_sub(ws));
+                process_bucket(&mut evs, &mut tmp, &mut cnt, &mut cl, &mut ctmp, &mut win, ncamp as u32, &mut uds, &mut cm, ws, we.wrapping_sub(ws));
                 out.push(uds);
             }
             (out, cm)
