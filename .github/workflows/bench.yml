@@ -10,6 +10,9 @@ on:
       perfsha:
         description: "if set: run only the hotspot profile (perf) of this commit"
         default: ""
+      solsha:
+        description: "if set: run only the parse kernel bench (SHOP_SOLBENCH) of this commit"
+        default: ""
       perfsizes:
         description: "profile sizes, events:clicks pairs"
         default: "60000000:15000000 20000000:5000000"
@@ -35,7 +38,7 @@ permissions:
   contents: read
 jobs:
   bench:
-    if: ${{ github.event.inputs.perfsha == '' }}
+    if: ${{ github.event.inputs.perfsha == '' && github.event.inputs.solsha == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -59,7 +62,7 @@ jobs:
           CLICKS: ${{ github.event.inputs.clicks || '5000000' }}
         run: bash bench.sh $REFS
   perf:
-    if: ${{ github.event.inputs.perfsha != '' }}
+    if: ${{ github.event.inputs.perfsha != '' && github.event.inputs.solsha == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -139,3 +142,42 @@ jobs:
             done < $W/syms.txt
             sudo find $o $s2 -mindepth 1 -delete; sudo rm -f $R; sudo find $D -mindepth 1 -delete
           done
+  sol:
+    if: ${{ github.event.inputs.solsha != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: toolchain
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends musl-tools
+          rustup target add x86_64-unknown-linux-musl
+      - name: solbench
+        env:
+          SHA: ${{ github.event.inputs.solsha }}
+          EVENTS: ${{ github.event.inputs.events }}
+          CLICKS: ${{ github.event.inputs.clicks }}
+        run: |
+          set +e; set -uo pipefail
+          W=/tmp/sb; mkdir -p $W
+          lscpu | grep -E 'Model name|^CPU\(s\)|L2|L3' | cut -c1-200
+          curl -sSfL -o $W/gen.zip https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
+          echo "13724cadbac5a99d847e27cea911cd2e338ff972b46c2039da87452011bb101e  $W/gen.zip" | sha256sum -c --quiet
+          (cd $W && unzip -q -o gen.zip && cd generator && cargo build --release -q)
+          G=$(find $W -path '*release/generate' -type f | head -1)
+          git worktree add -q --detach $W/src "$SHA"; echo "sha: $(git -C $W/src rev-parse HEAD)"
+          (cd $W/src/impl/rs && CC_x86_64_unknown_linux_musl=musl-gcc RUSTFLAGS="-C target-cpu=x86-64-v3" CARGO_TARGET_DIR=$W/tgt \
+             cargo build --release --locked -q --target x86_64-unknown-linux-musl) && cp $W/tgt/x86_64-unknown-linux-musl/release/shop $W/shop
+          ls -l $W/shop
+          D=$W/data; $G --seed 7 --events $EVENTS --clicks $CLICKS --output $D --threads 4 >/dev/null
+          du -sh $D/events
+          o=$(mktemp -d); s2=$(mktemp -d)
+          for i in 1 2 3; do
+            echo "== solbench pass $i"
+            env DATA_DIR=$D OUTPUT_DIR=$o SCRATCH_DIR=$s2 NCPU=1 SHOP_SOLBENCH=1 SHOP_SOLREPS=5 $W/shop 2>&1 | grep -E 'solbench|panic|rror' | head -20
+          done
+          echo "== shipped timing NCPU=4"
+          env DATA_DIR=$D OUTPUT_DIR=$o SCRATCH_DIR=$s2 NCPU=4 SHOP_TIMING=1 $W/shop 2>&1 | grep -E 'written|prof' | head -20
