@@ -469,6 +469,106 @@ fn scan7(chunk: B, f: impl FnMut(&[B; 7])) {
     scan::<7>(chunk, f)
 }
 
+/// Same lines and fields as `scan::<4>` (same dialect, same order). A line takes the fast path
+/// when one 64-byte window at its start holds its newline with exactly three commas before it and
+/// every quote opens or closes a whole field of two or more bytes (the mask rule of `line7`).
+/// Every other line, and the last 64 bytes of the chunk, go to `scan` one line at a time.
+/// The fast path of `scan4`: the fields of the line at `p` and its length with the newline, or
+/// None if the line needs `scan`. The caller guarantees 64 readable bytes at `p`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+fn line4(p: *const u8) -> Option<([B; 4], usize)> {
+    use core::arch::x86_64::_bzhi_u64;
+    // SAFETY (bzhi): BMI2 is enabled for this build
+    let bzhi = |x: u64, n: u32| unsafe { _bzhi_u64(x, n) };
+    let blsr = |x: u64| x & x.wrapping_sub(1);
+    let (ca, qa, na) = masks64(p);
+    let l = na.trailing_zeros();
+    let cl = bzhi(ca, l);
+    let e0 = cl.trailing_zeros();
+    let c1 = blsr(cl);
+    let e1 = c1.trailing_zeros();
+    let c2 = blsr(c1);
+    let e2 = c2.trailing_zeros();
+    let c3 = blsr(c2);
+    let sb = ca | na;
+    let q1 = bzhi(qa, l);
+    let x = q1 & ((ca << 1) | 1);
+    let y = q1 & (sb >> 1);
+    let r = y.wrapping_sub(x);
+    let bad = (q1 & !(x | y)) | (x & y) | (r & (bzhi(sb, l + 1) | y));
+    if (na != 0) & (c2 != 0) & (c3 == 0) & (bad == 0) {
+        let fld = |s: u32, e: u32| {
+            let q = ((x >> s) & 1) as u32;
+            // SAFETY: s <= e <= 63 inside the window; a quoted field has e - s >= 2
+            unsafe { std::slice::from_raw_parts(p.add((s + q) as usize), (e - s - 2 * q) as usize) }
+        };
+        let out: [B; 4] = [fld(0, e0), fld(e0 + 1, e1), fld(e1 + 1, e2), fld(e2 + 1, l)];
+        return Some((out, (l + 1) as usize));
+    }
+    None
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+fn scan4(chunk: B, mut f: impl FnMut(&[B; 4])) {
+    let len = chunk.len();
+    let base = chunk.as_ptr();
+    let mut pos = 0usize;
+    // lines from the slow path wait in buf, so f has one call site
+    let mut buf: Vec<[B; 4]> = Vec::new();
+    let mut bi = 0usize;
+    loop {
+        let line: [B; 4] = if bi < buf.len() {
+            bi += 1;
+            buf[bi - 1]
+        } else if pos + 64 <= len {
+            // SAFETY: pos + 64 <= len
+            match line4(unsafe { base.add(pos) }) {
+                Some((l, n)) => {
+                    #[cfg(test)]
+                    SCAN7_FAST.with(|c| c.set(c.get() + 1));
+                    pos += n;
+                    l
+                }
+                None => {
+                    buf.clear();
+                    bi = 0;
+                    pos = scan4_line(chunk, pos, &mut buf);
+                    continue;
+                }
+            }
+        } else if pos < len {
+            buf.clear();
+            bi = 0;
+            scan::<4>(&chunk[pos..], |l| buf.push(*l));
+            pos = len;
+            continue;
+        } else {
+            break;
+        };
+        f(&line);
+    }
+}
+
+/// The slow path of `scan4`: the one line at `pos` through `scan`; returns the next line start.
+#[cold]
+#[inline(never)]
+fn scan4_line(chunk: B, pos: usize, buf: &mut Vec<[B; 4]>) -> usize {
+    let end = match memchr(b'\n', &chunk[pos..]) {
+        Some(i) => pos + i + 1,
+        None => chunk.len(),
+    };
+    scan::<4>(&chunk[pos..end], |l| buf.push(*l));
+    end
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
+#[inline(always)]
+fn scan4(chunk: B, f: impl FnMut(&[B; 4])) {
+    scan::<4>(chunk, f)
+}
+
 #[inline]
 fn d2(b: &[u8]) -> Option<i64> {
     let (x, y) = (b[0].wrapping_sub(b'0'), b[1].wrapping_sub(b'0'));
@@ -891,6 +991,27 @@ impl IdLookup {
             // SAFETY: [p + n - 8, p + n) lies inside the chunk that starts at lo
             let w = unsafe { std::ptr::read_unaligned((p + n - 8) as *const u64) };
             let d = (n - 1) as u32;
+            let low = (u64::MAX >> (8 * d - 1)) >> 1;
+            let w2 = (w & !low) | (h8(b'0') & low);
+            if dig8(w2) {
+                let v = parse8(w2) as usize;
+                if v < (1 << 24) {
+                    return self.arr.get(v).copied().filter(|&x| x != u32::MAX);
+                }
+            }
+        }
+        self.get(b)
+    }
+    /// `get_fast` for a two-byte prefix: same result as `get`; `lo` is the lowest readable address
+    /// at or before `b` (up to 8 digits are read as one word ending at the end of `b`).
+    #[inline(always)]
+    fn get_fast2(&self, b: B, lo: usize) -> Option<u32> {
+        let n = b.len();
+        let p = b.as_ptr() as usize;
+        if self.prefix.len() == 2 && (3..=10).contains(&n) && p + n >= lo + 8 && b[0] == self.prefix[0] && b[1] == self.prefix[1] && b[2] != b'0' {
+            // SAFETY: [p + n - 8, p + n) lies inside the chunk that starts at lo
+            let w = unsafe { std::ptr::read_unaligned((p + n - 8) as *const u64) };
+            let d = (n - 2) as u32;
             let low = (u64::MAX >> (8 * d - 1)) >> 1;
             let w2 = (w & !low) | (h8(b'0') & low);
             if dig8(w2) {
@@ -3498,12 +3619,13 @@ fn main() {
             let mut tmp: Vec<ClickRec> = Vec::with_capacity(c.len() / 40);
             let mut tc = TsCache::new();
             let mut tm = now();
-            scan::<4>(c, |&[cid, uid, cmp, ts]| {
+            let lo = c.as_ptr() as usize;
+            scan4(c, |&[cid, uid, cmp, ts]| {
                 if cid.is_empty() || uid.is_empty() {
                     return;
                 }
-                let Some(ci) = camp.get(cmp) else { return };
-                let Some(t) = parse_ts_c(ts, &mut tc) else { return };
+                let Some(ci) = camp.get_fast2(cmp, lo) else { return };
+                let Some(t) = ts_fast(ts, &mut tc) else { return };
                 if t < ws - WEEK || t >= we {
                     return;
                 }
@@ -3724,6 +3846,129 @@ mod tests {
         }
         eprintln!("scan7 test: {cases} chunks, {total} accepted lines, {fast_lines} via the vector path");
         assert!(total > 1_000_000 && fast_lines > total / 4);
+    }
+
+    /// one click-shaped line (four fields) or a random one, with the mutations of `line`
+    fn line4t(r: &mut Rng, out: &mut Vec<u8>) {
+        let start = out.len();
+        match r.below(10) {
+            0..=5 => {
+                let lens = [10u64, 10, 7, 27];
+                for (k, &ml) in lens.iter().enumerate() {
+                    if k > 0 {
+                        out.push(b',');
+                    }
+                    field(r, out, ml);
+                }
+            }
+            6..=8 => {
+                let nf = if r.chance(60) { 4 } else { 1 + r.below(6) };
+                let ml = [3u64, 20, 40, 90][r.below(4) as usize];
+                for k in 0..nf {
+                    if k > 0 {
+                        out.push(b',');
+                    }
+                    field(r, out, ml);
+                }
+            }
+            _ => {
+                const AL: &[u8] = b"a0,,\"\r";
+                for _ in 0..r.below(90) {
+                    out.push(AL[r.below(AL.len() as u64) as usize]);
+                }
+            }
+        }
+        for _ in 0..r.below(3) {
+            if r.chance(30) && out.len() > start {
+                let at = start + r.below((out.len() - start) as u64) as usize;
+                match r.below(4) {
+                    0 => out.insert(at, b'"'),
+                    1 => out.insert(at, b','),
+                    2 => out.insert(at, b'\r'),
+                    _ => {
+                        out.remove(at);
+                    }
+                }
+            }
+        }
+        if r.chance(10) {
+            out.push(b'\r');
+        }
+    }
+
+    fn lines_of4(chunk: B, f: impl Fn(B, &mut dyn FnMut(&[B; 4]))) -> Vec<[(usize, usize); 4]> {
+        let mut v = vec![];
+        let b0 = chunk.as_ptr() as usize;
+        f(chunk, &mut |l: &[B; 4]| v.push(l.map(|x| (x.as_ptr() as usize - b0, x.len()))));
+        v
+    }
+
+    /// scan4 (one vector window, mask quote rule) yields exactly the lines and fields of scan::<4>
+    #[test]
+    fn scan4_matches_scan() {
+        assert!(cfg!(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), "build with -C target-cpu=x86-64-v3");
+        let buf: &'static mut [u8] = Box::leak(vec![0u8; 1 << 16].into_boxed_slice());
+        let mut r = Rng(0x2545_f491_4f6c_dd1d);
+        let mut text = Vec::new();
+        let (mut cases, mut total, mut fast_lines) = (0u64, 0u64, 0u64);
+        for _ in 0..400_000 {
+            text.clear();
+            for _ in 0..r.below(40) {
+                line4t(&mut r, &mut text);
+                text.push(b'\n');
+            }
+            if r.chance(50) && !text.is_empty() {
+                text.pop();
+            }
+            if text.len() + 64 > buf.len() {
+                continue;
+            }
+            let off = r.below(64) as usize;
+            buf[off..off + text.len()].copy_from_slice(&text);
+            // SAFETY: buf is leaked (lives forever) and not written while `chunk` is in use
+            let chunk: B = unsafe { std::slice::from_raw_parts(buf.as_ptr().add(off), text.len()) };
+            let want = lines_of4(chunk, |c, f| scan::<4>(c, f));
+            let got = lines_of4(chunk, |c, f| scan4(c, f));
+            assert_eq!(got, want, "case {cases}: {:?}", String::from_utf8_lossy(chunk));
+            cases += 1;
+            total += want.len() as u64;
+            fast_lines += SCAN7_FAST.with(|c| c.replace(0));
+        }
+        eprintln!("scan4 test: {cases} chunks, {total} accepted lines, {fast_lines} via the vector path");
+        assert!(total > 1_000_000 && fast_lines > total / 4);
+    }
+
+    /// IdLookup::get_fast2 returns exactly what get returns, for ids near and far from canonical
+    #[test]
+    fn get_fast2_matches_get() {
+        let mut r = Rng(0x6a09_e667_f3bc_c908);
+        let mut items: Vec<(B, u32)> = vec![];
+        for i in 0..3000u32 {
+            let s = match r.below(4) {
+                0 => format!("c_{}", r.below(5000)),
+                1 => format!("c_{}", r.below(1 << 26)),
+                2 => format!("c_0{}", r.below(100)),
+                _ => format!("x{}", r.below(1000)),
+            };
+            items.push((leak_str(s), i));
+        }
+        let lk = IdLookup::new(b"c_", &items);
+        let buf: &'static mut [u8] = Box::leak(vec![b'#'; 64].into_boxed_slice());
+        const AL: &[u8] = b"0123456789c_x/:";
+        for _ in 0..2_000_000 {
+            let n = r.below(14) as usize;
+            let mut id: Vec<u8> = if r.chance(70) { b"c_".to_vec() } else { vec![] };
+            while id.len() < n {
+                id.push(if r.chance(85) { b'0' + r.below(10) as u8 } else { AL[r.below(AL.len() as u64) as usize] });
+            }
+            id.truncate(n);
+            let off = 8 + r.below(30) as usize;
+            buf[off..off + n].copy_from_slice(&id);
+            let lo = buf.as_ptr() as usize + r.below(off as u64 + 1) as usize;
+            // SAFETY: buf is leaked and not written while b is in use
+            let b: B = unsafe { std::slice::from_raw_parts(buf.as_ptr().add(off), n) };
+            assert_eq!(lk.get_fast2(b, lo), lk.get(b), "{:?}", String::from_utf8_lossy(b));
+        }
     }
 
     /// old and new parse of one chunk; the record count, or the first difference
