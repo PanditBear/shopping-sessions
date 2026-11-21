@@ -1062,6 +1062,8 @@ struct ClickRec {
     ts: i64,
     cid: u64,
     camp: u32,
+    /// person bucket of `key` (set once the key is resolved)
+    bk: u32,
 }
 
 struct UD {
@@ -2187,7 +2189,7 @@ fn ck_rec(&[cid, uid, cmp, ts]: &[B; 4], camp: &IdLookup, rs: &RandomState, ws: 
     if t < ws - WEEK || t >= we {
         return;
     }
-    tmp.push(ClickRec { key: ukey(rs, uid), ts: t, cid: pack(cid), camp: ci });
+    tmp.push(ClickRec { key: ukey(rs, uid), ts: t, cid: pack(cid), camp: ci, bk: 0 });
 }
 
 fn parse_clicks_old(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, tmp: &mut Vec<ClickRec>) {
@@ -2276,7 +2278,7 @@ fn parse_clicks_sol(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, t
             if (t < lo) | (t >= we) {
                 continue 'ln;
             }
-            tmp.push(ClickRec { key: ukey(rs, sl(pu, nu)), ts: t, cid: pack(sl(pc, nc)), camp: ci });
+            tmp.push(ClickRec { key: ukey(rs, sl(pu, nu)), ts: t, cid: pack(sl(pc, nc)), camp: ci, bk: 0 });
             continue 'ln;
         }
         let end = match memchr(b'\n', &c[pos..]) {
@@ -2968,6 +2970,7 @@ fn main() {
             // parse in line-aligned pieces and resolve each piece's users while its records are
             // still in cache; keys that miss the mover filter map to themselves without a table lookup
             let piece = if old { c.len().max(1) } else { 64 << 10 };
+            let mut cnt = vec![0u32; PB + 1];
             let mut s = 0usize;
             while s < c.len() {
                 let mut e = (s + piece).min(c.len());
@@ -2996,15 +2999,34 @@ fn main() {
                             tab.pf(k);
                         }
                     }
-                    let k = v[i].key;
+                    let mut k = v[i].key;
                     if mf.hit(k) {
-                        v[i].key = tab.get(k);
+                        k = tab.get(k);
+                        v[i].key = k;
                     }
+                    let b = pbk(k);
+                    v[i].bk = b as u32;
+                    cnt[b + 1] += 1;
                 }
                 pt(10, &mut tm);
                 s = e;
             }
-            let r = bucketize(&tmp, PB, |x| pbk(x.key));
+            for i in 0..PB {
+                cnt[i + 1] += cnt[i];
+            }
+            let mut w = cnt.clone();
+            let mut out: Vec<ClickRec> = Vec::with_capacity(tmp.len());
+            {
+                let sp = out.spare_capacity_mut();
+                for x in &tmp {
+                    let b = x.bk as usize;
+                    sp[w[b] as usize].write(*x);
+                    w[b] += 1;
+                }
+            }
+            // SAFETY: the counts gave every slot of 0..len exactly one writer
+            unsafe { out.set_len(tmp.len()) };
+            let r = (out, cnt);
             pt(10, &mut tm);
             r
         })
