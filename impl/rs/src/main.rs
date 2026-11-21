@@ -1784,6 +1784,400 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
     });
 }
 
+/// The body of `parse_events` for one line, as a plain function (the slow lines of
+/// `parse_events_sol` go through it).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn ev_line<E: Ev>(f: &[B; 7], cx: &EvCtx, c0: usize, tci: &mut TsCache, tct: &mut TsCache, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>) {
+    let &[eid, uid, ts, ing, et, pr, price] = f;
+    if eid.is_empty() {
+        return;
+    }
+    let ingest = ts_fast(ing, tci).unwrap_or(i64::MAX);
+    let mut r = E::nil();
+    'v: {
+        if uid.is_empty() || pr.is_empty() {
+            break 'v;
+        }
+        let Some(t) = ts_fast(ts, tct) else { break 'v };
+        if t < cx.ws || t >= cx.we {
+            break 'v;
+        }
+        let purch = match et_code(et) {
+            1 => false,
+            2 => true,
+            _ => break 'v,
+        };
+        let mut pv = 0u32;
+        let mut cat = 0u32;
+        if purch {
+            match parse_price(price) {
+                Some(p) => pv = p,
+                None => break 'v,
+            }
+            cat = cx.prod.get_fast(pr, c0).unwrap_or(cx.unknown_cat);
+        }
+        if ingest.wrapping_sub(t) > DAY {
+            break 'v;
+        }
+        r = E::mk(ev_key(uid, cx.rs, fbn), (t - cx.ws) as u64, pv, cat);
+    }
+    let loc = m.len() as u32;
+    m.push(r);
+    let (ik, exact) = ing32(ingest, cx.ibase);
+    if !exact {
+        side.push((loc, ingest));
+    }
+    match pack6(eid) {
+        Some(k) => d.push(DRec { eid: k, ing: ik, loc }),
+        None => fb.push((pack(eid), ingest, loc)),
+    }
+}
+
+/// Person key of a valid line's user id: the packed id, or else a hash with HBIT set (noted in
+/// `fbn` with the id's location). The one place that maps a user id to its record key.
+#[inline(always)]
+fn ev_key(uid: B, rs: &RandomState, fbn: &mut Vec<(u64, u64)>) -> u64 {
+    match pack6(uid) {
+        Some(k) => k,
+        None => ev_key_slow(uid, rs, fbn),
+    }
+}
+#[cold]
+#[inline(never)]
+fn ev_key_slow(uid: B, rs: &RandomState, fbn: &mut Vec<(u64, u64)>) -> u64 {
+    let k = rs.hash_one(uid) | HBIT;
+    fbn.push((k, pack(uid)));
+    k
+}
+
+/// `pack6` of two ids at once: 16 bytes are read at each pointer (`na`, `nb` are the lengths).
+/// Returns (key a, a ok, key b, b ok); a key is only meaningful when its flag is set.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn pack6x2(pa: *const u8, na: usize, pb: *const u8, nb: usize) -> (u64, bool, u64, bool) {
+    use core::arch::x86_64::*;
+    let x = _mm256_set_m128i(_mm_loadu_si128(pb as *const __m128i), _mm_loadu_si128(pa as *const __m128i));
+    let l4 = _mm256_set1_epi8(0x0F);
+    let hn = _mm256_and_si256(_mm256_srli_epi16(x, 4), l4);
+    let ln = _mm256_and_si256(x, l4);
+    // valid bytes [0-9A-Z_a-z] by nibbles: high nibble 3 -> class 1, 4|6 -> 2, 5 -> 4, 7 -> 8;
+    // the low-nibble table holds the classes in which that low nibble is valid
+    let hi_t = _mm256_broadcastsi128_si256(_mm_setr_epi8(0, 0, 0, 1, 2, 4, 2, 8, 0, 0, 0, 0, 0, 0, 0, 0));
+    let lo_t = _mm256_broadcastsi128_si256(_mm_setr_epi8(0x0D, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0E, 0x02, 0x02, 0x02, 0x02, 0x06));
+    let cls = _mm256_and_si256(_mm256_shuffle_epi8(hi_t, hn), _mm256_shuffle_epi8(lo_t, ln));
+    let invalid = _mm256_cmpeq_epi8(cls, _mm256_setzero_si256());
+    // CODE values: byte minus a per-high-nibble offset ('_' 4 less than the other 0x5_ bytes)
+    let off_t = _mm256_broadcastsi128_si256(_mm_setr_epi8(0, 0, 0, 0x2F, 0x36, 0x36, 0x3B, 0x3B, 0, 0, 0, 0, 0, 0, 0, 0));
+    let us = _mm256_and_si256(_mm256_cmpeq_epi8(x, _mm256_set1_epi8(0x5F)), _mm256_set1_epi8(4));
+    let code = _mm256_sub_epi8(_mm256_sub_epi8(x, _mm256_shuffle_epi8(off_t, hn)), us);
+    let iota = _mm256_broadcastsi128_si256(_mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15));
+    let nv = _mm256_set_m128i(_mm_set1_epi8(nb.min(16) as i8), _mm_set1_epi8(na.min(16) as i8));
+    let inf = _mm256_cmpgt_epi8(nv, iota);
+    let bad = _mm256_movemask_epi8(_mm256_and_si256(invalid, inf)) as u32;
+    let c = _mm256_and_si256(code, inf);
+    // pairs -> 12 bits, quads -> 24 bits: dwords 0..2 of a lane hold codes 0-3, 4-7, 8-11
+    let w = _mm256_maddubs_epi16(c, _mm256_set1_epi16(0x0140));
+    let dw = _mm256_madd_epi16(w, _mm256_set1_epi32(0x0001_1000));
+    let lo = _mm256_castsi256_si128(dw);
+    let hi = _mm256_extracti128_si256(dw, 1);
+    let k3 = |q: u64, d2: u32| ((q & 0xFFFF_FFFF) << 36) | ((q >> 32) << 12) | (d2 as u64 >> 12);
+    let ka = k3(_mm_cvtsi128_si64(lo) as u64, _mm_extract_epi32(lo, 2) as u32);
+    let kb = k3(_mm_cvtsi128_si64(hi) as u64, _mm_extract_epi32(hi, 2) as u32);
+    let oka = (bad & 0xFFFF) == 0 && na.wrapping_sub(1) < 10;
+    let okb = (bad >> 16) == 0 && nb.wrapping_sub(1) < 10;
+    (ka, oka, kb, okb)
+}
+
+/// `ts_iso` of the 20 bytes "YYYY-MM-DDTHH:MM:SSZ" at `p`, in whole seconds (the caller checks
+/// the length and byte 19).
+#[inline(always)]
+unsafe fn iso_secs(p: *const u8, c: &mut TsCache) -> Option<i64> {
+    let b = std::slice::from_raw_parts(p, 20);
+    if b[10] != b'T' {
+        return None;
+    }
+    let t = ld8(b, 11);
+    let t2 = t ^ 0x00000A00000A0000;
+    if (t & 0x0000FF0000FF0000) != 0x00003A00003A0000 || !dig8(t2) {
+        return None;
+    }
+    let v = t2.wrapping_sub(h8(0x30));
+    let v = v.wrapping_mul(10).wrapping_add(v >> 8);
+    let (h, mi, s) = ((v & 0xFF) as i64, ((v >> 24) & 0xFF) as i64, ((v >> 48) & 0xFF) as i64);
+    if h > 23 || mi > 59 || s > 59 {
+        return None;
+    }
+    let days;
+    let p8 = ld8(b, 0);
+    let tag2 = u16::from_le_bytes([b[8], b[9]]) as u32 | 0x1_0000;
+    let hi = ((p8 ^ ((tag2 as u64) << 40)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> c.sh) as usize;
+    debug_assert!(hi < c.ents.len());
+    // SAFETY: the shift leaves 64 - sh bits and ents has 1 << (64 - sh) entries
+    let ent = c.ents.get_unchecked_mut(hi);
+    if ent.p8 == p8 && ent.tag2 == tag2 {
+        days = ent.days as i64;
+    } else {
+        days = ts_days(b)?;
+        if days == days as i32 as i64 {
+            *ent = TsEnt { p8, tag2, days: days as i32 };
+        }
+    }
+    Some(days * 86_400 + (h * 60 + mi) * 60 + s)
+}
+
+/// Same records, dedup entries and side lists, in the same order, as `parse_events`, except
+/// that the category of a record with no price is 0 (no product lookup for views and carts;
+/// `Ev::pc` never reads it). One fused pass: the `scan7` line classifier with the fields kept
+/// as pointer and length, both ids packed in one vector, ISO times straight to seconds.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(never)]
+fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>) {
+    use core::arch::x86_64::_bzhi_u64;
+    let mut tci = TsCache::new();
+    let mut tct = TsCache::new();
+    let c0 = c.as_ptr() as usize;
+    // SAFETY (bzhi): BMI2 is enabled for this build
+    let bzhi = |x: u64, n: u32| unsafe { _bzhi_u64(x, n) };
+    let blsr = |x: u64| x & x.wrapping_sub(1);
+    // SAFETY (sl): only called on fields found inside the chunk
+    let sl = |p: *const u8, n: usize| -> B { unsafe { std::slice::from_raw_parts(p, n) } };
+    let (ws, we, ibase) = (cx.ws, cx.we, cx.ibase);
+    let (imax_k, imax_x) = ing32(i64::MAX, ibase);
+    let len = c.len();
+    let base = c.as_ptr();
+    let mut pos = 0usize;
+    let mut sbuf: Vec<[B; 7]> = Vec::new();
+    'ln: while pos + 128 <= len {
+        // SAFETY: pos + 128 <= len, and the second window starts at most 64 bytes in
+        let p = unsafe { base.add(pos) };
+        let (ca, qa, na) = masks64(p);
+        let e0 = ca.trailing_zeros();
+        let c1 = blsr(ca);
+        let e1 = c1.trailing_zeros();
+        let c2 = blsr(c1);
+        let e2 = c2.trailing_zeros();
+        'slow: {
+            if !((c2 != 0) & (bzhi(na, e2) == 0)) {
+                break 'slow;
+            }
+            let pb = unsafe { p.add(e2 as usize + 1) };
+            let (cb, qb, nb) = masks64(pb);
+            let l = nb.trailing_zeros();
+            let e3 = cb.trailing_zeros();
+            let d1 = blsr(cb);
+            let e4 = d1.trailing_zeros();
+            let d2 = blsr(d1);
+            let e5 = d2.trailing_zeros();
+            let d3 = blsr(d2);
+            let qa1 = bzhi(qa, e2);
+            let xa = qa1 & ((ca << 1) | 1);
+            let ya = qa1 & (ca >> 1);
+            let ra = ya.wrapping_sub(xa);
+            let bad_a = (qa1 & !(xa | ya)) | (xa & ya) | (ra & (bzhi(ca, e2 + 1) | ya));
+            let sb = cb | nb;
+            let qb1 = bzhi(qb, l);
+            let xb = qb1 & ((cb << 1) | 1);
+            let yb = qb1 & (sb >> 1);
+            let rb = yb.wrapping_sub(xb);
+            let bad_b = (qb1 & !(xb | yb)) | (xb & yb) | (rb & (bzhi(sb, l + 1) | yb));
+            if !((nb != 0) & (e5 < l) & (bzhi(d3, l) == 0) & ((bad_a | bad_b) == 0)) {
+                break 'slow;
+            }
+            pos += (e2 + l + 2) as usize;
+            let fld = |p: *const u8, x: u64, s: u32, e: u32| {
+                let q = ((x >> s) & 1) as u32;
+                // SAFETY: s <= e <= 63 inside a window; a quoted field has e - s >= 2
+                (unsafe { p.add((s + q) as usize) }, (e - s - 2 * q) as usize)
+            };
+            let (pe, ne) = fld(p, xa, 0, e0);
+            if ne == 0 {
+                continue 'ln;
+            }
+            let (pu, nu) = fld(p, xa, e0 + 1, e1);
+            let (pt, nt) = fld(p, xa, e1 + 1, e2);
+            let (pi, ni) = fld(pb, xb, 0, e3);
+            let (pet, net) = fld(pb, xb, e3 + 1, e4);
+            let (pp, np) = fld(pb, xb, e4 + 1, e5);
+            let (ppr, npr) = fld(pb, xb, e5 + 1, l);
+            // SAFETY: both ids start in the first window, so 16 bytes from each stay inside
+            // the 128 readable bytes at p
+            let (ke, oke, ku, oku) = unsafe { pack6x2(pe, ne, pu, nu) };
+            // SAFETY (iso_secs): a 20-byte field lies inside its window
+            let iso_i = if ni == 20 && unsafe { *pi.add(19) } == b'Z' { Some(unsafe { iso_secs(pi, &mut tci) }) } else { None };
+            let (ingest, ik, iex) = match iso_i {
+                Some(Some(s)) => {
+                    let v = s - ibase + IOFF;
+                    (s * 1000, v.clamp(0, u32::MAX as i64) as u32, (v > 0) & (v < u32::MAX as i64))
+                }
+                Some(None) => (i64::MAX, imax_k, imax_x),
+                None => {
+                    let ingest = ts_fast(sl(pi, ni), &mut tci).unwrap_or(i64::MAX);
+                    let (k, x) = ing32(ingest, ibase);
+                    (ingest, k, x)
+                }
+            };
+            let mut r = E::nil();
+            'v: {
+                if (nu == 0) | (np == 0) {
+                    break 'v;
+                }
+                let t = if nt == 20 && unsafe { *pt.add(19) } == b'Z' {
+                    match unsafe { iso_secs(pt, &mut tct) } {
+                        Some(s) => s * 1000,
+                        None => break 'v,
+                    }
+                } else if nt == 13 {
+                    match ts_num(sl(pt, 13)) {
+                        Some(t) => t,
+                        None => break 'v,
+                    }
+                } else {
+                    match parse_ts_c(sl(pt, nt), &mut tct) {
+                        Some(t) => t,
+                        None => break 'v,
+                    }
+                };
+                if (t < ws) | (t >= we) | (ingest.wrapping_sub(t) > DAY) {
+                    break 'v;
+                }
+                let mut pv = 0u32;
+                let mut cat = 0u32;
+                match et_code(sl(pet, net)) {
+                    1 => {}
+                    2 => {
+                        match parse_price(sl(ppr, npr)) {
+                            Some(v) => pv = v,
+                            None => break 'v,
+                        }
+                        cat = cx.prod.get_fast(sl(pp, np), c0).unwrap_or(cx.unknown_cat);
+                    }
+                    _ => break 'v,
+                }
+                let key = if oku { ku } else { ev_key_slow(sl(pu, nu), cx.rs, fbn) };
+                r = E::mk(key, (t - ws) as u64, pv, cat);
+            }
+            let loc = m.len() as u32;
+            m.push(r);
+            if !iex {
+                side.push((loc, ingest));
+            }
+            if oke {
+                d.push(DRec { eid: ke, ing: ik, loc });
+            } else {
+                fb.push((pack(sl(pe, ne)), ingest, loc));
+            }
+            continue 'ln;
+        }
+        sbuf.clear();
+        pos = scan7_line(c, pos, &mut sbuf);
+        for f in &sbuf {
+            ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side);
+        }
+    }
+    if pos < len {
+        scan::<7>(&c[pos..], |f| ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side));
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
+fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>) {
+    let mut tci = TsCache::new();
+    let mut tct = TsCache::new();
+    let c0 = c.as_ptr() as usize;
+    scan::<7>(c, |f| ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side));
+}
+
+/// Output buffers of one event-parse call.
+struct EvBufs<E> {
+    m: Vec<E>,
+    d: Vec<DRec>,
+    fb: Vec<(u64, i64, u32)>,
+    fbn: Vec<(u64, u64)>,
+    side: Vec<(u32, i64)>,
+}
+impl<E: Ev> EvBufs<E> {
+    fn new() -> Self {
+        EvBufs { m: Vec::with_capacity(CHUNK / 32), d: Vec::with_capacity(CHUNK / 32), fb: vec![], fbn: vec![], side: vec![] }
+    }
+    fn clear(&mut self) {
+        self.m.clear();
+        self.d.clear();
+        self.fb.clear();
+        self.fbn.clear();
+        self.side.clear();
+    }
+    /// the first difference from `o` (records compared by key, ts and `pc`), if any
+    fn diff(&self, o: &Self) -> Option<String> {
+        if self.m.len() != o.m.len() {
+            return Some(format!("m len {} vs {}", self.m.len(), o.m.len()));
+        }
+        for (i, (a, b)) in self.m.iter().zip(&o.m).enumerate() {
+            if a.key() != b.key() || a.rts() != b.rts() || a.pc() != b.pc() {
+                return Some(format!("m[{i}]: key {:x}/{:x} rts {}/{} pc {:?}/{:?}", a.key(), b.key(), a.rts(), b.rts(), a.pc(), b.pc()));
+            }
+        }
+        let dk = |v: &[DRec]| v.iter().map(|r| (r.eid, r.ing, r.loc)).collect::<Vec<_>>();
+        if dk(&self.d) != dk(&o.d) {
+            return Some(format!("d differs ({} vs {})", self.d.len(), o.d.len()));
+        }
+        if self.fb != o.fb {
+            return Some(format!("fb differs ({} vs {})", self.fb.len(), o.fb.len()));
+        }
+        if self.fbn != o.fbn {
+            return Some(format!("fbn differs ({} vs {})", self.fbn.len(), o.fbn.len()));
+        }
+        if self.side != o.side {
+            return Some(format!("side differs ({} vs {})", self.side.len(), o.side.len()));
+        }
+        None
+    }
+}
+
+/// measurement aid (SHOP_SOLBENCH): `parse_events` and `parse_events_sol`, serial, alternating
+/// which runs first per chunk; prints ns per record for each and checks the outputs agree.
+fn sol_bench<E: Ev>(ev_chunks: &[B], cx: &EvCtx) {
+    let (mut a, mut b) = (EvBufs::<E>::new(), EvBufs::<E>::new());
+    let reps: usize = std::env::var("SHOP_SOLREPS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+    let (mut best_o, mut best_n) = (f64::MAX, f64::MAX);
+    for rep in 0..reps {
+        let (mut to, mut tn, mut n, mut bad) = (0f64, 0f64, 0usize, 0usize);
+        for (i, &c) in ev_chunks.iter().enumerate() {
+            a.clear();
+            b.clear();
+            let old = |a: &mut EvBufs<E>| {
+                let t = std::time::Instant::now();
+                parse_events(c, cx, &mut a.m, &mut a.d, &mut a.fb, &mut a.fbn, &mut a.side);
+                t.elapsed().as_secs_f64()
+            };
+            let new = |b: &mut EvBufs<E>| {
+                let t = std::time::Instant::now();
+                parse_events_sol(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side);
+                t.elapsed().as_secs_f64()
+            };
+            if i % 2 == 0 {
+                to += old(&mut a);
+                tn += new(&mut b);
+            } else {
+                tn += new(&mut b);
+                to += old(&mut a);
+            }
+            n += a.m.len();
+            if let Some(e) = a.diff(&b) {
+                if bad == 0 {
+                    eprintln!("solbench MISMATCH chunk {i}: {e}");
+                }
+                bad += 1;
+            }
+        }
+        let (no, nn) = (to * 1e9 / n.max(1) as f64, tn * 1e9 / n.max(1) as f64);
+        best_o = best_o.min(no);
+        best_n = best_n.min(nn);
+        eprintln!("solbench rep{rep} old {no:.2} ns/rec new {nn:.2} ns/rec ratio {:.3} recs {n} chunks {} mismatched {bad}", no / nn, ev_chunks.len());
+    }
+    eprintln!("solbench best old {best_o:.2} ns/rec new {best_n:.2} ns/rec speedup {:.3}", best_o / best_n);
+}
+
 struct EvChunk<E> {
     m: Vec<E>,
     d: Vec<DRec>,
@@ -2296,6 +2690,14 @@ fn main() {
                 }
                 std::process::exit(0);
             }
+            if std::env::var_os("SHOP_SOLBENCH").is_some() {
+                if lean {
+                    sol_bench::<EvL>(&ev_chunks, &cx);
+                } else {
+                    sol_bench::<EvW>(&ev_chunks, &cx);
+                }
+                std::process::exit(0);
+            }
             if std::env::var_os("SHOP_PARTS").is_some() {
                 // measurement aid: each per-field step alone over the real fields
                 let mut fs: [Vec<B>; 7] = Default::default();
@@ -2599,5 +3001,191 @@ mod tests {
         }
         eprintln!("scan7 test: {cases} chunks, {total} accepted lines, {fast_lines} via the vector path");
         assert!(total > 1_000_000 && fast_lines > total / 4);
+    }
+
+    /// old and new parse of one chunk; the record count, or the first difference
+    fn sol_cmp<E: Ev>(c: B, cx: &EvCtx) -> Result<(usize, usize), String> {
+        let (mut a, mut b) = (EvBufs::<E>::new(), EvBufs::<E>::new());
+        parse_events(c, cx, &mut a.m, &mut a.d, &mut a.fb, &mut a.fbn, &mut a.side);
+        parse_events_sol(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side);
+        match a.diff(&b) {
+            Some(e) => Err(e),
+            None => Ok((a.m.len(), a.m.iter().filter(|e| e.pc().is_some()).count())),
+        }
+    }
+
+    fn leak_str(s: String) -> B {
+        Box::leak(s.into_bytes().into_boxed_slice())
+    }
+
+    /// one event line of random, mostly well-formed fields (ids with a few bad bytes, the three
+    /// time shapes around early December 2023 with some invalid dates, all event types)
+    fn ev_text(r: &mut Rng, out: &mut Vec<u8>) {
+        use std::io::Write;
+        const ID: &[u8] = b"0123456789ABCXYZabcxyz_-.:\"";
+        let q = |r: &mut Rng, out: &mut Vec<u8>, s: &[u8]| {
+            if r.chance(20) {
+                out.push(b'"');
+                out.extend_from_slice(s);
+                out.push(b'"');
+            } else {
+                out.extend_from_slice(s);
+            }
+        };
+        let id = |r: &mut Rng| -> Vec<u8> {
+            let n = if r.chance(10) { r.below(14) } else { 8 + r.below(2) };
+            (0..n).map(|_| if r.chance(98) { ID[r.below(23) as usize] } else { ID[r.below(ID.len() as u64) as usize] }).collect()
+        };
+        let ts = |r: &mut Rng, iso_only: bool| -> Vec<u8> {
+            let mut s = Vec::new();
+            let d = if r.chance(2) { [0u64, 31, 32][r.below(3) as usize] } else { 1 + r.below(4) };
+            let hm = if r.chance(1) { 30 } else { 24 };
+            let sm = if r.chance(1) { 70 } else { 60 };
+            let (h, mi, sec) = (r.below(hm), r.below(60), r.below(sm));
+            match if iso_only { 0 } else { r.below(10) } {
+                0..=5 => write!(s, "2023-12-{d:02}T{h:02}:{mi:02}:{sec:02}Z").unwrap(),
+                6 => write!(s, "2023-12-{d:02}T{h:02}:{mi:02}:{sec:02}{}{:02}:{:02}", if r.chance(50) { '+' } else { '-' }, r.below(25), r.below(60)).unwrap(),
+                7..=8 => {
+                    let base = days_from_civil(2023, 12, 1) * DAY;
+                    let ms = if r.chance(50) { r.below(5 * 86_400) * 1000 } else { r.below(5 * DAY as u64) };
+                    write!(s, "{}", base as u64 + ms).unwrap()
+                }
+                _ => write!(s, "2023-12-{d:02} {h:02}:{mi:02}:{sec:02}.{}", r.below(1000)).unwrap(),
+            }
+            if r.chance(2) && !s.is_empty() {
+                let at = r.below(s.len() as u64) as usize;
+                s[at] = b"9x:-T "[r.below(6) as usize];
+            }
+            s
+        };
+        let eid = id(r);
+        q(r, out, &eid);
+        out.push(b',');
+        let uid = id(r);
+        q(r, out, &uid);
+        out.push(b',');
+        let t = ts(r, false);
+        q(r, out, &t);
+        out.push(b',');
+        let iso = r.chance(85);
+        let ing = ts(r, iso);
+        q(r, out, &ing);
+        out.push(b',');
+        let et: &[u8] = [&b"view"[..], b"cart", b"purchase", b"purchase", b"purchasx", b"", b"View"][r.below(7) as usize];
+        q(r, out, et);
+        out.push(b',');
+        let pr = match r.below(20) {
+            0 => vec![],
+            1 => b"x5".to_vec(),
+            _ => format!("p{}", r.below(14)).into_bytes(),
+        };
+        q(r, out, &pr);
+        out.push(b',');
+        let price: &[u8] = [&b"12.34"[..], b"5", b"0", b"", b"abc", b"-1", b"999999.99"][r.below(7) as usize];
+        q(r, out, price);
+        if r.chance(3) {
+            out.push(b',');
+        }
+        if r.chance(5) {
+            out.push(b'\r');
+        }
+    }
+
+    /// parse_events_sol gives the same records, dedup entries and side lists as parse_events:
+    /// on every chunk of the fixtures and of each directory in SOL_DATA (';'-separated), and on
+    /// random event text
+    #[test]
+    fn sol_matches_old() {
+        let mut dirs: Vec<std::path::PathBuf> = vec![];
+        if let Ok(rd) = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures")) {
+            for e in rd.flatten() {
+                dirs.push(e.path().join("input"));
+            }
+        }
+        if let Ok(v) = std::env::var("SOL_DATA") {
+            dirs.extend(v.split(';').filter(|s| !s.is_empty()).map(std::path::PathBuf::from));
+        }
+        let rs = hasher();
+        let (mut n_chunks, mut n_recs) = (0usize, 0usize);
+        for dir in dirs.iter().filter(|d| d.join("events").is_dir()) {
+            let mf = std::fs::read_to_string(dir.join("manifest.json")).unwrap_or_default();
+            let ws = manifest_ts(&mf, "window_start").unwrap_or(0);
+            let we = manifest_ts(&mf, "window_end").unwrap_or(0);
+            let mut prod_raw: Vec<(B, B)> = vec![];
+            if let Some(f) = leak_file(&dir.join("products.csv")) {
+                for c in chunks(f, CHUNK) {
+                    scan::<2>(c, |&[p, c]| prod_raw.push((p, c)));
+                }
+            }
+            let mut cat_names: Vec<B> = prod_raw.iter().map(|x| x.1).collect();
+            cat_names.push(b"unknown");
+            cat_names.sort();
+            cat_names.dedup();
+            let unknown_cat = cat_names.binary_search(&(b"unknown" as B)).unwrap() as u32;
+            let lean = cat_names.len() <= 256 && we.saturating_sub(ws) <= 1i64 << 32;
+            let mut prod_items: Vec<(B, u32)> = vec![];
+            let mut seen: AHashMap<B, usize> = AHashMap::new();
+            for &(p, c) in &prod_raw {
+                let cat = cat_names.binary_search(&c).unwrap() as u32;
+                match seen.get(p) {
+                    Some(&i) => prod_items[i].1 = cat,
+                    None => {
+                        seen.insert(p, prod_items.len());
+                        prod_items.push((p, cat));
+                    }
+                }
+            }
+            let prod = IdLookup::new(b"p", &prod_items);
+            let cx = EvCtx { prod: &prod, unknown_cat, ws, we, ibase: ws.div_euclid(1000), rs: &rs };
+            let ev_files = csv_files(&dir.join("events"));
+            let ev_chunks = all_chunks(&ev_files, ev_chunk(&ev_files));
+            for (i, &c) in ev_chunks.iter().enumerate() {
+                let (n, _) = sol_cmp::<EvW>(c, &cx).unwrap_or_else(|e| panic!("{} chunk {i} EvW: {e}", dir.display()));
+                if lean {
+                    sol_cmp::<EvL>(c, &cx).unwrap_or_else(|e| panic!("{} chunk {i} EvL: {e}", dir.display()));
+                }
+                n_chunks += 1;
+                n_recs += n;
+            }
+            eprintln!("sol test: {} ({} chunks so far, {n_recs} records)", dir.display(), n_chunks);
+        }
+        assert!(n_chunks > 0);
+
+        // random event text around a window of 2023-12-01 12:00 .. 2023-12-04 00:00
+        let items: Vec<(B, u32)> = (0..10).map(|i| (leak_str(format!("p{i}")), (i % 3) as u32)).collect();
+        let prod = IdLookup::new(b"p", &items);
+        let ws = days_from_civil(2023, 12, 1) * DAY + DAY / 2;
+        let cx = EvCtx { prod: &prod, unknown_cat: 3, ws, we: ws + 2 * DAY + DAY / 2, ibase: ws.div_euclid(1000), rs: &rs };
+        let buf: &'static mut [u8] = Box::leak(vec![0u8; 1 << 17].into_boxed_slice());
+        let mut r = Rng(0x2545_f491_4f6c_dd1d);
+        let mut text = Vec::new();
+        let (mut recs, mut purch) = (0usize, 0usize);
+        for case in 0..20_000 {
+            text.clear();
+            for _ in 0..r.below(300) {
+                if r.chance(95) {
+                    ev_text(&mut r, &mut text);
+                } else {
+                    line(&mut r, &mut text);
+                }
+                text.push(b'\n');
+            }
+            if r.chance(50) && !text.is_empty() {
+                text.pop();
+            }
+            if text.len() + 64 > buf.len() {
+                continue;
+            }
+            let off = r.below(64) as usize;
+            buf[off..off + text.len()].copy_from_slice(&text);
+            // SAFETY: buf is leaked (lives forever) and not written while `chunk` is in use
+            let chunk: B = unsafe { std::slice::from_raw_parts(buf.as_ptr().add(off), text.len()) };
+            let (n, p) = sol_cmp::<EvW>(chunk, &cx).unwrap_or_else(|e| panic!("random case {case} EvW: {e}\n{}", String::from_utf8_lossy(chunk)));
+            sol_cmp::<EvL>(chunk, &cx).unwrap_or_else(|e| panic!("random case {case} EvL: {e}\n{}", String::from_utf8_lossy(chunk)));
+            recs += n;
+            purch += p;
+        }
+        eprintln!("sol test random: {recs} records, {purch} priced");
+        assert!(recs > 1_000_000 && purch > 10_000);
     }
 }
