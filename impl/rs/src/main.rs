@@ -267,6 +267,18 @@ fn masks64(p: *const u8) -> (u64, u64, u64) {
     (cm, qm, nm)
 }
 
+/// Quote check for the first fields of a line inside one 64-byte window. `q1`: the quote bits
+/// before the field end `end`; `c`: the separator bits, with bit `end` set. Returns the quotes
+/// that open a field and a mask that is nonzero unless every field before `end` is either free
+/// of quotes or is '"', at least one byte, '"' with no other quote.
+/// The borrow of `c - x` from each opening quote clears the separator that ends its field.
+#[inline(always)]
+fn quote_bad(q1: u64, c: u64) -> (u64, u64) {
+    let x = q1 & ((c << 1) | 1);
+    let e = !c.wrapping_sub(x) & c;
+    (x, q1 ^ x ^ (e >> 1))
+}
+
 /// Calls `f` with the unquoted fields of every well-formed line of `chunk` (N fields).
 /// Same dialect as rules.md: only \n ends a line; quotes allowed only around a whole field.
 #[inline(always)]
@@ -2737,17 +2749,8 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
             let d2 = blsr(d1);
             let e5 = d2.trailing_zeros();
             let d3 = blsr(d2);
-            let qa1 = bzhi(qa, e2);
-            let xa = qa1 & ((ca << 1) | 1);
-            let ya = qa1 & (ca >> 1);
-            let ra = ya.wrapping_sub(xa);
-            let bad_a = (qa1 & !(xa | ya)) | (xa & ya) | (ra & (bzhi(ca, e2 + 1) | ya));
-            let sb = cb | nb;
-            let qb1 = bzhi(qb, l);
-            let xb = qb1 & ((cb << 1) | 1);
-            let yb = qb1 & (sb >> 1);
-            let rb = yb.wrapping_sub(xb);
-            let bad_b = (qb1 & !(xb | yb)) | (xb & yb) | (rb & (bzhi(sb, l + 1) | yb));
+            let (xa, bad_a) = quote_bad(bzhi(qa, e2), ca);
+            let (xb, bad_b) = quote_bad(bzhi(qb, l), cb | nb);
             if !((nb != 0) & (e5 < l) & (bzhi(d3, l) == 0) & ((bad_a | bad_b) == 0)) {
                 break 'slow;
             }
@@ -4398,5 +4401,148 @@ mod pack_simd_tests {
             ok += want.is_some() as u32;
         }
         assert!(ok > 100_000, "{ok}");
+    }
+
+    fn bz(x: u64, n: u32) -> u64 {
+        if n >= 64 { x } else { x & ((1u64 << n) - 1) }
+    }
+
+    /// The earlier quote rule (open/close pairs by a subtraction), kept as the reference
+    fn quote_bad_old(q: u64, c: u64, end: u32) -> u64 {
+        let q1 = bz(q, end);
+        let x = q1 & ((c << 1) | 1);
+        let y = q1 & (c >> 1);
+        let r = y.wrapping_sub(x);
+        (q1 & !(x | y)) | (x & y) | (r & (bz(c, end + 1) | y))
+    }
+
+    /// Byte-level rule: every field before `end` is free of quotes or is "..." with no other quote
+    fn quote_ok_ref(q: u64, c: u64, end: u32) -> bool {
+        let mut s = 0u32;
+        for i in 0..=end {
+            if (c >> i) & 1 == 1 {
+                let n = i - s;
+                let fq = bz(q >> s, n);
+                let ok = fq == 0 || (n >= 2 && fq == (1 | (1u64 << (n - 1))));
+                if !ok {
+                    return false;
+                }
+                s = i + 1;
+            }
+        }
+        true
+    }
+
+    fn quote_case(q: u64, c: u64, end: u32) {
+        let c = c | (1u64 << end);
+        let q = q & !c;
+        let (x, bad) = quote_bad(bz(q, end), c);
+        let old = quote_bad_old(q, c, end);
+        assert_eq!(x, bz(q, end) & ((c << 1) | 1));
+        assert_eq!(bad == 0, old == 0, "q={q:#x} c={c:#x} end={end}");
+        assert_eq!(bad == 0, quote_ok_ref(q, c, end), "q={q:#x} c={c:#x} end={end}");
+    }
+
+    /// The quote check equals the earlier rule and the byte-level rule: every class string
+    /// (other, ',', '"') of up to 12 bytes at the start, one byte in, and against bit 63
+    #[test]
+    fn quote_bad_exhaustive() {
+        for n in 0..=12u32 {
+            let total = 3u64.pow(n);
+            for code in 0..total {
+                let (mut q, mut c, mut k) = (0u64, 0u64, code);
+                for i in 0..n {
+                    match k % 3 {
+                        1 => c |= 1 << i,
+                        2 => q |= 1 << i,
+                        _ => {}
+                    }
+                    k /= 3;
+                }
+                for o in [0u32, 1, 63 - n] {
+                    let above = !bz(!0, o + n + 1);
+                    for (qa, ca) in [(0, 0), (above, 0), (0, above), (above & 0x5555_5555_5555_5555, above & 0xaaaa_aaaa_aaaa_aaaa)] {
+                        quote_case((q << o) | qa, (c << o) | ca, o + n);
+                    }
+                }
+                if n <= 59 {
+                    // '"' 'a' '"' ',' prefix (a well-formed quoted field), then the string
+                    quote_case((q << 4) | 0b101, (c << 4) | 0b1000, 4 + n);
+                    // '"' 'a' ',' prefix (an unclosed quote), then the string
+                    quote_case((q << 3) | 0b1, (c << 3) | 0b100, 3 + n);
+                }
+            }
+        }
+    }
+
+    /// 3 * 10^7 random windows: random masks of several densities, and lines built from
+    /// well-formed and broken fields with the end at a random separator
+    #[test]
+    fn quote_bad_random() {
+        struct Xs(u64);
+        impl Xs {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+            fn chance(&mut self, pct: u64) -> bool {
+                self.below(100) < pct
+            }
+        }
+        let mut r = Xs(0x9e37_79b9_7f4a_7c15);
+        for i in 0..10_000_000u64 {
+            let (a, b) = ((i % 4) as u32, ((i / 4) % 5) as u32);
+            let mut c = r.next();
+            for _ in 0..a {
+                c &= r.next();
+            }
+            let mut q = r.next();
+            for _ in 0..b {
+                q &= r.next();
+            }
+            quote_case(q, c, (r.next() % 64) as u32);
+        }
+        let mut acc = 0u64;
+        for _ in 0..20_000_000u64 {
+            let (mut q, mut c, mut pos) = (0u64, 0u64, 0u32);
+            let mut seps: Vec<u32> = Vec::new();
+            while pos < 64 {
+                let n = r.below(9) as u32;
+                let kind = r.below(10);
+                for j in 0..n.min(64 - pos) {
+                    let quote = match kind {
+                        0..=4 => false,
+                        5 | 6 => j == 0 || j + 1 == n,
+                        7 => j == 0,
+                        8 => j + 1 == n,
+                        _ => r.chance(33),
+                    };
+                    if quote {
+                        q |= 1 << (pos + j);
+                    }
+                }
+                pos += n;
+                if pos < 64 {
+                    c |= 1 << pos;
+                    seps.push(pos);
+                    pos += 1;
+                }
+            }
+            if seps.is_empty() {
+                continue;
+            }
+            let end = seps[r.below(seps.len() as u64) as usize];
+            let junk = r.next() & !bz(!0, end + 1);
+            let (q, c) = if r.chance(50) { (q | (junk & 0x5555_5555_5555_5555), c) } else { (q, c | (junk & r.next())) };
+            let (_, bad) = quote_bad(bz(q & !c, end), c);
+            acc += (bad == 0) as u64;
+            quote_case(q, c, end);
+        }
+        assert!(acc > 1_000_000, "{acc}");
     }
 }
