@@ -501,7 +501,7 @@ fn parse_price(b: &[u8]) -> Option<u32> {
     }
 }
 
-fn chunks(data: B) -> Vec<B> {
+fn chunks(data: B, sz: usize) -> Vec<B> {
     let start = match memchr(b'\n', data) {
         Some(i) => i + 1,
         None => return vec![],
@@ -509,7 +509,7 @@ fn chunks(data: B) -> Vec<B> {
     let mut v = vec![];
     let mut a = start;
     while a < data.len() {
-        let mut b = (a + CHUNK).min(data.len());
+        let mut b = (a + sz).min(data.len());
         if b < data.len() {
             b = match memchr(b'\n', &data[b - 1..]) {
                 Some(i) => b - 1 + i + 1,
@@ -562,8 +562,19 @@ fn csv_files(dir: &Path) -> Vec<B> {
     v
 }
 
-fn all_chunks(files: &[B]) -> Vec<B> {
-    files.iter().flat_map(|f| chunks(f)).collect()
+/// Event chunk size. The event-id dedup walks every (bucket, chunk) slice, so on large inputs
+/// small chunks cost more in slice starts and cache misses than they gain in balance: aim for
+/// about 300 chunks in all, never below CHUNK.
+fn ev_chunk(files: &[B]) -> usize {
+    if let Some(mb) = std::env::var("SHOP_CHUNK").ok().and_then(|s| s.parse::<usize>().ok()) {
+        return mb << 20;
+    }
+    let total: usize = files.iter().map(|f| f.len()).sum();
+    (total / 300).next_multiple_of(1 << 20).clamp(CHUNK, 8 * CHUNK)
+}
+
+fn all_chunks(files: &[B], sz: usize) -> Vec<B> {
+    files.iter().flat_map(|f| chunks(f, sz)).collect()
 }
 
 #[inline]
@@ -1393,7 +1404,7 @@ fn main() {
     // products
     let mut prod_raw: Vec<(B, B)> = vec![];
     if let Some(f) = leak_file(&data.join("products.csv")) {
-        for c in chunks(f) {
+        for c in chunks(f, CHUNK) {
             scan::<2>(c, |&[p, c]| prod_raw.push((p, c)));
         }
     }
@@ -1425,7 +1436,7 @@ fn main() {
     let mut channels: Vec<B> = vec![];
     if let Some(f) = leak_file(&data.join("campaigns.csv")) {
         let mut seen: AHashMap<B, u32> = AHashMap::new();
-        for c in chunks(f) {
+        for c in chunks(f, CHUNK) {
             scan::<2>(c, |&[id, ch]| {
                 if !seen.contains_key(id) {
                     seen.insert(id, camp_names.len() as u32);
@@ -1444,7 +1455,7 @@ fn main() {
     tick("prod/camp loaded");
     let rs = hasher();
 
-    let link_chunks = all_chunks(&csv_files(&data.join("links")));
+    let link_chunks = all_chunks(&csv_files(&data.join("links")), CHUNK);
     let link_pairs: Vec<Vec<[u64; 4]>> = link_chunks
         .par_iter()
         .map(|&c| {
@@ -1532,7 +1543,8 @@ fn main() {
             (tab, names_map)
         },
         || {
-            let ev_chunks = all_chunks(&csv_files(&data.join("events")));
+            let ev_files = csv_files(&data.join("events"));
+            let ev_chunks = all_chunks(&ev_files, ev_chunk(&ev_files));
             let cx = EvCtx { prod: &prod, unknown_cat, ws, we, rs: &rs };
             if std::env::var_os("SHOP_PARSE").is_some() {
                 // measurement aid: event parsing alone, serial, into reused buffers
@@ -1650,7 +1662,7 @@ fn main() {
     );
 
     // clicks
-    let click_chunks = all_chunks(&csv_files(&data.join("clicks")));
+    let click_chunks = all_chunks(&csv_files(&data.join("clicks")), CHUNK);
     let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_chunks
         .par_iter()
         .map(|&c| {
@@ -1690,13 +1702,20 @@ fn main() {
 
     let resolve_out = |mut sv: Vec<EvOut>| -> (Vec<EvOut>, Vec<u32>) {
         let mut tm = now();
+        // drops the records that are not kept (META_OK clear) and maps user keys to person keys
         let n = sv.len();
+        let mut w = 0;
         for i in 0..n {
             if i + PFD < n {
                 tab.pf(sv[i + PFD].key);
             }
-            sv[i].key = tab.get(sv[i].key);
+            let e = sv[i];
+            if e.meta & META_OK != 0 {
+                sv[w] = EvOut { key: tab.get(e.key), ..e };
+                w += 1;
+            }
         }
+        sv.truncate(w);
         pt(4, &mut tm);
         let r = bucketize(&sv, PB, |x| pbk(x.key));
         pt(5, &mut tm);
@@ -1712,57 +1731,50 @@ fn main() {
             let totals: [usize; DDG] =
                 std::array::from_fn(|i| ev_out.iter().map(|c| (c.1[g * DDG + i + 1] - c.1[g * DDG + i]) as usize).sum());
             let maxcap = (totals.iter().max().unwrap() * 2).max(16).next_power_of_two();
-            let mut tbuf: Vec<(u64, *const EvRec)> = vec![(0, std::ptr::null()); maxcap];
-            let mut sv: Vec<EvOut> = Vec::with_capacity(totals.iter().sum());
+            // One pass in record order. Every record is appended to `sv` when it is the first of
+            // its event_id or beats the current one (earlier ingest); the slot keeps the index of
+            // the current one, and a beaten one is cleared (META_OK off). Invalid records go in
+            // already cleared. What stays set is each event_id's winner, in record order.
+            let mut tbuf: Vec<(u64, u32)> = vec![(0, 0); maxcap];
+            let tsum: usize = totals.iter().sum();
+            let mut sv: Vec<EvOut> = Vec::with_capacity(tsum);
+            let mut ing: Vec<i64> = Vec::with_capacity(tsum);
             for (i, &total) in totals.iter().enumerate() {
                 let b = g * DDG + i;
                 let cap = (total * 2).max(16).next_power_of_two();
                 let mask = cap - 1;
                 let t = &mut tbuf[..cap];
                 if i > 0 {
-                    t.fill((0, std::ptr::null()));
+                    t.fill((0, 0));
                 }
                 for c in &ev_out {
                     for r in &c.0[c.1[b] as usize..c.1[b + 1] as usize] {
                         let mut p = (mix(r.eid) >> 8) as usize & mask;
                         loop {
-                            let o = &mut t[p];
+                            let o = unsafe { t.get_unchecked_mut(p) };
                             if o.0 == 0 {
-                                *o = (r.eid, r as *const EvRec);
+                                *o = (r.eid, sv.len() as u32);
                                 break;
                             }
                             if o.0 == r.eid {
-                                if r.ingest < unsafe { (*o.1).ingest } {
-                                    o.1 = r as *const EvRec;
+                                let j = o.1 as usize;
+                                if r.ingest < ing[j] {
+                                    sv[j].meta = 0;
+                                    o.1 = sv.len() as u32;
+                                } else {
+                                    p = usize::MAX;
                                 }
                                 break;
                             }
                             p = (p + 1) & mask;
+                        }
+                        if p != usize::MAX {
+                            sv.push(EvOut { key: r.uid, ts: r.ts, meta: r.meta });
+                            ing.push(r.ingest);
                         }
                     }
                 }
                 pt(2, &mut tm);
-                // Second pass in record order (sequential reads, no pointer chasing): a record is
-                // kept when it is valid and is the one its event_id's slot points to.
-                for c in &ev_out {
-                    for r in &c.0[c.1[b] as usize..c.1[b + 1] as usize] {
-                        if r.meta & META_OK == 0 {
-                            continue;
-                        }
-                        let mut p = (mix(r.eid) >> 8) as usize & mask;
-                        loop {
-                            let o = unsafe { t.get_unchecked(p) };
-                            if o.0 == r.eid {
-                                if std::ptr::eq(o.1, r) {
-                                    sv.push(EvOut { key: r.uid, ts: r.ts, meta: r.meta });
-                                }
-                                break;
-                            }
-                            p = (p + 1) & mask;
-                        }
-                    }
-                }
-                pt(3, &mut tm);
             }
             drop(tbuf);
             resolve_out(sv)
