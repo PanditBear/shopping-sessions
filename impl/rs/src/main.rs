@@ -3283,6 +3283,30 @@ fn pk_of(c: &mut PkCache, k: u64, tab: &IdTab, mf: &MoverF) -> u64 {
     p
 }
 
+/// Sets the person key of every line in `em` (user keys, mostly in runs). Each new key is
+/// looked up ahead of use: the mover filter 2 * RPD lines ahead, the table RPD lines ahead.
+fn resolve_run<E: Ev>(em: &mut [E], pc: &mut PkCache, tab: &IdTab, mf: &MoverF) {
+    let n = em.len();
+    for i in 0..n {
+        let j = i + 2 * RPD;
+        if j < n {
+            let k = em[j].key();
+            if k != em[j - 1].key() {
+                mf.pf(k);
+            }
+        }
+        let j = i + RPD;
+        if j < n {
+            let k = em[j].key();
+            if k != em[j - 1].key() && mf.hit(k) {
+                tab.pf(k);
+            }
+        }
+        let k = em[i].key();
+        em[i].set_key(pk_of(pc, k, tab, mf));
+    }
+}
+
 /// Groups kept lines (person keys set) by person bucket, keeping their order inside a bucket.
 fn pb_scatter<E: Ev>(em: &[E]) -> (Vec<E>, Vec<u32>) {
     let mut cnt = vec![0u32; PB + 1];
@@ -3412,17 +3436,17 @@ fn ev_after_idx<E: Ev>(
                             }
                             pt(2, &mut tm);
                             if !lb.is_empty() {
+                                let s0 = em.len();
                                 for o in t.iter_mut() {
                                     if *o != u64::MAX {
-                                        let mut e = lb[*o as u32 as usize];
+                                        let e = lb[*o as u32 as usize];
                                         *o = u64::MAX;
-                                        let k = e.key();
-                                        if k != 0 {
-                                            e.set_key(pk_of(&mut pc, k, tab, mf));
+                                        if e.key() != 0 {
                                             em.push(e);
                                         }
                                     }
                                 }
+                                resolve_run(&mut em[s0..], &mut pc, tab, mf);
                             }
                             pt(4, &mut tm);
                         }
