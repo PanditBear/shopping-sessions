@@ -834,26 +834,6 @@ impl IdTab {
     fn pf(&self, k: u64) {
         prefetch(unsafe { self.s.as_ptr().add(self.slot(k)) });
     }
-    /// `pf` with h = mix(k) already computed
-    #[inline(always)]
-    fn pf_h(&self, h: u64) {
-        prefetch(unsafe { self.s.as_ptr().add((h >> self.shift) as usize) });
-    }
-    /// `get` with h = mix(k) already computed
-    #[inline(always)]
-    fn get_h(&self, k: u64, h: u64) -> u64 {
-        let mut i = (h >> self.shift) as usize;
-        loop {
-            let e = unsafe { *self.s.get_unchecked(i) };
-            if e[0] == k {
-                return e[1];
-            }
-            if e[0] == 0 {
-                return k;
-            }
-            i = (i + 1) & self.mask;
-        }
-    }
     /// returns existing value or inserts v
     #[inline]
     fn get_or_insert(&mut self, k: u64, v: u64) -> (u64, bool) {
@@ -915,17 +895,6 @@ impl MoverF {
     fn pf(&self, k: u64) {
         prefetch(unsafe { self.w.as_ptr().add(mix(k) as usize & self.mask) });
     }
-    /// `pf` with h = mix(k) already computed
-    #[inline(always)]
-    fn pf_h(&self, h: u64) {
-        prefetch(unsafe { self.w.as_ptr().add(h as usize & self.mask) });
-    }
-    /// `hit` with h = mix(k) already computed
-    #[inline(always)]
-    fn hit_h(&self, h: u64) -> bool {
-        let b = Self::bits(h);
-        unsafe { self.w.get_unchecked(h as usize & self.mask) }.load(Relaxed) & b == b
-    }
     #[inline(always)]
     fn hit(&self, k: u64) -> bool {
         let h = mix(k);
@@ -937,8 +906,6 @@ impl MoverF {
 const PFD: usize = 12;
 /// prefetch distance of the user -> person passes (mover filter, then table), sized for DRAM latency
 const RPD: usize = 32;
-/// ring of key hashes carried through those passes (mix(k) is computed once per key)
-const RB: usize = 4 * RPD;
 
 // ---------- records ----------
 
@@ -1100,11 +1067,7 @@ fn bucketize<T: Copy>(v: &[T], nb: usize, bk: impl Fn(&T) -> usize) -> (Vec<T>, 
 
 #[inline(always)]
 fn pbk(key: u64) -> usize {
-    pbk_h(mix(key))
-}
-#[inline(always)]
-fn pbk_h(h: u64) -> usize {
-    (h >> 20) as usize & (PB - 1)
+    (mix(key) >> 20) as usize & (PB - 1)
 }
 
 // ---------- per-bucket processing ----------
@@ -1927,36 +1890,22 @@ fn ev_after<E: Ev>(
             let mb = mbase[ci] as usize;
             let mut m = c.m;
             let n = m.len();
-            let mut ring = [0u64; RB];
-            for j in 0..n.min(2 * RPD) {
-                let h = mix(m[j].key());
-                ring[j] = h;
-                mf.pf_h(h);
-            }
-            for j in 0..n.min(RPD) {
-                if mf.hit_h(ring[j]) {
-                    tab.pf_h(ring[j]);
-                }
-            }
             for i in 0..n {
                 if i + 2 * RPD < n {
-                    let h = mix(m[i + 2 * RPD].key());
-                    ring[(i + 2 * RPD) & (RB - 1)] = h;
-                    mf.pf_h(h);
+                    mf.pf(m[i + 2 * RPD].key());
                 }
                 if i + RPD < n {
-                    let h = ring[(i + RPD) & (RB - 1)];
-                    if mf.hit_h(h) {
-                        tab.pf_h(h);
+                    let k = m[i + RPD].key();
+                    if mf.hit(k) {
+                        tab.pf(k);
                     }
                 }
                 let g = mb + i;
                 let k = m[i].key();
                 if k != 0 && dead[g >> 6].load(Relaxed) & (1u64 << (g & 63)) == 0 {
-                    let h = ring[i & (RB - 1)];
-                    let pk = if mf.hit_h(h) { tab.get_h(k, h) } else { k };
+                    let pk = if mf.hit(k) { tab.get(k) } else { k };
                     m[i].set_key(pk);
-                    cnt[pbk_h(if pk == k { h } else { mix(pk) }) + 1] += 1;
+                    cnt[pbk(pk) + 1] += 1;
                 } else {
                     m[i].set_key(0);
                 }
@@ -2360,32 +2309,19 @@ fn main() {
             pt(9, &mut tm);
             // keys that miss the mover filter map to themselves without a table lookup
             let n = tmp.len();
-            let mut ring = [0u64; RB];
-            for j in 0..n.min(2 * RPD) {
-                let h = mix(tmp[j].key);
-                ring[j] = h;
-                mf.pf_h(h);
-            }
-            for j in 0..n.min(RPD) {
-                if mf.hit_h(ring[j]) {
-                    tab.pf_h(ring[j]);
-                }
-            }
             for i in 0..n {
                 if i + 2 * RPD < n {
-                    let h = mix(tmp[i + 2 * RPD].key);
-                    ring[(i + 2 * RPD) & (RB - 1)] = h;
-                    mf.pf_h(h);
+                    mf.pf(tmp[i + 2 * RPD].key);
                 }
                 if i + RPD < n {
-                    let h = ring[(i + RPD) & (RB - 1)];
-                    if mf.hit_h(h) {
-                        tab.pf_h(h);
+                    let k = tmp[i + RPD].key;
+                    if mf.hit(k) {
+                        tab.pf(k);
                     }
                 }
-                let h = ring[i & (RB - 1)];
-                if mf.hit_h(h) {
-                    tmp[i].key = tab.get_h(tmp[i].key, h);
+                let k = tmp[i].key;
+                if mf.hit(k) {
+                    tmp[i].key = tab.get(k);
                 }
             }
             let r = bucketize(&tmp, PB, |x| pbk(x.key));
