@@ -3607,9 +3607,10 @@ fn ev_after<E: Ev>(
     d0: i64,
     nd: usize,
     tick: &dyn Fn(&str),
-) -> Vec<(Vec<Vec<UD>>, CampAcc)> {
+    sink: &UdSink,
+) -> Vec<CampAcc> {
     if let Some(cfg) = idx_cfg() {
-        return ev_after_idx(ev_out, tab, mf, click_out, ws, we, ncamp, d0, nd, tick, cfg);
+        return ev_after_idx(ev_out, tab, mf, click_out, ws, we, ncamp, d0, nd, tick, cfg, sink);
     }
     // dedup on event_id: every line has a global index (chunk base + its index in the chunk);
     // each event_id's losers are marked in the dead bitmap. Each task takes DDG consecutive
@@ -3829,10 +3830,10 @@ fn ev_after<E: Ev>(
         w.gather(p, &parts, click_out);
         let mut uds = Vec::new();
         process_bucket(&mut w.evs, &mut w.tmp, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut uds, &mut w.cm, ws, we.wrapping_sub(ws));
-        w.out.push(uds);
+        sink.push(uds);
     })
     .into_iter()
-    .map(|w| (w.out, w.cm))
+    .map(|w| w.cm)
     .collect()
 }
 
@@ -3840,7 +3841,6 @@ fn ev_after<E: Ev>(
 struct SsW<E> {
     cm: CampAcc,
     win: Win,
-    out: Vec<Vec<UD>>,
     evs: Vec<E>,
     tmp: Vec<E>,
     runs: Vec<Run>,
@@ -3854,7 +3854,6 @@ impl<E: Ev> SsW<E> {
         SsW {
             cm: CampAcc::new(ncamp + 1, d0, nd),
             win: Win { cnt: vec![0; ncamp + 1], pos: vec![0; ncamp + 1], active: vec![] },
-            out: vec![],
             evs: vec![],
             tmp: vec![],
             runs: vec![],
@@ -3934,6 +3933,77 @@ fn lpt_run<S: Send>(cost: &[u64], init: impl Fn() -> S + Sync, f: impl Fn(usize,
     r.into_iter().map(|x| x.0).collect()
 }
 
+/// Writes user_daily part files while sessionize still runs: each finished bucket's rows go into a
+/// pending pool; whoever pushes it over `batch` rows writes one part file from the pool. `finish`
+/// writes the rest in parallel pieces. Any file count and row order is valid output.
+struct UdSink<'a> {
+    dir: &'a Path,
+    cats: &'a [B],
+    names: &'a Names,
+    pend: std::sync::Mutex<(Vec<Vec<UD>>, usize)>,
+    fno: AtomicUsize,
+    batch: usize,
+}
+
+impl<'a> UdSink<'a> {
+    fn new(dir: &'a Path, cats: &'a [B], names: &'a Names) -> Self {
+        UdSink { dir, cats, names, pend: std::sync::Mutex::new((vec![], 0)), fno: AtomicUsize::new(0), batch: 1 << 19 }
+    }
+    fn write(&self, g: &[Vec<UD>]) {
+        let n = self.fno.fetch_add(1, Relaxed);
+        let r: Vec<&Vec<UD>> = g.iter().collect();
+        write_user_daily(&self.dir.join(format!("part-{n}.parquet")), &r, self.cats, self.names);
+    }
+    fn push(&self, v: Vec<UD>) {
+        if v.is_empty() {
+            return;
+        }
+        let take = {
+            let mut g = self.pend.lock().unwrap();
+            g.1 += v.len();
+            g.0.push(v);
+            if g.1 >= self.batch {
+                g.1 = 0;
+                Some(std::mem::take(&mut g.0))
+            } else {
+                None
+            }
+        };
+        if let Some(t) = take {
+            self.write(&t);
+        }
+    }
+    /// After the last push: writes what is pending as about one piece per thread.
+    fn finish(&self) {
+        let mut rest = {
+            let mut g = self.pend.lock().unwrap();
+            g.1 = 0;
+            std::mem::take(&mut g.0)
+        };
+        let tot: usize = rest.iter().map(|x| x.len()).sum();
+        let want = (tot / rayon::current_num_threads().max(1)).max(1 << 15);
+        rest.sort_by_key(|g| std::cmp::Reverse(g.len()));
+        let mut pieces: Vec<Vec<Vec<UD>>> = vec![];
+        let mut cur: Vec<Vec<UD>> = vec![];
+        let mut n = 0usize;
+        for g in rest {
+            n += g.len();
+            cur.push(g);
+            if n >= want {
+                pieces.push(std::mem::take(&mut cur));
+                n = 0;
+            }
+        }
+        if !cur.is_empty() {
+            pieces.push(cur);
+        }
+        pieces.par_iter().for_each(|p| self.write(p));
+        if self.fno.load(Relaxed) == 0 {
+            self.write(&[]);
+        }
+    }
+}
+
 // ---------- dense-index pipeline after the parse ----------
 // With dense event indices, the winners of each dense bucket are emitted in index order, which
 // is the generator's order: a person's events then mostly arrive as one run already sorted by
@@ -3998,7 +4068,8 @@ fn ev_after_idx<E: Ev>(
     nd: usize,
     tick: &dyn Fn(&str),
     cfg: IdxCfg,
-) -> Vec<(Vec<Vec<UD>>, CampAcc)> {
+    sink: &UdSink,
+) -> Vec<CampAcc> {
     let _ = we;
     let ndb = cfg.ndb;
     let mut mbase: Vec<u32> = Vec::with_capacity(ev_out.len() + 1);
@@ -4233,10 +4304,10 @@ fn ev_after_idx<E: Ev>(
         w.gather(p, &parts, click_out);
         let mut uds = Vec::new();
         process_runs(&w.evs, &mut w.tmp, &mut w.runs, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut uds, &mut w.cm, ws);
-        w.out.push(uds);
+        sink.push(uds);
     })
     .into_iter()
-    .map(|w| (w.out, w.cm))
+    .map(|w| w.cm)
     .collect()
 }
 
@@ -5187,42 +5258,29 @@ fn main() {
     // person buckets
     let d0 = ws.div_euclid(DAY);
     let nd = if we > ws { ((we - 1).div_euclid(DAY) - d0 + 1) as usize } else { 0 };
-    let results = match ev_out {
-        Evs::L(v) => ev_after(v, &tab, &mf, &click_out, ws, we, ncamp, d0, nd, &tick),
-        Evs::W(v) => ev_after(v, &tab, &mf, &click_out, ws, we, ncamp, d0, nd, &tick),
-    };
-    tick("sessionized");
-
-    // outputs
     let names = Names { map: names_map };
     let ud_dir = outd.join("user_daily");
     let cd_dir = outd.join("campaign_daily");
     std::fs::create_dir_all(&ud_dir).unwrap();
     std::fs::create_dir_all(&cd_dir).unwrap();
-    let mut cm = CampAcc::new(ncamp + 1, d0, nd);
-    let mut ud_groups: Vec<&Vec<UD>> = vec![];
-    for (u, m) in &results {
-        ud_groups.extend(u.iter());
-        cm.merge(m);
-    }
-    let rows = cm.rows();
-    let nf = 16usize;
-    let mut files: Vec<Vec<&Vec<UD>>> = (0..nf).map(|_| vec![]).collect();
-    let mut load = vec![0usize; nf];
-    ud_groups.sort_by_key(|g| std::cmp::Reverse(g.len()));
-    for g in ud_groups {
-        let k = (0..nf).min_by_key(|&k| load[k]).unwrap();
-        load[k] += g.len();
-        files[k].push(g);
-    }
-    let any_rows = files.iter().any(|g| g.iter().any(|x| !x.is_empty()));
+    let sink = UdSink::new(&ud_dir, &cat_names, &names);
+    let cms = match ev_out {
+        Evs::L(v) => ev_after(v, &tab, &mf, &click_out, ws, we, ncamp, d0, nd, &tick, &sink),
+        Evs::W(v) => ev_after(v, &tab, &mf, &click_out, ws, we, ncamp, d0, nd, &tick, &sink),
+    };
+    tick("sessionized");
+
+    // outputs: the user_daily files are mostly written already; write the rest next to campaign_daily
     rayon::join(
+        || sink.finish(),
         || {
-            files.par_iter().enumerate().filter(|(i, g)| g.iter().any(|x| !x.is_empty()) || (*i == 0 && !any_rows)).for_each(|(i, g)| {
-                write_user_daily(&ud_dir.join(format!("part-{i}.parquet")), g, &cat_names, &names);
-            })
+            let mut cm = CampAcc::new(ncamp + 1, d0, nd);
+            for m in &cms {
+                cm.merge(m);
+            }
+            let rows = cm.rows();
+            write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows, &camp_names, &channels)
         },
-        || write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows, &camp_names, &channels),
     );
     tick("written");
     if timing {
