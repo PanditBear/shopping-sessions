@@ -2152,28 +2152,20 @@ fn main() {
                 // means "own parent"
                 let t = IdTab::with_cap(occ);
                 let cap = t.s.len();
-                let par: Vec<AtomicU32> = unsafe {
-                    let mut v = std::mem::ManuallyDrop::new(vec![0u32; cap]);
-                    Vec::from_raw_parts(v.as_mut_ptr() as *mut AtomicU32, cap, cap)
-                };
-                let best: Vec<AtomicU32> = unsafe {
-                    let mut v = std::mem::ManuallyDrop::new(vec![0u32; cap]);
-                    Vec::from_raw_parts(v.as_mut_ptr() as *mut AtomicU32, cap, cap)
+                // per slot: [parent xor slot, best slot + 1] in one cache line
+                let pb: Vec<AtomicU32> = unsafe {
+                    let mut v = std::mem::ManuallyDrop::new(vec![0u32; 2 * cap]);
+                    Vec::from_raw_parts(v.as_mut_ptr() as *mut AtomicU32, 2 * cap, 2 * cap)
                 };
                 let find = |mut x: usize| -> usize {
                     loop {
-                        let p = (par[x].load(Relaxed) as usize) ^ x;
+                        let p = (pb[2 * x].load(Relaxed) as usize) ^ x;
                         if p == x {
                             return x;
                         }
-                        let gp = (par[p].load(Relaxed) as usize) ^ p;
+                        let gp = (pb[2 * p].load(Relaxed) as usize) ^ p;
                         if gp != p {
-                            let _ = par[x].compare_exchange(
-                                (p ^ x) as u32,
-                                (gp ^ x) as u32,
-                                Relaxed,
-                                Relaxed,
-                            );
+                            let _ = pb[2 * x].compare_exchange((p ^ x) as u32, (gp ^ x) as u32, Relaxed, Relaxed);
                         }
                         x = gp;
                     }
@@ -2187,14 +2179,16 @@ fn main() {
                             return;
                         }
                         let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-                        if par[hi].compare_exchange(0, (lo ^ hi) as u32, Relaxed, Relaxed).is_ok() {
+                        if pb[2 * hi].compare_exchange(0, (lo ^ hi) as u32, Relaxed, Relaxed).is_ok() {
                             return;
                         }
                     }
                 };
+                let pfp = |i: usize| prefetch(unsafe { pb.as_ptr().add(2 * i) });
                 let nl_acc = AtomicUsize::new(0);
                 link_pairs.par_iter().for_each(|v| {
                     let mut cnt = 0usize;
+                    let mut edges: Vec<(u32, u32)> = Vec::with_capacity(v.len());
                     for (n, e) in v.iter().enumerate() {
                         if n + PFD / 2 < v.len() {
                             t.pf(v[n + PFD / 2][0]);
@@ -2210,7 +2204,14 @@ fn main() {
                         };
                         let a = g(e[0], e[1]);
                         let b = g(e[2], e[3]);
-                        union(a, b);
+                        edges.push((a as u32, b as u32));
+                    }
+                    for (n, &(a, b)) in edges.iter().enumerate() {
+                        if n + PFD < edges.len() {
+                            pfp(edges[n + PFD].0 as usize);
+                            pfp(edges[n + PFD].1 as usize);
+                        }
+                        union(a as usize, b as usize);
                     }
                     nl_acc.fetch_add(cnt, Relaxed);
                 });
@@ -2220,7 +2221,12 @@ fn main() {
                 let nblk = cap.div_ceil(BLK);
                 // best representative per component: the smallest by the original comparison
                 (0..nblk).into_par_iter().for_each(|bi| {
-                    for g in bi * BLK..((bi + 1) * BLK).min(cap) {
+                    let (lo, hi) = (bi * BLK, ((bi + 1) * BLK).min(cap));
+                    for g in lo..hi {
+                        // sequential read of the parent: warm the root's line
+                        pfp((pb[2 * g].load(Relaxed) as usize) ^ g);
+                    }
+                    for g in lo..hi {
                         let kg = t.ak(g).load(Relaxed);
                         if kg == 0 {
                             continue;
@@ -2228,7 +2234,7 @@ fn main() {
                         let r = find(g);
                         let rg = t.av(g).load(Relaxed);
                         loop {
-                            let cur = best[r].load(Relaxed);
+                            let cur = pb[2 * r + 1].load(Relaxed);
                             if cur != 0 {
                                 let b = cur as usize - 1;
                                 let kb = t.ak(b).load(Relaxed);
@@ -2241,22 +2247,34 @@ fn main() {
                                     break;
                                 }
                             }
-                            if best[r].compare_exchange(cur, g as u32 + 1, Relaxed, Relaxed).is_ok() {
+                            if pb[2 * r + 1].compare_exchange(cur, g as u32 + 1, Relaxed, Relaxed).is_ok() {
                                 break;
                             }
                         }
                     }
                 });
+                tick("links best");
                 let ft = IdTab::with_cap(nl);
                 let named: Vec<Vec<(u64, u64)>> = (0..nblk)
                     .into_par_iter()
                     .fold(Vec::new, |mut out: Vec<(u64, u64)>, bi| {
-                        for g in bi * BLK..((bi + 1) * BLK).min(cap) {
+                        let (lo, hi) = (bi * BLK, ((bi + 1) * BLK).min(cap));
+                        let mut bs = [0u32; BLK];
+                        for g in lo..hi {
+                            pfp((pb[2 * g].load(Relaxed) as usize) ^ g);
+                        }
+                        for g in lo..hi {
+                            if t.ak(g).load(Relaxed) != 0 {
+                                bs[g - lo] = pb[2 * find(g) + 1].load(Relaxed);
+                                prefetch(unsafe { t.s.as_ptr().add(bs[g - lo] as usize - 1) });
+                            }
+                        }
+                        for g in lo..hi {
                             let kg = t.ak(g).load(Relaxed);
                             if kg == 0 {
                                 continue;
                             }
-                            let b = best[find(g)].load(Relaxed) as usize - 1;
+                            let b = bs[g - lo] as usize - 1;
                             let pk = t.ak(b).load(Relaxed);
                             let (i, _) = ft.claim(kg);
                             ft.av(i).store(pk, Relaxed);
