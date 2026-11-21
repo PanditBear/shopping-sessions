@@ -1018,11 +1018,28 @@ struct DR<E> {
     e: E,
 }
 
+/// One 64-byte cache line.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct Line([u64; 8]);
+
+/// records staged per bucket before they go to the slots as whole cache lines (WK records of 24 or
+/// 32 bytes are 3 or 4 lines)
+const WK: usize = 8;
+
+thread_local! {
+    /// a parser thread's staging lines, reused from chunk to chunk
+    static WCP: std::cell::Cell<Vec<MaybeUninit<Line>>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
 /// A chunk's dense dedup records, written once by the parser: a line whose event_id decodes to an
 /// index below the bound goes to the `cap` slots of its bucket (index >> sh) in `r`, or to `ov`
 /// once those are full. A record's position is its slot (b * cap + n), or ndb * cap plus its place
 /// in `ov` (bucket order after `finish`); `dside` holds the exact ingest of the records whose key
-/// is inexact, by position.
+/// is inexact, by position. Slot records are staged per bucket in `wc` (WK at a time, in L2) and
+/// copied to `r` with streaming stores once WK are there, so the scattered slots are written as
+/// whole lines and never read in; cap is a multiple of WK and `r` is line-aligned, so every copy
+/// covers whole lines.
 struct Dz<E> {
     on: bool,
     key: u64,
@@ -1030,7 +1047,9 @@ struct Dz<E> {
     sh: u32,
     ndb: usize,
     cap: usize,
-    r: Vec<std::mem::MaybeUninit<DR<E>>>,
+    r: Vec<MaybeUninit<Line>>,
+    wc: Vec<MaybeUninit<Line>>,
+    _e: std::marker::PhantomData<E>,
     dn: Vec<u32>,
     ov: Vec<DR<E>>,
     ovb: Vec<u32>,
@@ -1041,7 +1060,7 @@ struct Dz<E> {
 impl<E: Ev> Dz<E> {
     /// takes no record: every line keeps the event_id hash path
     fn off() -> Self {
-        Dz { on: false, key: 0, lim: 0, sh: 0, ndb: 0, cap: 0, r: vec![], dn: vec![], ov: vec![], ovb: vec![], ovoff: vec![], dside: vec![] }
+        Dz { on: false, key: 0, lim: 0, sh: 0, ndb: 0, cap: 0, r: vec![], wc: vec![], _e: std::marker::PhantomData, dn: vec![], ov: vec![], ovb: vec![], ovoff: vec![], dside: vec![] }
     }
     /// for a chunk of `len` bytes: room for the expected bucket size plus a margin (the rest
     /// overflows)
@@ -1049,12 +1068,20 @@ impl<E: Ev> Dz<E> {
         let Some(c) = cfg else { return Self::off() };
         let lines = len as f64 * c.lpb;
         let mean = lines * (1u64 << c.sh) as f64 / ((c.lim - 64) as f64 / 1.3).max(1.0) * 1.04;
-        let cap = ((mean + 2.5 * mean.sqrt() + 4.0) as usize).min(lines as usize + 16);
-        let n = c.ndb * cap;
-        let mut r = Vec::with_capacity(n);
+        let cap = ((mean + 1.5 * mean.sqrt() + 1.0) as usize).min(lines as usize + 16).next_multiple_of(WK);
+        let sz = std::mem::size_of::<DR<E>>();
+        let nl = (c.ndb * cap * sz).div_ceil(64);
+        let mut r = Vec::with_capacity(nl);
         // SAFETY: MaybeUninit needs no initialization
-        unsafe { r.set_len(n) };
-        Dz { on: true, key: c.key, lim: c.lim, sh: c.sh, ndb: c.ndb, cap, r, dn: vec![0; c.ndb], ov: vec![], ovb: vec![], ovoff: vec![], dside: vec![] }
+        unsafe { r.set_len(nl) };
+        let wl = (c.ndb * WK * sz).div_ceil(64);
+        let mut wc = WCP.with(|p| p.take());
+        if wc.len() < wl {
+            wc = Vec::with_capacity(wl);
+            // SAFETY: as above
+            unsafe { wc.set_len(wl) };
+        }
+        Dz { on: true, key: c.key, lim: c.lim, sh: c.sh, ndb: c.ndb, cap, r, wc, _e: std::marker::PhantomData, dn: vec![0; c.ndb], ov: vec![], ovb: vec![], ovoff: vec![], dside: vec![] }
     }
     /// the dense index of a packed event_id, if it has one
     #[inline(always)]
@@ -1081,12 +1108,18 @@ impl<E: Ev> Dz<E> {
         // SAFETY: i < lim, so b < ndb; a slot below cap lies in b's stretch of r
         let n = unsafe { *self.dn.get_unchecked(b) } as usize;
         let pos = if n < self.cap {
-            let p = b * self.cap + n;
+            // SAFETY: b < ndb, so b's WK staging records lie in wc; n + 1 - WK is a multiple of
+            // WK below cap, so the copied slots lie in b's stretch of r
             unsafe {
-                self.r.get_unchecked_mut(p).write(x);
+                let w = (self.wc.as_mut_ptr() as *mut DR<E>).add(b * WK);
+                w.add(n % WK).write(x);
                 *self.dn.get_unchecked_mut(b) = n as u32 + 1;
+                if (n + 1) % WK == 0 {
+                    let d = (self.r.as_mut_ptr() as *mut DR<E>).add(b * self.cap + n + 1 - WK);
+                    stream_lines(w as *const Line, d as *mut Line, WK * std::mem::size_of::<DR<E>>() / 64);
+                }
             }
-            p
+            b * self.cap + n
         } else {
             self.ov_put(b, x)
         };
@@ -1101,8 +1134,23 @@ impl<E: Ev> Dz<E> {
         self.ovb.push(b as u32);
         self.ndb * self.cap + self.ov.len() - 1
     }
-    /// orders `ov` by bucket (keeping the line order) and sorts `dside` by position
+    /// copies the staged tail of every bucket to its slots, orders `ov` by bucket (keeping the
+    /// line order) and sorts `dside` by position
     fn finish(&mut self) {
+        if self.on {
+            for b in 0..self.ndb {
+                let n = self.dn[b] as usize;
+                let t = n % WK;
+                // SAFETY: the t records staged last for b are its slots n - t .. n
+                unsafe {
+                    let w = (self.wc.as_ptr() as *const DR<E>).add(b * WK);
+                    let d = (self.r.as_mut_ptr() as *mut DR<E>).add(b * self.cap + n - t);
+                    std::ptr::copy_nonoverlapping(w, d, t);
+                }
+            }
+            sfence();
+            WCP.with(|p| p.set(std::mem::take(&mut self.wc)));
+        }
         if !self.ov.is_empty() {
             let base = self.ndb * self.cap;
             let mut off = vec![0u32; self.ndb + 1];
@@ -1143,7 +1191,7 @@ impl<E: Ev> Dz<E> {
             return (&[], 0, &[], 0);
         }
         // SAFETY: put wrote the first dn[b] slots of b's stretch
-        let s = unsafe { std::slice::from_raw_parts(self.r.as_ptr().add(b * self.cap) as *const DR<E>, self.dn[b] as usize) };
+        let s = unsafe { std::slice::from_raw_parts((self.r.as_ptr() as *const DR<E>).add(b * self.cap), self.dn[b] as usize) };
         let (o, p) = if self.ovoff.is_empty() {
             (&self.ov[..0], 0)
         } else {
@@ -1152,6 +1200,36 @@ impl<E: Ev> Dz<E> {
         };
         (s, b * self.cap, o, p)
     }
+    fn slots(&self) -> usize {
+        self.ndb * self.cap
+    }
+}
+
+/// Copies `n` whole lines from `s` to `d` with streaming stores (no read of the target lines).
+#[inline(always)]
+unsafe fn stream_lines(s: *const Line, d: *mut Line, n: usize) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use std::arch::x86_64::*;
+        for k in 0..n {
+            let a = _mm256_load_si256(s.add(k) as *const __m256i);
+            let b = _mm256_load_si256((s.add(k) as *const __m256i).add(1));
+            _mm256_stream_si256(d.add(k) as *mut __m256i, a);
+            _mm256_stream_si256((d.add(k) as *mut __m256i).add(1), b);
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    std::ptr::copy_nonoverlapping(s, d, n);
+}
+
+/// Orders earlier streaming stores before later stores.
+#[inline(always)]
+fn sfence() {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: sse is part of x86_64
+    unsafe {
+        std::arch::x86_64::_mm_sfence()
+    };
 }
 
 const IOFF: i64 = 1 << 31;
@@ -3358,7 +3436,7 @@ fn ev_after_idx<E: Ev>(
     if TIMING.load(Relaxed) {
         let dense: usize = ev_out.iter().map(|c| c.dz.len()).sum();
         let ov: usize = ev_out.iter().map(|c| c.dz.ov.len()).sum();
-        let slots: usize = ev_out.iter().map(|c| c.dz.r.len()).sum();
+        let slots: usize = ev_out.iter().map(|c| c.dz.slots()).sum();
         let all: usize = dense + ev_out.iter().map(|c| c.d.len() + c.fb.len()).sum::<usize>();
         tick(&format!("idx dense records {dense} of {all} ({:.5}) overflow {ov} slots {slots}", dense as f64 / all.max(1) as f64));
     }
