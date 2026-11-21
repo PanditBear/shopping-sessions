@@ -2176,6 +2176,130 @@ impl<E: Ev> EvBufs<E> {
     }
 }
 
+/// One click line as `[click_id, user_id, campaign_id, ts]` (the reference path).
+#[inline(always)]
+fn ck_rec(&[cid, uid, cmp, ts]: &[B; 4], camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, tc: &mut TsCache, tmp: &mut Vec<ClickRec>) {
+    if cid.is_empty() || uid.is_empty() {
+        return;
+    }
+    let Some(ci) = camp.get(cmp) else { return };
+    let Some(t) = parse_ts_c(ts, tc) else { return };
+    if t < ws - WEEK || t >= we {
+        return;
+    }
+    tmp.push(ClickRec { key: ukey(rs, uid), ts: t, cid: pack(cid), camp: ci });
+}
+
+fn parse_clicks_old(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, tmp: &mut Vec<ClickRec>) {
+    let mut tc = TsCache::new();
+    scan::<4>(c, |f| ck_rec(f, camp, rs, ws, we, &mut tc, tmp));
+}
+
+/// Same records, in the same order, as `parse_clicks_old`: the `line7` classifier with four
+/// fields (two commas in the first window, the third comma and the newline in a second window
+/// that starts after the second comma), ids kept as pointer and length, ISO / epoch-ms times
+/// parsed in place.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(never)]
+fn parse_clicks_sol(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, tmp: &mut Vec<ClickRec>) {
+    use core::arch::x86_64::_bzhi_u64;
+    let bzhi = |x: u64, n: u32| unsafe { _bzhi_u64(x, n) };
+    let blsr = |x: u64| x & x.wrapping_sub(1);
+    let sl = |p: *const u8, n: usize| -> B { unsafe { std::slice::from_raw_parts(p, n) } };
+    let mut tc = TsCache::new();
+    let len = c.len();
+    let base = c.as_ptr();
+    let lo = ws - WEEK;
+    let mut pos = 0usize;
+    let mut sbuf: Vec<[B; 4]> = Vec::new();
+    'ln: while pos + 128 <= len {
+        // SAFETY: pos + 128 <= len, and the second window starts at most 64 bytes in
+        let p = unsafe { base.add(pos) };
+        let (ca, qa, na) = masks64(p);
+        let e0 = ca.trailing_zeros();
+        let c1 = blsr(ca);
+        let e1 = c1.trailing_zeros();
+        'slow: {
+            if !((c1 != 0) & (bzhi(na, e1) == 0)) {
+                break 'slow;
+            }
+            let pb = unsafe { p.add(e1 as usize + 1) };
+            let (cb, qb, nb) = masks64(pb);
+            let l = nb.trailing_zeros();
+            let e2 = cb.trailing_zeros();
+            let d1 = blsr(cb);
+            let qa1 = bzhi(qa, e1);
+            let xa = qa1 & ((ca << 1) | 1);
+            let ya = qa1 & (ca >> 1);
+            let ra = ya.wrapping_sub(xa);
+            let bad_a = (qa1 & !(xa | ya)) | (xa & ya) | (ra & (bzhi(ca, e1 + 1) | ya));
+            let sb = cb | nb;
+            let qb1 = bzhi(qb, l);
+            let xb = qb1 & ((cb << 1) | 1);
+            let yb = qb1 & (sb >> 1);
+            let rb = yb.wrapping_sub(xb);
+            let bad_b = (qb1 & !(xb | yb)) | (xb & yb) | (rb & (bzhi(sb, l + 1) | yb));
+            if !((nb != 0) & (e2 < l) & (bzhi(d1, l) == 0) & ((bad_a | bad_b) == 0)) {
+                break 'slow;
+            }
+            pos += (e1 + l + 2) as usize;
+            let fld = |p: *const u8, x: u64, s: u32, e: u32| {
+                let q = ((x >> s) & 1) as u32;
+                // SAFETY: s <= e <= 63 inside a window; a quoted field has e - s >= 2
+                (unsafe { p.add((s + q) as usize) }, (e - s - 2 * q) as usize)
+            };
+            let (pc, nc) = fld(p, xa, 0, e0);
+            let (pu, nu) = fld(p, xa, e0 + 1, e1);
+            let (pm, nm) = fld(pb, xb, 0, e2);
+            let (pt, nt) = fld(pb, xb, e2 + 1, l);
+            if (nc == 0) | (nu == 0) {
+                continue 'ln;
+            }
+            let Some(ci) = camp.get(sl(pm, nm)) else { continue 'ln };
+            // SAFETY (iso_secs): a 20-byte field lies inside its window
+            let t = if nt == 20 && unsafe { *pt.add(19) } == b'Z' {
+                match unsafe { iso_secs(pt, &mut tc) } {
+                    Some(s) => s * 1000,
+                    None => continue 'ln,
+                }
+            } else if nt == 13 {
+                match ts_num(sl(pt, 13)) {
+                    Some(t) => t,
+                    None => continue 'ln,
+                }
+            } else {
+                match parse_ts_c(sl(pt, nt), &mut tc) {
+                    Some(t) => t,
+                    None => continue 'ln,
+                }
+            };
+            if (t < lo) | (t >= we) {
+                continue 'ln;
+            }
+            tmp.push(ClickRec { key: ukey(rs, sl(pu, nu)), ts: t, cid: pack(sl(pc, nc)), camp: ci });
+            continue 'ln;
+        }
+        let end = match memchr(b'\n', &c[pos..]) {
+            Some(i) => pos + i + 1,
+            None => len,
+        };
+        sbuf.clear();
+        scan::<4>(&c[pos..end], |l| sbuf.push(*l));
+        pos = end;
+        for f in &sbuf {
+            ck_rec(f, camp, rs, ws, we, &mut tc, tmp);
+        }
+    }
+    if pos < len {
+        scan::<4>(&c[pos..], |f| ck_rec(f, camp, rs, ws, we, &mut tc, tmp));
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
+fn parse_clicks_sol(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, tmp: &mut Vec<ClickRec>) {
+    parse_clicks_old(c, camp, rs, ws, we, tmp)
+}
+
 /// measurement aid (SHOP_SOLBENCH): `parse_events` and `parse_events_sol`, serial, alternating
 /// which runs first per chunk; prints ns per record for each and checks the outputs agree.
 fn sol_bench<E: Ev>(ev_chunks: &[B], cx: &EvCtx) {
@@ -2838,19 +2962,13 @@ fn main() {
         .par_iter()
         .map(|&c| {
             let mut tmp: Vec<ClickRec> = Vec::with_capacity(c.len() / 40);
-            let mut tc = TsCache::new();
             let mut tm = now();
-            scan::<4>(c, |&[cid, uid, cmp, ts]| {
-                if cid.is_empty() || uid.is_empty() {
-                    return;
-                }
-                let Some(ci) = camp.get(cmp) else { return };
-                let Some(t) = parse_ts_c(ts, &mut tc) else { return };
-                if t < ws - WEEK || t >= we {
-                    return;
-                }
-                tmp.push(ClickRec { key: ukey(&rs, uid), ts: t, cid: pack(cid), camp: ci });
-            });
+            static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *OLD.get_or_init(|| std::env::var_os("SHOP_CKOLD").is_some()) {
+                parse_clicks_old(c, &camp, &rs, ws, we, &mut tmp);
+            } else {
+                parse_clicks_sol(c, &camp, &rs, ws, we, &mut tmp);
+            }
             pt(9, &mut tm);
             // keys that miss the mover filter map to themselves without a table lookup
             let n = tmp.len();
@@ -3245,5 +3363,136 @@ mod tests {
         }
         eprintln!("sol test random: {recs} records, {purch} priced");
         assert!(recs > 1_000_000 && purch > 10_000);
+    }
+
+    /// parse_clicks_sol gives the same records as parse_clicks_old on every click chunk of the
+    /// fixtures and of each SOL_DATA directory, and on random click text
+    #[test]
+    fn clicks_sol_matches_old() {
+        fn same(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64) -> usize {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            parse_clicks_old(c, camp, rs, ws, we, &mut a);
+            parse_clicks_sol(c, camp, rs, ws, we, &mut b);
+            assert_eq!(a.len(), b.len(), "{:?}", String::from_utf8_lossy(c));
+            for (x, y) in a.iter().zip(&b) {
+                assert!(x.key == y.key && x.ts == y.ts && x.cid == y.cid && x.camp == y.camp, "{:?}", String::from_utf8_lossy(c));
+            }
+            a.len()
+        }
+        let mut dirs: Vec<std::path::PathBuf> = vec![];
+        if let Ok(rd) = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures")) {
+            for e in rd.flatten() {
+                dirs.push(e.path().join("input"));
+            }
+        }
+        if let Ok(v) = std::env::var("SOL_DATA") {
+            dirs.extend(v.split(';').filter(|s| !s.is_empty()).map(std::path::PathBuf::from));
+        }
+        let rs = hasher();
+        let (mut n_chunks, mut n_recs) = (0usize, 0usize);
+        for dir in dirs.iter().filter(|d| d.join("clicks").is_dir()) {
+            let mf = std::fs::read_to_string(dir.join("manifest.json")).unwrap_or_default();
+            let ws = manifest_ts(&mf, "window_start").unwrap_or(0);
+            let we = manifest_ts(&mf, "window_end").unwrap_or(0);
+            let mut items: Vec<(B, u32)> = vec![];
+            if let Some(f) = leak_file(&dir.join("campaigns.csv")) {
+                let mut seen: AHashMap<B, u32> = AHashMap::new();
+                for c in chunks(f, CHUNK) {
+                    scan::<2>(c, |&[id, _]| {
+                        if !seen.contains_key(id) {
+                            seen.insert(id, items.len() as u32);
+                            items.push((id, items.len() as u32));
+                        }
+                    });
+                }
+            }
+            let camp = IdLookup::new(b"c_", &items);
+            for c in all_chunks(&csv_files(&dir.join("clicks")), CHUNK) {
+                n_recs += same(c, &camp, &rs, ws, we);
+                n_chunks += 1;
+            }
+        }
+        assert!(n_chunks > 0);
+        eprintln!("clicks test: {n_chunks} chunks, {n_recs} records");
+
+        let items: Vec<(B, u32)> = (0..10).map(|i| (leak_str(format!("c_{i}")), i as u32)).collect();
+        let camp = IdLookup::new(b"c_", &items);
+        let ws = days_from_civil(2023, 12, 1) * DAY + DAY / 2;
+        let we = ws + 2 * DAY + DAY / 2;
+        let buf: &'static mut [u8] = Box::leak(vec![0u8; 1 << 17].into_boxed_slice());
+        let mut r = Rng(0x1357_9bdf_2468_ace1);
+        let mut text = Vec::new();
+        let mut recs = 0usize;
+        const ID: &[u8] = b"0123456789ABCXYZabcxyz_-.:\"";
+        for _ in 0..20_000 {
+            text.clear();
+            for _ in 0..r.below(300) {
+                if r.chance(5) {
+                    line(&mut r, &mut text);
+                } else {
+                    use std::io::Write;
+                    let mut f: Vec<Vec<u8>> = Vec::new();
+                    for _ in 0..2 {
+                        let n = if r.chance(10) { r.below(14) } else { 8 + r.below(2) };
+                        f.push((0..n).map(|_| if r.chance(98) { ID[r.below(23) as usize] } else { ID[r.below(ID.len() as u64) as usize] }).collect());
+                    }
+                    f.push(match r.below(14) {
+                        0 => b"c_99".to_vec(),
+                        1 => b"c_03".to_vec(),
+                        2 => vec![],
+                        _ => format!("c_{}", r.below(10)).into_bytes(),
+                    });
+                    let mut s = Vec::new();
+                    let d = if r.chance(2) { [0u64, 31, 32][r.below(3) as usize] } else { 1 + r.below(4) };
+                    let hm = if r.chance(1) { 30 } else { 24 };
+                    let sm = if r.chance(1) { 70 } else { 60 };
+                    let (h, mi, sec) = (r.below(hm), r.below(60), r.below(sm));
+                    match r.below(10) {
+                        0..=5 => write!(s, "2023-12-{d:02}T{h:02}:{mi:02}:{sec:02}Z").unwrap(),
+                        6 => write!(s, "2023-12-{d:02}T{h:02}:{mi:02}:{sec:02}{}{:02}:{:02}", if r.chance(50) { '+' } else { '-' }, r.below(25), r.below(60)).unwrap(),
+                        7..=8 => {
+                            let base = days_from_civil(2023, 12, 1) * DAY;
+                            let ms = if r.chance(50) { r.below(5 * 86_400) * 1000 } else { r.below(5 * DAY as u64) };
+                            write!(s, "{}", base as u64 + ms).unwrap()
+                        }
+                        _ => write!(s, "2023-12-{d:02} {h:02}:{mi:02}:{sec:02}.{}", r.below(1000)).unwrap(),
+                    }
+                    if r.chance(2) && !s.is_empty() {
+                        let at = r.below(s.len() as u64) as usize;
+                        s[at] = b"9x:-T "[r.below(6) as usize];
+                    }
+                    f.push(s);
+                    for (k, v) in f.iter().enumerate() {
+                        if k > 0 {
+                            text.push(b',');
+                        }
+                        if r.chance(20) {
+                            text.push(b'"');
+                            text.extend_from_slice(v);
+                            text.push(b'"');
+                        } else {
+                            text.extend_from_slice(v);
+                        }
+                    }
+                    if r.chance(5) {
+                        text.push(b'\r');
+                    }
+                }
+                text.push(b'\n');
+            }
+            if r.chance(50) && !text.is_empty() {
+                text.pop();
+            }
+            if text.len() + 64 > buf.len() {
+                continue;
+            }
+            let off = r.below(64) as usize;
+            buf[off..off + text.len()].copy_from_slice(&text);
+            // SAFETY: buf is leaked (lives forever) and not written while `chunk` is in use
+            let chunk: B = unsafe { std::slice::from_raw_parts(buf.as_ptr().add(off), text.len()) };
+            recs += same(chunk, &camp, &rs, ws, we);
+        }
+        eprintln!("clicks test random: {recs} records");
+        assert!(recs > 100_000);
     }
 }
