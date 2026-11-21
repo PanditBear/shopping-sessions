@@ -1620,6 +1620,89 @@ fn parse_clicks(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: 
     parse_clicks_old(c, camp, rs, ws, we, out)
 }
 
+/// One fast-path click line awaiting its time: field pointers and lengths inside the line's window.
+struct CkD {
+    pc: *const u8,
+    pu: *const u8,
+    pt: *const u8,
+    ci: u32,
+    t: i64,
+    nc: u8,
+    nu: u8,
+    nt: u8,
+    small: bool,
+}
+
+fn ck_blk() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("CKBLK").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n >= 1).unwrap_or(128))
+}
+
+const CK_FAIL: i64 = i64::MIN;
+
+/// Finish a block of fast-path click lines in order: times per format in separate loops, then
+/// window check, key and push per line. A time the fast parsers refuse goes to `parse_ts_c`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(never)]
+fn ck_flush(ds: &mut Vec<CkD>, dc: &mut DayCache, tc: &mut TsCache, rs: &RandomState, tlo: i64, we: i64, out: &mut Vec<ClickRec>) {
+    if ds.is_empty() {
+        return;
+    }
+    let sl = |p: *const u8, n: usize| -> B { unsafe { std::slice::from_raw_parts(p, n) } };
+    let n = ds.len();
+    let mut i13: Vec<u32> = Vec::with_capacity(n);
+    let mut i25: Vec<u32> = Vec::with_capacity(n);
+    for (i, d) in ds.iter_mut().enumerate() {
+        // SAFETY (ldp, day_get, hms): a 20-byte field lies inside the window
+        if d.nt == 20 && unsafe { *d.pt.add(19) } == b'Z' {
+            let pt = d.pt;
+            let (ta, tb) = unsafe { (ldp(pt), ldp(pt.add(3))) };
+            d.t = match unsafe { (day_get(ta, tb, pt, dc), hms(pt.add(11))) } {
+                (Some(dd), Some(h)) => (dd + h) * 1000,
+                _ => CK_FAIL,
+            };
+        } else if d.nt == 13 {
+            i13.push(i as u32);
+        } else if d.nt == 25 {
+            i25.push(i as u32);
+        } else {
+            d.t = CK_FAIL;
+        }
+    }
+    // SAFETY (ts13): the time is the fourth field and both ids are not empty, so the 3 bytes
+    // before it and the 16 bytes from pt - 3 lie inside the window
+    for &i in &i13 {
+        let d = &mut ds[i as usize];
+        d.t = unsafe { ts13(d.pt) }.unwrap_or(CK_FAIL);
+    }
+    // SAFETY (ts25): a 25-byte field lies inside the window
+    for &i in &i25 {
+        let d = &mut ds[i as usize];
+        d.t = unsafe { ts25(d.pt, D0_A, D0_B, D0_S, dc) }.unwrap_or(CK_FAIL);
+    }
+    for d in ds.iter() {
+        let t = if d.t != CK_FAIL {
+            d.t
+        } else {
+            match parse_ts_c(sl(d.pt, d.nt as usize), tc) {
+                Some(t) => t,
+                None => continue,
+            }
+        };
+        if (t < tlo) | (t >= we) {
+            continue;
+        }
+        let uid = sl(d.pu, d.nu as usize);
+        // SAFETY (pack6x1): small means e0 < 47, which puts the 16 bytes from pu inside the window
+        let key = match if d.small { unsafe { pack6x1(d.pu, d.nu as usize) } } else { (0, false) } {
+            (k, true) => k,
+            _ => ukey(rs, uid),
+        };
+        out.push(ClickRec { key, ts: t, cid: pack(sl(d.pc, d.nc as usize)), camp: d.ci });
+    }
+    ds.clear();
+}
+
 /// Same records in the same order as `parse_clicks_old`. A line whose 64-byte window at its start
 /// holds its newline, exactly three commas before it and only whole-field quotes (`quote_bad`)
 /// is parsed in place: fields as pointer and length, F1 times through the day cache and `hms`,
@@ -1643,6 +1726,8 @@ fn parse_clicks(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: 
     let base = c.as_ptr();
     let mut pos = 0usize;
     let mut sbuf: Vec<[B; 4]> = Vec::new();
+    let blk = ck_blk();
+    let mut descs: Vec<CkD> = Vec::with_capacity(blk);
     while pos + 64 <= len {
         // SAFETY: pos + 64 <= len
         let p = unsafe { base.add(pos) };
@@ -1673,41 +1758,20 @@ fn parse_clicks(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: 
             let (pm, nm) = fld(e1 + 1, e2);
             let Some(ci) = camp.get_fast2(sl(pm, nm), lo) else { continue };
             let (pt, nt) = fld(e2 + 1, l);
-            // SAFETY (ldp, day_get, hms, ts25): a 20- or 25-byte field lies inside the window.
-            // ts13: the time is the fourth field and both ids are not empty, so the 3 bytes
-            // before it and the 16 bytes from pt - 3 lie inside the window.
-            let f = if nt == 20 && unsafe { *pt.add(19) } == b'Z' {
-                let (ta, tb) = unsafe { (ldp(pt), ldp(pt.add(3))) };
-                match unsafe { (day_get(ta, tb, pt, &mut dc), hms(pt.add(11))) } {
-                    (Some(d), Some(h)) => Some((d + h) * 1000),
-                    _ => None,
-                }
-            } else if nt == 13 {
-                unsafe { ts13(pt) }
-            } else if nt == 25 {
-                unsafe { ts25(pt, D0_A, D0_B, D0_S, &mut dc) }
-            } else {
-                None
-            };
-            let Some(t) = f.or_else(|| parse_ts_c(sl(pt, nt), &mut tc)) else { continue };
-            if (t < tlo) | (t >= we) {
-                continue;
+            descs.push(CkD { pc, pu, pt, ci, t: 0, nc: nc as u8, nu: nu as u8, nt: nt as u8, small: e0 < 47 });
+            if descs.len() >= blk {
+                ck_flush(&mut descs, &mut dc, &mut tc, rs, tlo, we, out);
             }
-            let uid = sl(pu, nu);
-            // SAFETY (pack6x1): e0 < 47 puts the 16 bytes from pu inside the window
-            let key = match if e0 < 47 { unsafe { pack6x1(pu, nu) } } else { (0, false) } {
-                (k, true) => k,
-                _ => ukey(rs, uid),
-            };
-            out.push(ClickRec { key, ts: t, cid: pack(sl(pc, nc)), camp: ci });
             continue;
         }
+        ck_flush(&mut descs, &mut dc, &mut tc, rs, tlo, we, out);
         sbuf.clear();
         pos = scan4_line(c, pos, &mut sbuf);
         for f in &sbuf {
             click_line(f, camp, rs, ws, we, lo, &mut tc, out);
         }
     }
+    ck_flush(&mut descs, &mut dc, &mut tc, rs, tlo, we, out);
     if pos < len {
         scan::<4>(&c[pos..], |f| click_line(f, camp, rs, ws, we, lo, &mut tc, out));
     }
