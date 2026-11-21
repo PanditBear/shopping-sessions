@@ -2358,9 +2358,8 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
 /// classifier, 3 its AVX-512VL 256-bit classifier.
 const EVK_NAMES: [&str; 4] = ["old", "sol", "z512", "z256"];
 
-/// The kernel `parse_events_k` runs by default: SHOP_EVK=old|sol|z512|z256 (SHOP_EVOLD=1 means
-/// old), else z256 when the CPU has AVX-512 F/BW/VL, else sol. A kernel the CPU cannot run
-/// falls back to sol.
+/// The kernel `parse_events_k` runs: SHOP_EVK=old|sol|z512|z256 (SHOP_EVOLD=1 means old), else
+/// `ev_default()`. A kernel the CPU cannot run falls back to sol.
 fn ev_kernel() -> u8 {
     static K: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *K.get_or_init(|| {
@@ -2369,13 +2368,52 @@ fn ev_kernel() -> u8 {
             Err(_) => None,
         };
         let want = if std::env::var_os("SHOP_EVOLD").is_some() { Some(0) } else { want };
-        let k = want.unwrap_or(if ev_has512() { 3 } else { 1 });
+        let k = want.unwrap_or_else(ev_default);
         if k >= 2 && !ev_has512() {
             1
         } else {
             k
         }
     })
+}
+
+/// The default kernel. On CPUs with AVX-512 F/BW/VL: z256 on AMD (Zen 4 double-pumps 512-bit
+/// ops; GHA EPYC 9V74 solbench: z256 0.7% faster than sol, z512 0.6% slower), z512 on Intel
+/// with VBMI2 (Ice Lake and later, no frequency licence step for 512-bit integer compares; GHA
+/// Xeon 6975P-C: 2.6% faster), else sol (Skylake-SP and Cascade Lake clock down for 512-bit
+/// ops). Otherwise sol.
+fn ev_default() -> u8 {
+    if !ev_has512() {
+        1
+    } else if !ev_intel() {
+        3
+    } else if ev_vbmi2() {
+        2
+    } else {
+        1
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+fn ev_intel() -> bool {
+    // SAFETY: cpuid leaf 0 exists on every x86_64 CPU
+    #[allow(unused_unsafe)]
+    let v = unsafe { core::arch::x86_64::__cpuid(0) };
+    // vendor "GenuineIntel" in ebx, edx, ecx
+    (v.ebx, v.edx, v.ecx) == (0x756e_6547, 0x4965_6e69, 0x6c65_746e)
+}
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
+fn ev_intel() -> bool {
+    false
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+fn ev_vbmi2() -> bool {
+    std::is_x86_feature_detected!("avx512vbmi2")
+}
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
+fn ev_vbmi2() -> bool {
+    false
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
