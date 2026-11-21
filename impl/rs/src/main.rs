@@ -2393,6 +2393,17 @@ fn ev_key_slow(uid: B, rs: &RandomState, fbn: &mut Vec<(u64, u64)>) -> u64 {
     k
 }
 
+/// 16 set bytes then 16 clear ones: 16 bytes read from 16 - n mark the first n.
+static LEN_MASK: [u8; 32] = {
+    let mut t = [0u8; 32];
+    let mut i = 0;
+    while i < 16 {
+        t[i] = 0xFF;
+        i += 1;
+    }
+    t
+};
+
 /// `pack6` of two ids at once: 16 bytes are read at each pointer (`na`, `nb` are the lengths).
 /// Returns (key a, a ok, key b, b ok); a key is only meaningful when its flag is set.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
@@ -2411,11 +2422,13 @@ unsafe fn pack6x2(pa: *const u8, na: usize, pb: *const u8, nb: usize) -> (u64, b
     let invalid = _mm256_cmpeq_epi8(cls, _mm256_setzero_si256());
     // CODE values: byte minus a per-high-nibble offset ('_' 4 less than the other 0x5_ bytes)
     let off_t = _mm256_broadcastsi128_si256(_mm_setr_epi8(0, 0, 0, 0x2F, 0x36, 0x36, 0x3B, 0x3B, 0, 0, 0, 0, 0, 0, 0, 0));
-    let us = _mm256_and_si256(_mm256_cmpeq_epi8(x, _mm256_set1_epi8(0x5F)), _mm256_set1_epi8(4));
-    let code = _mm256_sub_epi8(_mm256_sub_epi8(x, _mm256_shuffle_epi8(off_t, hn)), us);
-    let iota = _mm256_broadcastsi128_si256(_mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15));
-    let nv = _mm256_set_m128i(_mm_set1_epi8(nb.min(16) as i8), _mm_set1_epi8(na.min(16) as i8));
-    let inf = _mm256_cmpgt_epi8(nv, iota);
+    // in the 0x5_ row only '_' (0x29 after the offset) exceeds 0x25, its CODE value
+    let cap_t = _mm256_broadcastsi128_si256(_mm_setr_epi8(-1, -1, -1, -1, -1, 0x25, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1));
+    let code = _mm256_min_epu8(_mm256_sub_epi8(x, _mm256_shuffle_epi8(off_t, hn)), _mm256_shuffle_epi8(cap_t, hn));
+    // bytes below the length: 16 bytes of LEN_MASK from 16 - n (n of 16 or more only feeds a key
+    // whose flag is false, so n & 15 keeps the read in bounds)
+    let mp = LEN_MASK.as_ptr();
+    let inf = _mm256_loadu2_m128i(mp.add(16 - (nb & 15)) as *const __m128i, mp.add(16 - (na & 15)) as *const __m128i);
     let bad = _mm256_movemask_epi8(_mm256_and_si256(invalid, inf)) as u32;
     let c = _mm256_and_si256(code, inf);
     // pairs -> 12 bits, quads -> 24 bits: dwords 0..2 of a lane hold codes 0-3, 4-7, 8-11
