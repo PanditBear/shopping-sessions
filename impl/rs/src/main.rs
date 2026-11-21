@@ -1276,40 +1276,20 @@ impl CampAcc {
             }
         }
     }
-    /// Prefetch the dense cell of (c, d), if it is dense.
+    /// One touch for every campaign in `act` on day d.
     #[inline(always)]
-    fn pf(&self, c: u32, d: i64) {
-        if let Some(di) = self.di(d) {
-            prefetch(self.dense.as_ptr().wrapping_add(c as usize * self.nd + di));
-        }
-    }
-    /// `n` touches for every campaign in `act` on day d, for each (d, n) in `days`. Campaign-major:
-    /// the days of one campaign are adjacent in `tch`.
-    #[inline(always)]
-    fn touch_days(&mut self, act: &[u32], days: &[(i64, u32)]) {
-        let nd = self.nd;
-        if days.iter().all(|&(d, _)| self.di(d).is_some()) {
-            let d0 = self.d0;
-            let t = &mut self.tch[..];
-            for &c in act {
-                let row = c as usize * nd;
-                for &(d, n) in days {
-                    t[row + (d - d0) as usize] += n;
+    fn touch(&mut self, act: &[u32], d: i64) {
+        match self.di(d) {
+            Some(di) => {
+                let nd = self.nd;
+                let t = &mut self.tch[..];
+                for &c in act {
+                    t[c as usize * nd + di] += 1;
                 }
             }
-        } else {
-            for &(d, n) in days {
-                match self.di(d) {
-                    Some(di) => {
-                        for &c in act {
-                            self.tch[c as usize * nd + di] += n;
-                        }
-                    }
-                    None => {
-                        for &c in act {
-                            self.map.entry(((c as u64) << 32) | (d as u32 as u64)).or_insert([0; 4])[3] += n as u64;
-                        }
-                    }
+            None => {
+                for &c in act {
+                    self.map.entry(((c as u64) << 32) | (d as u32 as u64)).or_insert([0; 4])[3] += 1;
                 }
             }
         }
@@ -1593,7 +1573,6 @@ fn sort_clicks(cl: &mut [ClickRec], tmp: &mut Vec<ClickRec>, cnt: &mut [u32], pk
         let m = en - st;
         if m == 1 {
             cl[st] = tmp[st];
-        } else if m < 2048 && pack_clicks(&tmp[st..en], &mut cl[st..en], pk) {
         } else if m > 32 && sort_one_clicker(&tmp[st..en], &mut cl[st..en], pk) {
         } else if m > 1 {
             let o = &mut cl[st..en];
@@ -1606,80 +1585,6 @@ fn sort_clicks(cl: &mut [ClickRec], tmp: &mut Vec<ClickRec>, cnt: &mut [u32], pk
         }
         st = en;
     }
-}
-
-/// Orders `r` (2 <= len < 2048) into `out` by (key, ts, click_id bytes) when it holds at most 16
-/// keys: (key rank, ts - min ts, index) packed into u64s are sorted and gathered, then each run of
-/// equal (key, ts) is ordered by click_id bytes. Returns false and leaves `out` alone for more keys
-/// or when the fields do not fit in 64 bits.
-#[inline(always)]
-fn pack_clicks(r: &[ClickRec], out: &mut [ClickRec], pk: &mut Vec<u64>) -> bool {
-    let m = r.len();
-    let ib = 64 - ((m - 1) as u64).leading_zeros();
-    let (mut lo, mut hi) = (i64::MAX, i64::MIN);
-    for c in r {
-        lo = lo.min(c.ts);
-        hi = hi.max(c.ts);
-    }
-    let sh = 64 - (hi.wrapping_sub(lo) as u64).leading_zeros() + ib;
-    if sh > 60 {
-        return false;
-    }
-    let k0 = r[0].key;
-    let mut uk = [0u64; 16];
-    uk[0] = k0;
-    let mut nk = 1usize;
-    pk.clear();
-    for (i, c) in r.iter().enumerate() {
-        let k = c.key;
-        let mut s = 0usize;
-        if k != k0 {
-            s = 1;
-            while s < nk && uk[s] != k {
-                s += 1;
-            }
-            if s == nk {
-                if nk == 16 {
-                    return false;
-                }
-                uk[nk] = k;
-                nk += 1;
-            }
-        }
-        pk.push(((s as u64) << sh) | ((c.ts.wrapping_sub(lo) as u64) << ib) | i as u64);
-    }
-    if nk > 1 {
-        let mut rk = [0u64; 16];
-        for s in 0..nk {
-            rk[s] = uk[..nk].iter().filter(|&&x| x < uk[s]).count() as u64;
-        }
-        let lm = (1u64 << sh) - 1;
-        for k in pk.iter_mut() {
-            *k = (rk[(*k >> sh) as usize] << sh) | (*k & lm);
-        }
-    }
-    if m <= 32 {
-        isort_by(&mut pk[..], |a, b| a < b);
-    } else {
-        pk.sort_unstable();
-    }
-    let im = (1u64 << ib) - 1;
-    for (o, &k) in out.iter_mut().zip(pk.iter()) {
-        *o = r[(k & im) as usize];
-    }
-    let mut a = 0;
-    while a < m {
-        let h = pk[a] >> ib;
-        let mut b = a + 1;
-        while b < m && pk[b] >> ib == h {
-            b += 1;
-        }
-        if b - a > 1 {
-            out[a..b].sort_unstable_by(|x, y| unpack(x.cid).cmp(unpack(y.cid)));
-        }
-        a = b;
-    }
-    true
 }
 
 /// A long digit range is nearly always one heavy clicker. When every click in `src` has the same key,
@@ -1725,8 +1630,6 @@ fn proc_sorted<E: Ev>(evs: &[E], clicks: &[ClickRec], win: &mut Win, organic: u3
     let mut ci = 0;
     let mut i = 0;
     let mut day = DayAcc { key: 0, day: 0, sessions: 0, events: 0, rev: 0, cats: vec![] };
-    // (day, sessions) started under the current window, not yet counted as touches
-    let mut pend: Vec<(i64, u32)> = Vec::new();
     while i < evs.len() {
         let pid = evs[i].key();
         let pd = dg(pid);
@@ -1765,19 +1668,13 @@ fn proc_sorted<E: Ev>(evs: &[E], clicks: &[ClickRec], win: &mut Win, organic: u3
                 s_day = d;
                 s_rev = 0;
                 s_purch = false;
-                if (hi < cs.len() && cs[hi].ts <= s) || (lo < hi && cs[lo].ts < s - WEEK) {
-                    if !pend.is_empty() {
-                        cm.touch_days(&win.active, &pend);
-                        pend.clear();
-                    }
-                    while hi < cs.len() && cs[hi].ts <= s {
-                        win.add(cs[hi].camp);
-                        hi += 1;
-                    }
-                    while lo < hi && cs[lo].ts < s - WEEK {
-                        win.remove(cs[lo].camp);
-                        lo += 1;
-                    }
+                while hi < cs.len() && cs[hi].ts <= s {
+                    win.add(cs[hi].camp);
+                    hi += 1;
+                }
+                while lo < hi && cs[lo].ts < s - WEEK {
+                    win.remove(cs[lo].camp);
+                    lo += 1;
                 }
                 s_camp = if hi > lo {
                     let t = cs[hi - 1].ts;
@@ -1789,13 +1686,7 @@ fn proc_sorted<E: Ev>(evs: &[E], clicks: &[ClickRec], win: &mut Win, organic: u3
                 } else {
                     organic
                 };
-                cm.pf(s_camp, d);
-                if !win.active.is_empty() {
-                    match pend.last_mut() {
-                        Some(x) if x.0 == d => x.1 += 1,
-                        _ => pend.push((d, 1)),
-                    }
-                }
+                cm.touch(&win.active, d);
                 if day.day != d {
                     flush_day(&mut day, uds);
                     day.day = d;
@@ -1818,10 +1709,6 @@ fn proc_sorted<E: Ev>(evs: &[E], clicks: &[ClickRec], win: &mut Win, organic: u3
             cm.sess(s_camp, s_day, s_purch, s_rev);
         }
         flush_day(&mut day, uds);
-        if !pend.is_empty() {
-            cm.touch_days(&win.active, &pend);
-            pend.clear();
-        }
         for &c in &win.active {
             win.cnt[c as usize] = 0;
         }
