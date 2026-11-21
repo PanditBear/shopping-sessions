@@ -31,7 +31,9 @@ for spec in "$@"; do
   sha=$(git rev-parse --short "$r^{commit}" 2>/dev/null || git rev-parse --short "origin/$r")
   if [ ! -f $W/bin-$sha ]; then
     rm -rf $W/w$i; git worktree add -q --detach $W/w$i "$sha"
-    (cd $W/w$i/impl/rs && CC_x86_64_unknown_linux_musl=musl-gcc RUSTFLAGS="-C target-cpu=x86-64-v3" CARGO_TARGET_DIR=$W/tgt \
+    RF=$(grep -o 'RUSTFLAGS="[^"]*"' $W/w$i/Dockerfile 2>/dev/null | head -1 | cut -d'"' -f2 | sed "s#/pgo/#$W/w$i/impl/rs/pgo/#")
+    RF=${RF:-"-C target-cpu=x86-64-v3"}; echo "rustflags for $sha: $RF"
+    (cd $W/w$i/impl/rs && CC_x86_64_unknown_linux_musl=musl-gcc RUSTFLAGS="$RF" CARGO_TARGET_DIR=$W/tgt \
        cargo build --release --locked -q --target x86_64-unknown-linux-musl)
     cp $W/tgt/x86_64-unknown-linux-musl/release/shop $W/bin-$sha
   fi
