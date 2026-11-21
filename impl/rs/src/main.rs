@@ -317,72 +317,103 @@ fn scan<const N: usize>(chunk: B, mut f: impl FnMut(&[B; N])) {
 /// every quote opens or closes a whole field of two or more bytes (checked on the masks: with X
 /// the quotes at field starts and Y those at field ends, Y - X must touch no separator and no Y
 /// bit). Every other line, and the last 128 bytes of the chunk, go to `scan` one line at a time.
+/// The fast path of `scan7`: the fields of the line at `p` and its length with the newline, or
+/// None if the line needs `scan`. The caller guarantees 128 readable bytes at `p`.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
 #[inline(always)]
-fn scan7(chunk: B, mut f: impl FnMut(&[B; 7])) {
+fn line7(p: *const u8) -> Option<([B; 7], usize)> {
     use core::arch::x86_64::_bzhi_u64;
     // SAFETY (bzhi): BMI2 is enabled for this build
     let bzhi = |x: u64, n: u32| unsafe { _bzhi_u64(x, n) };
     let blsr = |x: u64| x & x.wrapping_sub(1);
+    let (ca, qa, na) = masks64(p);
+    let e0 = ca.trailing_zeros();
+    let c1 = blsr(ca);
+    let e1 = c1.trailing_zeros();
+    let c2 = blsr(c1);
+    let e2 = c2.trailing_zeros();
+    if (c2 != 0) & (bzhi(na, e2) == 0) {
+        let pb = unsafe { p.add(e2 as usize + 1) };
+        let (cb, qb, nb) = masks64(pb);
+        let l = nb.trailing_zeros();
+        let e3 = cb.trailing_zeros();
+        let d1 = blsr(cb);
+        let e4 = d1.trailing_zeros();
+        let d2 = blsr(d1);
+        let e5 = d2.trailing_zeros();
+        let d3 = blsr(d2);
+        let qa1 = bzhi(qa, e2);
+        let xa = qa1 & ((ca << 1) | 1);
+        let ya = qa1 & (ca >> 1);
+        let ra = ya.wrapping_sub(xa);
+        let bad_a = (qa1 & !(xa | ya)) | (xa & ya) | (ra & (bzhi(ca, e2 + 1) | ya));
+        let sb = cb | nb;
+        let qb1 = bzhi(qb, l);
+        let xb = qb1 & ((cb << 1) | 1);
+        let yb = qb1 & (sb >> 1);
+        let rb = yb.wrapping_sub(xb);
+        let bad_b = (qb1 & !(xb | yb)) | (xb & yb) | (rb & (bzhi(sb, l + 1) | yb));
+        if (nb != 0) & (e5 < l) & (bzhi(d3, l) == 0) & ((bad_a | bad_b) == 0) {
+            let fld = |p: *const u8, x: u64, s: u32, e: u32| {
+                let q = ((x >> s) & 1) as u32;
+                // SAFETY: s <= e <= 63 inside a window; a quoted field has e - s >= 2
+                unsafe { std::slice::from_raw_parts(p.add((s + q) as usize), (e - s - 2 * q) as usize) }
+            };
+            let out: [B; 7] = [
+                fld(p, xa, 0, e0),
+                fld(p, xa, e0 + 1, e1),
+                fld(p, xa, e1 + 1, e2),
+                fld(pb, xb, 0, e3),
+                fld(pb, xb, e3 + 1, e4),
+                fld(pb, xb, e4 + 1, e5),
+                fld(pb, xb, e5 + 1, l),
+            ];
+            return Some((out, (e2 + l + 2) as usize));
+        }
+    }
+    None
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+fn scan7(chunk: B, mut f: impl FnMut(&[B; 7])) {
     let len = chunk.len();
     let base = chunk.as_ptr();
     let mut pos = 0usize;
-    while pos + 128 <= len {
-        // SAFETY: pos + 128 <= len, and the second window starts at most 64 bytes in
-        let p = unsafe { base.add(pos) };
-        let (ca, qa, na) = masks64(p);
-        let e0 = ca.trailing_zeros();
-        let c1 = blsr(ca);
-        let e1 = c1.trailing_zeros();
-        let c2 = blsr(c1);
-        let e2 = c2.trailing_zeros();
-        if (c2 != 0) & (bzhi(na, e2) == 0) {
-            let pb = unsafe { p.add(e2 as usize + 1) };
-            let (cb, qb, nb) = masks64(pb);
-            let l = nb.trailing_zeros();
-            let e3 = cb.trailing_zeros();
-            let d1 = blsr(cb);
-            let e4 = d1.trailing_zeros();
-            let d2 = blsr(d1);
-            let e5 = d2.trailing_zeros();
-            let d3 = blsr(d2);
-            let qa1 = bzhi(qa, e2);
-            let xa = qa1 & ((ca << 1) | 1);
-            let ya = qa1 & (ca >> 1);
-            let ra = ya.wrapping_sub(xa);
-            let bad_a = (qa1 & !(xa | ya)) | (xa & ya) | (ra & (bzhi(ca, e2 + 1) | ya));
-            let sb = cb | nb;
-            let qb1 = bzhi(qb, l);
-            let xb = qb1 & ((cb << 1) | 1);
-            let yb = qb1 & (sb >> 1);
-            let rb = yb.wrapping_sub(xb);
-            let bad_b = (qb1 & !(xb | yb)) | (xb & yb) | (rb & (bzhi(sb, l + 1) | yb));
-            if (nb != 0) & (e5 < l) & (bzhi(d3, l) == 0) & ((bad_a | bad_b) == 0) {
-                let fld = |p: *const u8, x: u64, s: u32, e: u32| {
-                    let q = ((x >> s) & 1) as u32;
-                    // SAFETY: s <= e <= 63 inside a window; a quoted field has e - s >= 2
-                    unsafe { std::slice::from_raw_parts(p.add((s + q) as usize), (e - s - 2 * q) as usize) }
-                };
-                let out: [B; 7] = [
-                    fld(p, xa, 0, e0),
-                    fld(p, xa, e0 + 1, e1),
-                    fld(p, xa, e1 + 1, e2),
-                    fld(pb, xb, 0, e3),
-                    fld(pb, xb, e3 + 1, e4),
-                    fld(pb, xb, e4 + 1, e5),
-                    fld(pb, xb, e5 + 1, l),
-                ];
-                f(&out);
-                #[cfg(test)]
-                SCAN7_FAST.with(|c| c.set(c.get() + 1));
-                pos += (e2 + l + 2) as usize;
-                continue;
+    // lines from the slow path wait in buf, so f has one call site and its state never
+    // reaches a non-inlined function
+    let mut buf: Vec<[B; 7]> = Vec::new();
+    let mut bi = 0usize;
+    loop {
+        let line: [B; 7] = if bi < buf.len() {
+            bi += 1;
+            buf[bi - 1]
+        } else if pos + 128 <= len {
+            // SAFETY: pos + 128 <= len, and the second window starts at most 64 bytes in
+            match line7(unsafe { base.add(pos) }) {
+                Some((l, n)) => {
+                    #[cfg(test)]
+                    SCAN7_FAST.with(|c| c.set(c.get() + 1));
+                    pos += n;
+                    l
+                }
+                None => {
+                    buf.clear();
+                    bi = 0;
+                    pos = scan7_line(chunk, pos, &mut buf);
+                    continue;
+                }
             }
-        }
-        pos = scan7_line(chunk, pos, &mut f);
-    }
-    if pos < len {
-        scan::<7>(&chunk[pos..], f);
+        } else if pos < len {
+            buf.clear();
+            bi = 0;
+            scan::<7>(&chunk[pos..], |l| buf.push(*l));
+            pos = len;
+            continue;
+        } else {
+            break;
+        };
+        f(&line);
     }
 }
 
@@ -394,12 +425,12 @@ thread_local! {
 /// The slow path of `scan7`: the one line at `pos` through `scan`; returns the next line start.
 #[cold]
 #[inline(never)]
-fn scan7_line<F: FnMut(&[B; 7])>(chunk: B, pos: usize, f: &mut F) -> usize {
+fn scan7_line(chunk: B, pos: usize, buf: &mut Vec<[B; 7]>) -> usize {
     let end = match memchr(b'\n', &chunk[pos..]) {
         Some(i) => pos + i + 1,
         None => chunk.len(),
     };
-    scan::<7>(&chunk[pos..end], |l| f(l));
+    scan::<7>(&chunk[pos..end], |l| buf.push(*l));
     end
 }
 
