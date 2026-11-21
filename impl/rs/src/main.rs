@@ -310,6 +310,35 @@ fn scan<const N: usize>(chunk: B, mut f: impl FnMut(&[B; N])) {
     }
 }
 
+/// Fast path for unquoted click rows; delegate quoted rows to the CSV scanner.
+#[inline]
+fn scan_clicks(chunk: B, mut f: impl FnMut(&[B; 4])) {
+    let mut start = 0usize;
+    while start < chunk.len() {
+        let end = match memchr(b'\n', &chunk[start..]) {
+            Some(i) => start + i,
+            None => chunk.len(),
+        };
+        let row = &chunk[start..end];
+        if !row.contains(&b'"') {
+            if let Some(a) = memchr(b',', row) {
+                if let Some(b) = memchr(b',', &row[a + 1..]) {
+                    let b = a + 1 + b;
+                    if let Some(c) = memchr(b',', &row[b + 1..]) {
+                        let c = b + 1 + c;
+                        if !row[c + 1..].contains(&b',') {
+                            f(&[&row[..a], &row[a + 1..b], &row[b + 1..c], &row[c + 1..]]);
+                        }
+                    }
+                }
+            }
+        } else {
+            scan::<4>(&chunk[start..if end < chunk.len() { end + 1 } else { end }], |fields| f(fields));
+        }
+        start = end + 1;
+    }
+}
+
 #[inline]
 fn d2(b: &[u8]) -> Option<i64> {
     let (x, y) = (b[0].wrapping_sub(b'0'), b[1].wrapping_sub(b'0'));
@@ -1698,7 +1727,7 @@ fn main() {
             let mut tmp: Vec<ClickRec> = Vec::with_capacity(c.len() / 40);
             let mut tc = TsCache::new();
             let mut tm = now();
-            scan::<4>(c, |&[cid, uid, cmp, ts]| {
+            scan_clicks(c, |&[cid, uid, cmp, ts]| {
                 if cid.is_empty() || uid.is_empty() {
                     return;
                 }
