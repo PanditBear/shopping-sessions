@@ -4315,8 +4315,11 @@ fn ev_after_idx<E: Ev>(
                     .into_par_iter()
                     .map(|g| {
                         let mut tm = now();
-                        let mut t: Vec<u64> = vec![u64::MAX; span];
+                        // slot: 1 + the record's place in lb (0 = empty); li holds each record's
+                        // ingest key, read back only when a slot is taken
+                        let mut t: Vec<u32> = vec![0; span];
                         let mut lb: Vec<E> = Vec::new();
+                        let mut li: Vec<u32> = Vec::new();
                         let mut lg: Vec<u64> = Vec::new();
                         // em outlives the task (sessionize reads its runs), so size it once from the
                         // record counts instead of growing it by doubling
@@ -4338,6 +4341,7 @@ fn ev_after_idx<E: Ev>(
                         let mut pc = PkCache { k: [0; 4], p: [0; 4], n: 0 };
                         for b in g * G..((g + 1) * G).min(ndb) {
                             lb.clear();
+                            li.clear();
                             lg.clear();
                             for (ci, c) in ev_out.iter().enumerate() {
                                 // each chunk keeps bucket b in its own far-off stretch: fetch the count a few
@@ -4364,23 +4368,25 @@ fn ev_after_idx<E: Ev>(
                                         }
                                         let q = lb.len() as u32;
                                         lb.push(x.e);
+                                        li.push(x.ing);
                                         if dside_any {
                                             lg.push(((ci as u64) << 32) | (p0 + j) as u64);
                                         }
-                                        let pk = ((x.ing as u64) << 32) | q as u64;
                                         // SAFETY: the slot index is masked to span
                                         let o = unsafe { t.get_unchecked_mut((x.i as u64 & mask) as usize) };
-                                        if *o == u64::MAX {
-                                            *o = pk;
+                                        if *o == 0 {
+                                            *o = q + 1;
                                             continue;
                                         }
-                                        let ok = (*o >> 32) as u32;
+                                        let oq = *o as usize - 1;
+                                        // SAFETY: a taken slot names an earlier record, oq < q < li.len()
+                                        let ok = unsafe { *li.get_unchecked(oq) };
                                         if x.ing < ok
                                             || (x.ing == ok
                                                 && dside_any
-                                                && dexact(lg[q as usize], x.ing) < dexact(lg[*o as u32 as usize], ok))
+                                                && dexact(lg[q as usize], x.ing) < dexact(lg[oq], ok))
                                         {
-                                            *o = pk;
+                                            *o = q + 1;
                                         }
                                     }
                                 }
@@ -4392,14 +4398,14 @@ fn ev_after_idx<E: Ev>(
                                 for j in 0..tl {
                                     if j + PD < tl {
                                         let n = t[j + PD];
-                                        if n != u64::MAX {
-                                            prefetch(lb.as_ptr().wrapping_add(n as u32 as usize) as *const u8);
+                                        if n != 0 {
+                                            prefetch(lb.as_ptr().wrapping_add(n as usize - 1) as *const u8);
                                         }
                                     }
                                     let o = &mut t[j];
-                                    if *o != u64::MAX {
-                                        let mut e = lb[*o as u32 as usize];
-                                        *o = u64::MAX;
+                                    if *o != 0 {
+                                        let mut e = lb[*o as usize - 1];
+                                        *o = 0;
                                         let k = e.key();
                                         if k != 0 {
                                             let pk = pk_of(&mut pc, k, tab, mf);
