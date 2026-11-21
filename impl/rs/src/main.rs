@@ -2457,17 +2457,26 @@ fn main() {
     }
     tick("events scattered");
 
-    // clicks: map keys through the identity table
+    // clicks: map keys through the identity table (keys that miss the mover filter map to themselves)
     let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_raw
         .into_par_iter()
         .map(|mut tmp| {
             let mut tm = now();
             let n = tmp.len();
             for i in 0..n {
-                if i + PFD < n {
-                    tab.pf(tmp[i + PFD].key);
+                if i + 2 * PFD < n {
+                    mf.pf(tmp[i + 2 * PFD].key);
                 }
-                tmp[i].key = tab.get(tmp[i].key);
+                if i + PFD < n {
+                    let k = tmp[i + PFD].key;
+                    if mf.hit(k) {
+                        tab.pf(k);
+                    }
+                }
+                let k = tmp[i].key;
+                if mf.hit(k) {
+                    tmp[i].key = tab.get(k);
+                }
             }
             let r = bucketize(&tmp, PB, |x| pbk(x.key));
             pt(10, &mut tm);
