@@ -31,11 +31,14 @@ on:
       clicks:
         description: "clicks in the generated dataset"
         default: "5000000"
+      pqrefs:
+        description: "if set: only the parquet reader check (Spark, pyarrow, duckdb, polars) of these refs"
+        default: ""
 permissions:
   contents: read
 jobs:
   bench:
-    if: ${{ github.event.inputs.perfsha == '' }}
+    if: ${{ github.event.inputs.perfsha == '' && github.event.inputs.pqrefs == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -139,3 +142,21 @@ jobs:
             done < $W/syms.txt
             sudo find $o $s2 -mindepth 1 -delete; sudo rm -f $R; sudo find $D -mindepth 1 -delete
           done
+  pq:
+    if: ${{ github.event.inputs.pqrefs != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: bench
+      - name: toolchain
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends musl-tools
+          rustup target add x86_64-unknown-linux-musl
+      - name: pqcheck
+        env:
+          REFS: ${{ github.event.inputs.pqrefs }}
+        run: bash pqcheck.sh $REFS
