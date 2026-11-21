@@ -50,17 +50,6 @@ const EB: usize = 1 << EBB; // event dedup buckets (by event_id)
 const DDG: usize = 4; // event_id buckets per dedup task
 const PBB: u32 = 10;
 const PB: usize = 1 << PBB; // person buckets
-/// Person buckets per user_daily file, in bucket order. The files are written while later buckets
-/// are sessionized, so they get smaller toward the end: the last writes are short.
-const UDF: [usize; 16] = [80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 64, 48, 40, 32, 24, 16];
-const _: () = {
-    let (mut s, mut i) = (0, 0);
-    while i < UDF.len() {
-        s += UDF[i];
-        i += 1;
-    }
-    assert!(s == PB);
-};
 
 fn hasher() -> RandomState {
     RandomState::with_seeds(0x243f6a8885a308d3, 0x13198a2e03707344, 0xa4093822299f31d0, 0x082efa98ec4e6c89)
@@ -72,7 +61,7 @@ fn mix(k: u64) -> u64 {
     k ^ (k >> 29)
 }
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::AcqRel, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 static TIMING: AtomicBool = AtomicBool::new(false);
 static PROF: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 const PROF_NAMES: [&str; 12] =
@@ -2555,9 +2544,7 @@ fn ev_after<E: Ev>(
     d0: i64,
     nd: usize,
     tick: &dyn Fn(&str),
-    wud: &(dyn Fn(usize, &[&Vec<UD>]) + Sync),
-    wcd: &(dyn Fn(CampAcc) + Sync),
-) {
+) -> Vec<(Vec<Vec<UD>>, CampAcc)> {
     let (mbase, dead) = dd;
     // kept lines: user key -> person key (0 marks a dropped line; keys that miss the mover filter
     // map to themselves without a table lookup), then each chunk's kept lines
@@ -2624,64 +2611,37 @@ fn ev_after<E: Ev>(
     drop(dead);
     tick("dedup done");
 
-    // Workers take the person buckets in order, one at a time; whoever finishes the last bucket
-    // of a user_daily file writes that file at once, so the writes overlap the sessionize. Each
-    // worker keeps one campaign accumulator; the last worker to run out of buckets merges them
-    // and writes campaign_daily.
-    let mut fof = vec![0u8; PB];
-    let mut fst = vec![0usize; UDF.len() + 1];
-    for (f, &n) in UDF.iter().enumerate() {
-        fst[f + 1] = fst[f] + n;
-        fof[fst[f]..fst[f + 1]].fill(f as u8);
-    }
-    let rem: Vec<AtomicUsize> = UDF.iter().map(|&n| AtomicUsize::new(n)).collect();
-    let uds: Vec<std::sync::OnceLock<Vec<UD>>> = (0..PB).map(|_| std::sync::OnceLock::new()).collect();
-    let next = AtomicUsize::new(0);
-    let nt = rayon::current_num_threads();
-    let acc: std::sync::Mutex<(Option<CampAcc>, usize)> = std::sync::Mutex::new((None, 0));
-    (0..nt).into_par_iter().for_each(|_| {
-        let mut cm: Option<CampAcc> = None;
-        let mut win = Win { cnt: vec![0; ncamp + 1], pos: vec![0; ncamp + 1], active: vec![] };
-        let mut evs: Vec<E> = vec![];
-        let mut tmp: Vec<E> = vec![];
-        let mut cnt: Vec<u32> = vec![];
-        let mut cl: Vec<ClickRec> = vec![];
-        let mut ctmp: Vec<ClickRec> = vec![];
-        for p in std::iter::from_fn(|| Some(next.fetch_add(1, Relaxed))).take_while(|&p| p < PB) {
-            let cm = cm.get_or_insert_with(|| CampAcc::new(ncamp + 1, d0, nd));
-            let mut tm = now();
-            cl.clear();
-            for (v, o) in click_out.iter() {
-                cl.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
+    let ngroups = (rayon::current_num_threads() * 4).clamp(1, PB);
+    let per = PB.div_ceil(ngroups);
+    (0..ngroups)
+        .into_par_iter()
+        .map(|g| {
+            let mut cm = CampAcc::new(ncamp + 1, d0, nd);
+            let mut win = Win { cnt: vec![0; ncamp + 1], pos: vec![0; ncamp + 1], active: vec![] };
+            let mut out = vec![];
+            let mut evs: Vec<E> = vec![];
+            let mut tmp: Vec<E> = vec![];
+            let mut cnt: Vec<u32> = vec![];
+            let mut cl: Vec<ClickRec> = vec![];
+            let mut ctmp: Vec<ClickRec> = vec![];
+            for p in g * per..((g + 1) * per).min(PB) {
+                let mut tm = now();
+                cl.clear();
+                for (v, o) in click_out.iter() {
+                    cl.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
+                }
+                evs.clear();
+                for (v, o) in parts.iter() {
+                    evs.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
+                }
+                pt(6, &mut tm);
+                let mut uds = Vec::new();
+                process_bucket(&mut evs, &mut tmp, &mut cnt, &mut cl, &mut ctmp, &mut win, ncamp as u32, &mut uds, &mut cm, ws, we.wrapping_sub(ws));
+                out.push(uds);
             }
-            evs.clear();
-            for (v, o) in parts.iter() {
-                evs.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
-            }
-            pt(6, &mut tm);
-            let mut u = Vec::new();
-            process_bucket(&mut evs, &mut tmp, &mut cnt, &mut cl, &mut ctmp, &mut win, ncamp as u32, &mut u, cm, ws, we.wrapping_sub(ws));
-            uds[p].set(u).ok();
-            let f = fof[p] as usize;
-            if rem[f].fetch_sub(1, AcqRel) == 1 {
-                let g: Vec<&Vec<UD>> = uds[fst[f]..fst[f + 1]].iter().map(|x| x.get().unwrap()).collect();
-                wud(f, &g);
-            }
-        }
-        let mut a = acc.lock().unwrap();
-        if let Some(cm) = cm {
-            match &mut a.0 {
-                Some(m) => m.merge(&cm),
-                None => a.0 = Some(cm),
-            }
-        }
-        a.1 += 1;
-        if a.1 == nt {
-            let m = a.0.take().unwrap_or_else(|| CampAcc::new(ncamp + 1, d0, nd));
-            drop(a);
-            wcd(m);
-        }
-    });
+            (out, cm)
+        })
+        .collect()
 }
 
 /// Parses one chunk and groups its dedup records by event_id bucket.
@@ -3132,39 +3092,54 @@ fn main() {
     let mf = MoverF::build(&tab);
     pt(4, &mut tm);
 
-    // outputs: written while the person buckets are sessionized
+    // person buckets
+    let d0 = ws.div_euclid(DAY);
+    let nd = if we > ws { ((we - 1).div_euclid(DAY) - d0 + 1) as usize } else { 0 };
+    let results = match ev_out {
+        Evs::L(v) => ev_after(v, dd, ck_tmp, &tab, &mf, ws, we, ncamp, d0, nd, &tick),
+        Evs::W(v) => ev_after(v, dd, ck_tmp, &tab, &mf, ws, we, ncamp, d0, nd, &tick),
+    };
+    tick("sessionized");
+
+    // outputs
+    let tpl = now();
     let names = Names { map: names_map };
     let ud_dir = outd.join("user_daily");
     let cd_dir = outd.join("campaign_daily");
     std::fs::create_dir_all(&ud_dir).unwrap();
     std::fs::create_dir_all(&cd_dir).unwrap();
-    let wrote = AtomicBool::new(false);
-    let wud = |i: usize, g: &[&Vec<UD>]| {
-        if g.iter().any(|x| !x.is_empty()) {
-            wrote.store(true, Relaxed);
+    let mut cm = CampAcc::new(ncamp + 1, d0, nd);
+    let mut ud_groups: Vec<&Vec<UD>> = vec![];
+    for (u, m) in &results {
+        ud_groups.extend(u.iter());
+        cm.merge(m);
+    }
+    let rows = cm.rows();
+    let nf = 16usize;
+    let mut files: Vec<Vec<&Vec<UD>>> = (0..nf).map(|_| vec![]).collect();
+    let mut load = vec![0usize; nf];
+    ud_groups.sort_by_key(|g| std::cmp::Reverse(g.len()));
+    for g in ud_groups {
+        let k = (0..nf).min_by_key(|&k| load[k]).unwrap();
+        load[k] += g.len();
+        files[k].push(g);
+    }
+    let any_rows = files.iter().any(|g| g.iter().any(|x| !x.is_empty()));
+    tspan(19, tpl);
+    rayon::join(
+        || {
+            files.par_iter().enumerate().filter(|(i, g)| g.iter().any(|x| !x.is_empty()) || (*i == 0 && !any_rows)).for_each(|(i, g)| {
+                let tw = now();
+                write_user_daily(&ud_dir.join(format!("part-{i}.parquet")), g, &cat_names, &names);
+                tspan(20, tw);
+            })
+        },
+        || {
             let tw = now();
-            write_user_daily(&ud_dir.join(format!("part-{i}.parquet")), g, &cat_names, &names);
-            tspan(20, tw);
-        }
-    };
-    let wcd = |cm: CampAcc| {
-        let tw = now();
-        let rows = cm.rows();
-        write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows, &camp_names, &channels);
-        tspan(21, tw);
-    };
-
-    // person buckets
-    let d0 = ws.div_euclid(DAY);
-    let nd = if we > ws { ((we - 1).div_euclid(DAY) - d0 + 1) as usize } else { 0 };
-    match ev_out {
-        Evs::L(v) => ev_after(v, dd, ck_tmp, &tab, &mf, ws, we, ncamp, d0, nd, &tick, &wud, &wcd),
-        Evs::W(v) => ev_after(v, dd, ck_tmp, &tab, &mf, ws, we, ncamp, d0, nd, &tick, &wud, &wcd),
-    }
-    if !wrote.load(Relaxed) {
-        // no rows at all: one empty user_daily file
-        write_user_daily(&ud_dir.join("part-0.parquet"), &[], &cat_names, &names);
-    }
+            write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows, &camp_names, &channels);
+            tspan(21, tw);
+        },
+    );
     tick("written");
     if timing {
         let v: Vec<String> = (0..12).map(|i| format!("{}={:.2}", PROF_NAMES[i], PROF[i].load(Relaxed) as f64 / 1e9)).collect();
