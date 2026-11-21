@@ -2724,6 +2724,8 @@ struct EvChunk<E> {
     m: Vec<E>,
     d: Vec<DRec>,
     doff: Vec<u32>,
+    /// the line of each dense record (d[..doff[ndb]]), scattered with it
+    de: Vec<E>,
     fb: Vec<(u64, i64, u32)>,
     fbn: Vec<(u64, u64)>,
     side: Vec<(u32, i64)>,
@@ -2742,6 +2744,12 @@ fn ev_after<E: Ev>(
     nd: usize,
     tick: &dyn Fn(&str),
 ) -> Vec<(Vec<Vec<UD>>, CampAcc)> {
+    if let Some(cfg) = idx_cfg() {
+        static NOB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*NOB.get_or_init(|| std::env::var_os("SHOP_NOB").is_some()) {
+            return ev_after_idx(ev_out, tab, mf, click_out, ws, we, ncamp, d0, nd, tick, cfg);
+        }
+    }
     // dedup on event_id: every line has a global index (chunk base + its index in the chunk);
     // each event_id's losers are marked in the dead bitmap. Each task takes DDG consecutive
     // event_id buckets, one small (L2-sized) table at a time.
@@ -2988,6 +2996,471 @@ fn ev_after<E: Ev>(
         .collect()
 }
 
+// ---------- dense-index pipeline after the parse ----------
+// With dense event indices, the winners of each dense bucket are emitted in index order, which
+// is the generator's order: a person's events then mostly arrive as one run already sorted by
+// ts. The sessionizer sorts only the persons that do not (process_runs). Exact for any input:
+// the order of the lines only decides the speed.
+
+/// Last few (user key, person key) pairs: lines in index order mostly repeat a user.
+struct PkCache {
+    k: [u64; 4],
+    p: [u64; 4],
+    n: usize,
+}
+
+#[inline(always)]
+fn pk_of(c: &mut PkCache, k: u64, tab: &IdTab, mf: &MoverF) -> u64 {
+    for i in 0..4 {
+        if c.k[i] == k {
+            return c.p[i];
+        }
+    }
+    let p = if mf.hit(k) { tab.get(k) } else { k };
+    c.k[c.n & 3] = k;
+    c.p[c.n & 3] = p;
+    c.n += 1;
+    p
+}
+
+/// Groups kept lines (person keys set) by person bucket, keeping their order inside a bucket.
+fn pb_scatter<E: Ev>(em: &[E]) -> (Vec<E>, Vec<u32>) {
+    let mut cnt = vec![0u32; PB + 1];
+    for e in em {
+        cnt[pbk(e.key()) + 1] += 1;
+    }
+    for p in 0..PB {
+        cnt[p + 1] += cnt[p];
+    }
+    let tot = cnt[PB] as usize;
+    let mut out: Vec<E> = Vec::with_capacity(tot);
+    {
+        let mut w = cnt.clone();
+        let sp = out.spare_capacity_mut();
+        for e in em {
+            let p = pbk(e.key());
+            sp[w[p] as usize].write(*e);
+            w[p] += 1;
+        }
+    }
+    unsafe { out.set_len(tot) };
+    (out, cnt)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ev_after_idx<E: Ev>(
+    ev_out: Vec<EvChunk<E>>,
+    tab: &IdTab,
+    mf: &MoverF,
+    click_out: &[(Vec<ClickRec>, Vec<u32>)],
+    ws: i64,
+    we: i64,
+    ncamp: usize,
+    d0: i64,
+    nd: usize,
+    tick: &dyn Fn(&str),
+    cfg: IdxCfg,
+) -> Vec<(Vec<Vec<UD>>, CampAcc)> {
+    let _ = we;
+    let ndb = cfg.ndb;
+    let mut mbase: Vec<u32> = Vec::with_capacity(ev_out.len() + 1);
+    let mut acc = 0usize;
+    for c in &ev_out {
+        mbase.push(acc as u32);
+        acc += c.m.len();
+    }
+    assert!(acc < u32::MAX as usize);
+    mbase.push(acc as u32);
+    if TIMING.load(Relaxed) {
+        let dense: usize = ev_out.iter().map(|c| c.doff[ndb] as usize).sum();
+        let all: usize = ev_out.iter().map(|c| c.d.len() + c.fb.len()).sum();
+        tick(&format!("idx dense records {dense} of {all} ({:.5})", dense as f64 / all.max(1) as f64));
+    }
+    let parts: Vec<(Vec<E>, Vec<u32>)> = {
+        let side_any = ev_out.iter().any(|c| !c.side.is_empty());
+        let ibase = ws.div_euclid(1000);
+        // exact ingest of line g with key k (only needed on key ties when some key is inexact)
+        let exact = |g: u32, k: u32| -> i64 {
+            let c = mbase.partition_point(|&b| b <= g) - 1;
+            let loc = g - mbase[c];
+            let sd = &ev_out[c].side;
+            match sd.binary_search_by_key(&loc, |x| x.0) {
+                Ok(i) => sd[i].1,
+                Err(_) => (k as i64 - IOFF + ibase) * 1000,
+            }
+        };
+        let line = |g: u32| -> E {
+            let c = mbase.partition_point(|&b| b <= g) - 1;
+            ev_out[c].m[(g - mbase[c]) as usize]
+        };
+        let (mut parts, rest) = rayon::join(
+            || {
+                // dense buckets: one slot per index; the slot keeps the winning copy (smallest
+                // ingest), then the slots are read in index order
+                const G: usize = 4;
+                let span = 1usize << cfg.sh;
+                let mask = span as u64 - 1;
+                (0..ndb.div_ceil(G))
+                    .into_par_iter()
+                    .map(|g| {
+                        let mut tm = now();
+                        let mut t: Vec<u64> = vec![u64::MAX; span];
+                        let mut lb: Vec<E> = Vec::new();
+                        let mut lg: Vec<u32> = Vec::new();
+                        let mut em: Vec<E> = Vec::new();
+                        let mut pc = PkCache { k: [0; 4], p: [0; 4], n: 0 };
+                        for b in g * G..((g + 1) * G).min(ndb) {
+                            lb.clear();
+                            lg.clear();
+                            for (ci, c) in ev_out.iter().enumerate() {
+                                let mb = mbase[ci];
+                                let (s, e) = (c.doff[b] as usize, c.doff[b + 1] as usize);
+                                for (r, x) in c.d[s..e].iter().zip(&c.de[s..e]) {
+                                    let q = lb.len() as u32;
+                                    lb.push(*x);
+                                    if side_any {
+                                        lg.push(mb + r.loc);
+                                    }
+                                    let pk = ((r.ing as u64) << 32) | q as u64;
+                                    // SAFETY: the slot index is masked to span
+                                    let o = unsafe { t.get_unchecked_mut((r.eid & mask) as usize) };
+                                    if *o == u64::MAX {
+                                        *o = pk;
+                                        continue;
+                                    }
+                                    let ok = (*o >> 32) as u32;
+                                    if r.ing < ok
+                                        || (r.ing == ok
+                                            && side_any
+                                            && exact(lg[q as usize], r.ing) < exact(lg[*o as u32 as usize], ok))
+                                    {
+                                        *o = pk;
+                                    }
+                                }
+                            }
+                            pt(2, &mut tm);
+                            if !lb.is_empty() {
+                                for o in t.iter_mut() {
+                                    if *o != u64::MAX {
+                                        let mut e = lb[*o as u32 as usize];
+                                        *o = u64::MAX;
+                                        let k = e.key();
+                                        if k != 0 {
+                                            e.set_key(pk_of(&mut pc, k, tab, mf));
+                                            em.push(e);
+                                        }
+                                    }
+                                }
+                            }
+                            pt(4, &mut tm);
+                        }
+                        let r = pb_scatter(&em);
+                        pt(5, &mut tm);
+                        r
+                    })
+                    .collect::<Vec<_>>()
+            },
+            || {
+                // every other event_id: hash buckets by packed id, then exact bytes for the rest
+                let hb: Vec<Vec<E>> = (0..EB / DDG)
+                    .into_par_iter()
+                    .map(|g| {
+                        let mut tm = now();
+                        let mut em: Vec<E> = Vec::new();
+                        let totals: [usize; DDG] = std::array::from_fn(|i| {
+                            ev_out
+                                .iter()
+                                .map(|c| (c.doff[ndb + g * DDG + i + 1] - c.doff[ndb + g * DDG + i]) as usize)
+                                .sum()
+                        });
+                        if totals.iter().all(|&x| x == 0) {
+                            return em;
+                        }
+                        let maxcap = (totals.iter().max().unwrap() * 2).max(16).next_power_of_two();
+                        let mut tbuf: Vec<[u64; 2]> = vec![[0, 0]; maxcap];
+                        for (i, &total) in totals.iter().enumerate() {
+                            if total == 0 {
+                                continue;
+                            }
+                            let b = ndb + g * DDG + i;
+                            let cap = (total * 2).max(16).next_power_of_two();
+                            let mask = cap - 1;
+                            let t = &mut tbuf[..cap];
+                            t.fill([0, 0]);
+                            for (ci, c) in ev_out.iter().enumerate() {
+                                let mb = mbase[ci];
+                                for r in &c.d[c.doff[b] as usize..c.doff[b + 1] as usize] {
+                                    let gi = mb + r.loc;
+                                    let pk = ((r.ing as u64) << 32) | gi as u64;
+                                    let mut p = (mix(r.eid) >> 8) as usize & mask;
+                                    loop {
+                                        // SAFETY: p is masked to cap
+                                        let o = unsafe { t.get_unchecked_mut(p) };
+                                        if o[0] == 0 {
+                                            *o = [r.eid, pk];
+                                            break;
+                                        }
+                                        if o[0] == r.eid {
+                                            let ok = (o[1] >> 32) as u32;
+                                            let og = o[1] as u32;
+                                            if r.ing < ok || (r.ing == ok && side_any && exact(gi, r.ing) < exact(og, ok)) {
+                                                o[1] = pk;
+                                            }
+                                            break;
+                                        }
+                                        p = (p + 1) & mask;
+                                    }
+                                }
+                            }
+                            for o in t.iter() {
+                                if o[0] != 0 {
+                                    em.push(line(o[1] as u32));
+                                }
+                            }
+                        }
+                        pt(2, &mut tm);
+                        em
+                    })
+                    .collect();
+                let mut tm = now();
+                let mut m: AHashMap<B, (i64, u32)> = AHashMap::new();
+                for (ci, c) in ev_out.iter().enumerate() {
+                    for &(e, ing, loc) in &c.fb {
+                        let gi = mbase[ci] + loc;
+                        match m.get_mut(unpack(e)) {
+                            Some(o) => {
+                                if ing < o.0 {
+                                    *o = (ing, gi);
+                                }
+                            }
+                            None => {
+                                m.insert(unpack(e), (ing, gi));
+                            }
+                        }
+                    }
+                }
+                let mut em: Vec<E> = hb.into_iter().flatten().collect();
+                em.extend(m.values().map(|&(_, g)| line(g)));
+                pt(3, &mut tm);
+                let mut pc = PkCache { k: [0; 4], p: [0; 4], n: 0 };
+                em.retain_mut(|e| {
+                    let k = e.key();
+                    if k == 0 {
+                        return false;
+                    }
+                    e.set_key(pk_of(&mut pc, k, tab, mf));
+                    true
+                });
+                let r = pb_scatter(&em);
+                pt(5, &mut tm);
+                r
+            },
+        );
+        parts.push(rest);
+        parts
+    };
+    drop(ev_out);
+    tick("dedup done");
+
+    let ngroups = (rayon::current_num_threads() * 4).clamp(1, PB);
+    let per = PB.div_ceil(ngroups);
+    (0..ngroups)
+        .into_par_iter()
+        .map(|g| {
+            let mut cm = CampAcc::new(ncamp + 1, d0, nd);
+            let mut win = Win { cnt: vec![0; ncamp + 1], pos: vec![0; ncamp + 1], active: vec![] };
+            let mut out = vec![];
+            let mut evs: Vec<E> = vec![];
+            let mut tmp: Vec<E> = vec![];
+            let mut runs: Vec<Run> = vec![];
+            let mut cnt: Vec<u32> = vec![];
+            let mut cl: Vec<ClickRec> = vec![];
+            let mut ctmp: Vec<ClickRec> = vec![];
+            for p in g * per..((g + 1) * per).min(PB) {
+                let mut tm = now();
+                cl.clear();
+                for (v, o) in click_out.iter() {
+                    cl.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
+                }
+                evs.clear();
+                for (v, o) in parts.iter() {
+                    evs.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
+                }
+                pt(6, &mut tm);
+                let mut uds = Vec::new();
+                process_runs(&evs, &mut tmp, &mut runs, &mut cnt, &mut cl, &mut ctmp, &mut win, ncamp as u32, &mut uds, &mut cm, ws);
+                out.push(uds);
+            }
+            (out, cm)
+        })
+        .collect()
+}
+
+/// A stretch of one person's lines in a bucket: digit, person key, start, length, ts sorted.
+#[derive(Clone, Copy)]
+struct Run {
+    d: u32,
+    k: u64,
+    s: u32,
+    l: u32,
+    ok: bool,
+}
+
+/// process_bucket for lines that arrive mostly as one ts-sorted run per person: the runs are
+/// ordered by (digit, key); a person given as one sorted run is sessionized in place, any other
+/// person (several runs, or a run out of ts order) is gathered and sorted by ts first.
+#[allow(clippy::too_many_arguments)]
+fn process_runs<E: Ev>(
+    evs: &[E],
+    tmp: &mut Vec<E>,
+    runs: &mut Vec<Run>,
+    cnt: &mut Vec<u32>,
+    clicks: &mut Vec<ClickRec>,
+    ctmp: &mut Vec<ClickRec>,
+    win: &mut Win,
+    organic: u32,
+    uds: &mut Vec<UD>,
+    cm: &mut CampAcc,
+    base: i64,
+) {
+    let mut tm = now();
+    runs.clear();
+    let n = evs.len();
+    let mut i = 0;
+    while i < n {
+        let k = evs[i].key();
+        let mut ok = true;
+        let mut j = i + 1;
+        while j < n && evs[j].key() == k {
+            ok &= evs[j].rts() >= evs[j - 1].rts();
+            j += 1;
+        }
+        runs.push(Run { d: dg(k) as u32, k, s: i as u32, l: (j - i) as u32, ok });
+        i = j;
+    }
+    runs.sort_unstable_by_key(|r| (r.d, r.k, r.s));
+    pt(7, &mut tm);
+    sort_clicks(clicks, ctmp, cnt);
+    pt(11, &mut tm);
+    let mut ci = 0;
+    let mut day = DayAcc { key: 0, day: 0, sessions: 0, events: 0, rev: 0, cats: vec![] };
+    let mut a = 0;
+    while a < runs.len() {
+        let pid = runs[a].k;
+        let pd = runs[a].d as usize;
+        let mut b = a + 1;
+        while b < runs.len() && runs[b].k == pid {
+            b += 1;
+        }
+        let pes: &[E] = if b == a + 1 && runs[a].ok {
+            &evs[runs[a].s as usize..(runs[a].s + runs[a].l) as usize]
+        } else {
+            tmp.clear();
+            for r in &runs[a..b] {
+                tmp.extend_from_slice(&evs[r.s as usize..(r.s + r.l) as usize]);
+            }
+            tmp.sort_unstable_by_key(|e| e.rts());
+            &tmp[..]
+        };
+        while ci < clicks.len() && (dg(clicks[ci].key), clicks[ci].key) < (pd, pid) {
+            ci += 1;
+        }
+        let mut cj = ci;
+        while cj < clicks.len() && clicks[cj].key == pid {
+            cj += 1;
+        }
+        person_sess(pes, pid, &clicks[ci..cj], win, organic, &mut day, uds, cm, base);
+        ci = cj;
+        a = b;
+    }
+    pt(8, &mut tm);
+}
+
+/// Sessions of one person (lines sorted by ts, clicks sorted by ts); the loop body of
+/// process_bucket.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn person_sess<E: Ev>(
+    pes: &[E],
+    pid: u64,
+    cs: &[ClickRec],
+    win: &mut Win,
+    organic: u32,
+    day: &mut DayAcc,
+    uds: &mut Vec<UD>,
+    cm: &mut CampAcc,
+    base: i64,
+) {
+    let (mut lo, mut hi) = (0usize, 0usize);
+    day.key = pid;
+    day.day = 0;
+    let mut prev = 0i64;
+    let mut first = true;
+    let mut s_camp = 0u32;
+    let mut s_day = 0i64;
+    let mut s_rev = 0u64;
+    let mut s_purch = false;
+    let mut in_sess = false;
+    for e in pes {
+        let et = e.rts() as i64 + base;
+        if first || et - prev > GAP {
+            if in_sess {
+                cm.sess(s_camp, s_day, s_purch, s_rev);
+            }
+            first = false;
+            in_sess = true;
+            let s = et;
+            let d = s.div_euclid(DAY);
+            s_day = d;
+            s_rev = 0;
+            s_purch = false;
+            while hi < cs.len() && cs[hi].ts <= s {
+                win.add(cs[hi].camp);
+                hi += 1;
+            }
+            while lo < hi && cs[lo].ts < s - WEEK {
+                win.remove(cs[lo].camp);
+                lo += 1;
+            }
+            s_camp = if hi > lo {
+                let t = cs[hi - 1].ts;
+                let mut g = hi - 1;
+                while g > lo && cs[g - 1].ts == t {
+                    g -= 1;
+                }
+                cs[g].camp
+            } else {
+                organic
+            };
+            cm.touch(&win.active, d);
+            if day.day != d {
+                flush_day(day, uds);
+                day.day = d;
+            }
+            day.sessions += 1;
+        }
+        prev = et;
+        day.events += 1;
+        if let Some((p, ecat)) = e.pc() {
+            day.rev += p;
+            s_rev += p;
+            s_purch = true;
+            match day.cats.iter_mut().find(|x| x.0 == ecat) {
+                Some(x) => x.1 += p,
+                None => day.cats.push((ecat, p)),
+            }
+        }
+    }
+    if in_sess {
+        cm.sess(s_camp, s_day, s_purch, s_rev);
+    }
+    flush_day(day, uds);
+    for &c in &win.active {
+        win.cnt[c as usize] = 0;
+    }
+    win.active.clear();
+}
+
 // ---------- generator event ids -> dense indices ----------
 // The published generator writes an event_id as 'e' + base36(scramble(index)), a 40-bit
 // scramble with a per-dataset key. The key is recovered at run time from the first IDs of the
@@ -3125,7 +3598,7 @@ fn idx_find(ev_files: &[B], ev_chunks: &[B]) -> Option<IdxCfg> {
 /// Groups a chunk's dedup records by bucket: a record whose event_id decodes to an index below
 /// the bound goes to dense bucket index >> sh with eid replaced by the index; the rest go to the
 /// event_id hash buckets after the ndb dense ones. Order within a bucket stays the line order.
-fn idx_split(mut d: Vec<DRec>, cfg: &IdxCfg) -> (Vec<DRec>, Vec<u32>) {
+fn idx_split<E: Ev>(mut d: Vec<DRec>, m: &[E], cfg: &IdxCfg) -> (Vec<DRec>, Vec<u32>, Vec<E>) {
     let nb = cfg.ndb + EB;
     let mut cnt = vec![0u32; nb + 1];
     let mut bk: Vec<u32> = Vec::with_capacity(d.len());
@@ -3145,15 +3618,25 @@ fn idx_split(mut d: Vec<DRec>, cfg: &IdxCfg) -> (Vec<DRec>, Vec<u32>) {
     }
     let mut w = cnt.clone();
     let mut out: Vec<DRec> = Vec::with_capacity(d.len());
+    let nde = cnt[cfg.ndb] as usize;
+    let mut de: Vec<E> = Vec::with_capacity(nde);
     {
         let sp = out.spare_capacity_mut();
+        let dsp = de.spare_capacity_mut();
         for (x, &b) in d.iter().zip(&bk) {
-            sp[w[b as usize] as usize].write(*x);
+            let q = w[b as usize] as usize;
+            sp[q].write(*x);
+            if (b as usize) < cfg.ndb {
+                dsp[q].write(m[x.loc as usize]);
+            }
             w[b as usize] += 1;
         }
     }
-    unsafe { out.set_len(d.len()) };
-    (out, cnt)
+    unsafe {
+        out.set_len(d.len());
+        de.set_len(nde);
+    }
+    (out, cnt, de)
 }
 
 /// Parses one chunk and groups its dedup records by event_id bucket.
@@ -3169,12 +3652,15 @@ fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
         parse_events_sol(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
     }
     pt(0, &mut tm);
-    let (d, doff) = match idx_cfg() {
-        Some(cfg) => idx_split(d, &cfg),
-        None => bucketize(&d, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize),
+    let (d, doff, de) = match idx_cfg() {
+        Some(cfg) => idx_split(d, &m, &cfg),
+        None => {
+            let (d, doff) = bucketize(&d, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize);
+            (d, doff, Vec::new())
+        }
     };
     pt(1, &mut tm);
-    EvChunk { m, d, doff, fb, fbn, side }
+    EvChunk { m, d, doff, de, fb, fbn, side }
 }
 
 fn ev_parse<E: Ev>(ev_chunks: &[B], cx: &EvCtx) -> Vec<EvChunk<E>> {
