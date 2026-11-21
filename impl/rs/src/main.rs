@@ -728,6 +728,37 @@ fn chunks(data: B, sz: usize) -> Vec<B> {
     v
 }
 
+#[cfg(target_os = "linux")]
+static INPUT_MAPS: std::sync::Mutex<Vec<&'static memmap2::Mmap>> = std::sync::Mutex::new(Vec::new());
+
+/// SHOP_DROPIN: drop the page-table entries of the input mappings (MADV_DONTNEED) so process teardown has
+/// fewer 4K PTEs to zap. The mappings are private, read-only and file-backed, so any later read of an input
+/// byte just faults the same page back in from the page cache. `par` splits the work over the rayon pool.
+#[cfg(target_os = "linux")]
+fn drop_inputs(par: bool) {
+    let maps: Vec<&'static memmap2::Mmap> = INPUT_MAPS.lock().unwrap().clone();
+    let mut parts: Vec<(&'static memmap2::Mmap, usize, usize)> = vec![];
+    const CH: usize = 64 << 20;
+    for m in maps {
+        let mut o = 0;
+        while o < m.len() {
+            let n = CH.min(m.len() - o);
+            parts.push((m, o, n));
+            o += n;
+        }
+    }
+    let f = |&(m, o, n): &(&'static memmap2::Mmap, usize, usize)| {
+        let _ = unsafe { m.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, o, n) };
+    };
+    if par {
+        parts.par_iter().for_each(f);
+    } else {
+        parts.iter().for_each(f);
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn drop_inputs(_: bool) {}
+
 fn leak_file(p: &Path) -> Option<B> {
     let f = File::open(p).ok()?;
     let len = f.metadata().ok()?.len();
@@ -740,6 +771,8 @@ fn leak_file(p: &Path) -> Option<B> {
         let _ = m.advise(memmap2::Advice::Sequential);
     }
     let m: &'static memmap2::Mmap = Box::leak(Box::new(m));
+    #[cfg(target_os = "linux")]
+    INPUT_MAPS.lock().unwrap().push(m);
     if std::env::var_os("SHOP_TOUCH").is_some() {
         // measurement aid: fault every page in before the timed phases
         let mut acc = 0u8;
@@ -3394,6 +3427,10 @@ fn main() {
         })
         .collect();
     tick("clicks parsed");
+    let dropin = std::env::var("SHOP_DROPIN").unwrap_or_default();
+    if dropin == "bg" {
+        std::thread::spawn(|| drop_inputs(false));
+    }
     match &ev_out {
         Evs::L(v) => fbn_merge(v, &mut names_map),
         Evs::W(v) => fbn_merge(v, &mut names_map),
@@ -3446,6 +3483,14 @@ fn main() {
     }
     if timing {
         eprintln!("epoch main={:.3} end={:.3}", ep0, ep());
+    }
+    if dropin == "end" {
+        let t = ep();
+        drop_inputs(true);
+        if timing {
+            eprintln!("dropin end {:.3}s", ep() - t);
+        }
+        hpa::rusage("dropin");
     }
     // all output files are written and closed; skip freeing the large tables
     std::process::exit(0);
