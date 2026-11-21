@@ -62,6 +62,44 @@ fn mix(k: u64) -> u64 {
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 static TIMING: AtomicBool = AtomicBool::new(false);
+static DT0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static DFIN: std::sync::Mutex<Vec<f64>> = std::sync::Mutex::new(Vec::new());
+fn dfin() {
+    if let Some(t) = DT0.get() {
+        DFIN.lock().unwrap().push(t.elapsed().as_secs_f64());
+    }
+}
+fn dfin_report(what: &str) -> String {
+    let mut v = std::mem::take(&mut *DFIN.lock().unwrap());
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    if v.is_empty() {
+        return format!("fin {what} none");
+    }
+    let q = |f: f64| v[((v.len() - 1) as f64 * f) as usize];
+    format!("fin {what} n={} first={:.3} p50={:.3} p90={:.3} 4th-last={:.3} last={:.3}", v.len(), q(0.0), q(0.5), q(0.9), v[v.len().saturating_sub(4)], q(1.0))
+}
+#[cfg(target_os = "linux")]
+fn cpu_ru() -> String {
+    #[repr(C)]
+    struct Ru {
+        ut: [i64; 2],
+        st: [i64; 2],
+        rest: [i64; 14],
+    }
+    extern "C" {
+        fn getrusage(who: i32, r: *mut Ru) -> i32;
+    }
+    let mut r = MaybeUninit::<Ru>::zeroed();
+    unsafe {
+        getrusage(0, r.as_mut_ptr());
+        let r = r.assume_init();
+        format!(" | u={:.3} s={:.3} minflt={} vcs={} ics={}", r.ut[0] as f64 + r.ut[1] as f64 * 1e-6, r.st[0] as f64 + r.st[1] as f64 * 1e-6, r.rest[4], r.rest[12], r.rest[13])
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn cpu_ru() -> String {
+    String::new()
+}
 static PROF: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 const PROF_NAMES: [&str; 13] =
     ["ev.scan", "ev.bucket", "dd.table", "dd.collect", "dd.resolve", "dd.bucket", "ss.gather", "ss.sort", "ss.proc", "ck.scan", "ck.res", "ss.csort", "wr.ud"];
@@ -1107,6 +1145,7 @@ impl MoverF {
     fn build(tab: &IdTab) -> Self {
         Self::build_with(tab, UKEYC.get().copied().flatten())
     }
+    #[inline(never)]
     fn build_with(tab: &IdTab, ukey: Option<u64>) -> Self {
         let nw = (tab.s.len() / 16).max(1);
         let w: Vec<AtomicU64> = (0..nw).map(|_| AtomicU64::new(0)).collect();
@@ -1737,6 +1776,7 @@ fn bucketize<T: Copy>(v: &[T], nb: usize, bk: impl Fn(&T) -> usize) -> (Vec<T>, 
 
 /// `bucketize` when the bucket counts are already known: `cnt[b + 1]` = the number of items in
 /// bucket `b` (`cnt[0]` = 0); returns (vec ordered by bucket, offsets[nb+1]).
+#[inline(never)]
 fn scatter_counted<T: Copy>(v: &[T], mut cnt: Vec<u32>, bk: impl Fn(&T) -> usize) -> (Vec<T>, Vec<u32>) {
     let nb = cnt.len() - 1;
     for i in 0..nb {
@@ -1774,6 +1814,7 @@ struct DayAcc {
     cats: Vec<(u32, u64)>,
 }
 
+#[inline(never)]
 fn flush_day(d: &mut DayAcc, out: &mut Vec<UD>) {
     if d.sessions == 0 {
         return;
@@ -1878,7 +1919,7 @@ impl CampAcc {
         }
     }
     /// One touch for every campaign in `act` on day d.
-    #[inline(always)]
+    #[inline(never)]
     fn touch(&mut self, act: &[u32], d: i64) {
         match self.di(d) {
             Some(di) => {
@@ -1895,6 +1936,7 @@ impl CampAcc {
             }
         }
     }
+    #[inline(never)]
     fn merge(&mut self, o: &CampAcc) {
         for (a, b) in self.dense.iter_mut().zip(o.dense.iter()) {
             a.s += b.s;
@@ -2136,6 +2178,7 @@ fn click_less(a: &ClickRec, b: &ClickRec) -> bool {
 
 /// Sort clicks by (dg(key), key, ts, click_id bytes): a counting pass on the digit, then a small
 /// sort per range.
+#[inline(never)]
 fn sort_clicks(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Vec<u32>) {
     let n = cl.len();
     if n < 256 {
@@ -2168,6 +2211,7 @@ fn sort_clicks(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Vec<u3
 /// A long digit range is nearly always one heavy clicker. When every click in `src` has the same key,
 /// sort (ts, index) pairs packed into u64s, gather into `out`, then order each run of equal ts by
 /// click_id bytes. Returns false (and leaves `out` alone) for a range with several keys.
+#[inline(never)]
 fn sort_one_clicker(src: &[ClickRec], out: &mut [ClickRec], pk: &mut Vec<u64>) -> bool {
     let m = src.len();
     let k0 = src[0].key;
@@ -2553,6 +2597,7 @@ impl Pqf {
 
 /// An integer column as a range dictionary (`lo..=hi`) with bit-packed `v - lo` indices when the
 /// range is small, else PLAIN. `c.ty` 1 = INT32, 2 = INT64.
+#[inline(never)]
 fn int_col(f: &mut Pqf, c: &mut Cm, rows: &[&[UD]], n: usize, get: impl Fn(&UD) -> i64, lo: i64, hi: i64) {
     let int32 = c.ty == 1;
     if n > 0 && (hi - lo) < (1 << 16) {
@@ -2590,6 +2635,7 @@ fn int_col(f: &mut Pqf, c: &mut Cm, rows: &[&[UD]], n: usize, get: impl Fn(&UD) 
 }
 
 /// Writes one row group of `rows` (a list of row runs, n rows in all); returns its column chunks.
+#[inline(never)]
 fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names) -> Vec<Cm> {
     // pass 1: ranges and counts
     let (mut dlo, mut dhi) = (i64::MAX, i64::MIN);
@@ -2705,6 +2751,7 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
     cols
 }
 
+#[inline(never)]
 fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names) {
     let mut tm = now();
     const RG: usize = 1 << 20;
@@ -3760,6 +3807,7 @@ fn pk_of(c: &mut PkCache, k: u64, tab: &IdTab, mf: &MoverF) -> u64 {
 }
 
 /// Groups kept lines (person keys set) by person bucket, keeping their order inside a bucket.
+#[inline(never)]
 fn pb_scatter<E: Ev>(em: &[E]) -> (Vec<E>, Vec<u32>) {
     let mut cnt = vec![0u32; PB + 1];
     for e in em {
@@ -4028,7 +4076,7 @@ fn ev_after_idx<E: Ev>(
 
     let ngroups = (rayon::current_num_threads() * 4).clamp(1, PB);
     let per = PB.div_ceil(ngroups);
-    (0..ngroups)
+    let res: Vec<_> = (0..ngroups)
         .into_par_iter()
         .map(|g| {
             let mut cm = CampAcc::new(ncamp + 1, d0, nd);
@@ -4055,9 +4103,12 @@ fn ev_after_idx<E: Ev>(
                 process_runs(&evs, &mut tmp, &mut runs, &mut cnt, &mut cl, &mut ctmp, &mut win, ncamp as u32, &mut uds, &mut cm, ws);
                 out.push(uds);
             }
+            dfin();
             (out, cm)
         })
-        .collect()
+        .collect();
+    tick(&dfin_report("sess-groups"));
+    res
 }
 
 /// A stretch of one person's lines in a bucket: digit, person key, start, length, ts sorted.
@@ -4074,6 +4125,7 @@ struct Run {
 /// ordered by (digit, key); a person given as one sorted run is sessionized in place, any other
 /// person (several runs, or a run out of ts order) is gathered and sorted by ts first.
 #[allow(clippy::too_many_arguments)]
+#[inline(never)]
 fn process_runs<E: Ev>(
     evs: &[E],
     tmp: &mut Vec<E>,
@@ -4143,7 +4195,7 @@ fn process_runs<E: Ev>(
 /// Sessions of one person (lines sorted by ts, clicks sorted by ts); the loop body of
 /// process_bucket.
 #[allow(clippy::too_many_arguments)]
-#[inline]
+#[inline(never)]
 fn person_sess<E: Ev>(
     pes: &[E],
     pid: u64,
@@ -4605,9 +4657,10 @@ fn main() {
     let timing = std::env::var("SHOP_TIMING").is_ok();
     TIMING.store(timing, Relaxed);
     let t0 = std::time::Instant::now();
+    let _ = DT0.set(t0);
     let tick = |s: &str| {
         if timing {
-            eprintln!("[{:.2}s] {}", t0.elapsed().as_secs_f64(), s);
+            eprintln!("[{:.3}s] {}{}", t0.elapsed().as_secs_f64(), s, cpu_ru());
         }
         hpa::diag(s);
     };
@@ -4959,6 +5012,7 @@ fn main() {
     let mut tm = now();
     let mf = MoverF::build(&tab);
     pt(4, &mut tm);
+    tick("mf built");
     let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_chunks
         .par_iter()
         .map(|&c| {
@@ -4995,14 +5049,17 @@ fn main() {
             drop(hit);
             let r = scatter_counted(&tmp, cnt, |x| pbk(x.key));
             pt(10, &mut tm);
+            dfin();
             r
         })
         .collect();
+    tick(&dfin_report("clicks"));
     tick("clicks parsed");
     match &ev_out {
         Evs::L(v) => fbn_merge(v, &mut names_map),
         Evs::W(v) => fbn_merge(v, &mut names_map),
     }
+    tick("fbn merged");
 
     // person buckets
     let d0 = ws.div_euclid(DAY);
@@ -5036,14 +5093,17 @@ fn main() {
         files[k].push(g);
     }
     let any_rows = files.iter().any(|g| g.iter().any(|x| !x.is_empty()));
+    tick("write prep");
     rayon::join(
         || {
             files.par_iter().enumerate().filter(|(i, g)| g.iter().any(|x| !x.is_empty()) || (*i == 0 && !any_rows)).for_each(|(i, g)| {
                 write_user_daily(&ud_dir.join(format!("part-{i}.parquet")), g, &cat_names, &names);
+                dfin();
             })
         },
         || write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows, &camp_names, &channels),
     );
+    tick(&dfin_report("write"));
     tick("written");
     if timing {
         let v: Vec<String> = (0..PROF.len()).map(|i| format!("{}={:.2}", PROF_NAMES[i], PROF[i].load(Relaxed) as f64 / 1e9)).collect();
