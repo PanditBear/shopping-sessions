@@ -14,3 +14,4 @@ time,event,ticket,branch,dev,holdout,runtime_s,board,commit,note
 2026-11-20 20:11:06,board,,,,,,1.40,1698b09f45,dd2 no change on scorer (BB-0B99C34F)
 2026-11-20 21:12:20,land,D-fast,fast,1.0,1.0,44.169,,b9737a4d22,
 2026-11-20 21:18:19,board,,,,,,1.30,b3571a6e5e,f6+f8 b3571a6
+2026-11-20 21:49:01,land,D-ts,ts,1.0,1.0,43.77,,0d1afdddb4,
