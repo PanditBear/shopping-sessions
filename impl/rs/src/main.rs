@@ -703,23 +703,120 @@ const PFD: usize = 12;
 
 // ---------- records ----------
 
-const META_PURCH: u64 = 1 << 56;
-const META_OK: u64 = 1 << 57;
-
+/// Dedup record of one event line: packed event_id, ingest key (`ing32`) and the line's index in
+/// its chunk's record list.
 #[derive(Clone, Copy)]
-struct EvRec {
+struct DRec {
     eid: u64,
-    ingest: i64,
-    uid: u64,
-    ts: i64,
+    ing: u32,
+    loc: u32,
+}
+
+const IOFF: i64 = 1 << 31;
+
+/// Order-preserving 32-bit key of an ingest time (ms): whole seconds from `base_s`, offset by
+/// 2^31 and clamped. `exact` is false when the key does not give the time back exactly (clamped,
+/// or not whole seconds); such records keep their full value on the side.
+#[inline(always)]
+fn ing32(ingest: i64, base_s: i64) -> (u32, bool) {
+    let v = ingest.div_euclid(1000).saturating_sub(base_s).saturating_add(IOFF);
+    let exact = ingest.rem_euclid(1000) == 0 && v > 0 && v < u32::MAX as i64;
+    (v.clamp(0, u32::MAX as i64) as u32, exact)
+}
+
+/// Raw output pointer shared by tasks that write disjoint ranges.
+struct SPtr<T>(*mut T);
+unsafe impl<T> Send for SPtr<T> {}
+unsafe impl<T> Sync for SPtr<T> {}
+impl<T> SPtr<T> {
+    #[inline(always)]
+    fn at(&self, i: usize) -> *mut T {
+        unsafe { self.0.add(i) }
+    }
+}
+
+/// One event line after parsing: user or person key (0 marks a dropped line), ts relative to
+/// the window start, and for a purchase its price (never 0) and category index.
+trait Ev: Copy + Send + Sync {
+    fn nil() -> Self;
+    fn mk(key: u64, rts: u64, price: u32, cat: u32) -> Self;
+    fn key(&self) -> u64;
+    fn set_key(&mut self, k: u64);
+    fn rts(&self) -> u64;
+    /// (price, category) of a purchase
+    fn pc(&self) -> Option<(u64, u32)>;
+}
+
+/// 16-byte record: needs a window of at most 2^32 ms and at most 256 categories.
+#[derive(Clone, Copy)]
+struct EvL {
+    key: u64,
+    ts: u32,
+    meta: u32,
+}
+
+impl Ev for EvL {
+    #[inline(always)]
+    fn nil() -> Self {
+        EvL { key: 0, ts: 0, meta: 0 }
+    }
+    #[inline(always)]
+    fn mk(key: u64, rts: u64, price: u32, cat: u32) -> Self {
+        EvL { key, ts: rts as u32, meta: price | (cat << 24) }
+    }
+    #[inline(always)]
+    fn key(&self) -> u64 {
+        self.key
+    }
+    #[inline(always)]
+    fn set_key(&mut self, k: u64) {
+        self.key = k;
+    }
+    #[inline(always)]
+    fn rts(&self) -> u64 {
+        self.ts as u64
+    }
+    #[inline(always)]
+    fn pc(&self) -> Option<(u64, u32)> {
+        let p = self.meta & 0xFF_FFFF;
+        if p != 0 { Some((p as u64, self.meta >> 24)) } else { None }
+    }
+}
+
+/// 24-byte record for any window and category count.
+#[derive(Clone, Copy)]
+struct EvW {
+    key: u64,
+    ts: u64,
     meta: u64,
 }
 
-#[derive(Clone, Copy)]
-struct EvOut {
-    key: u64,
-    ts: i64,
-    meta: u64,
+impl Ev for EvW {
+    #[inline(always)]
+    fn nil() -> Self {
+        EvW { key: 0, ts: 0, meta: 0 }
+    }
+    #[inline(always)]
+    fn mk(key: u64, rts: u64, price: u32, cat: u32) -> Self {
+        EvW { key, ts: rts, meta: price as u64 | ((cat as u64) << 24) }
+    }
+    #[inline(always)]
+    fn key(&self) -> u64 {
+        self.key
+    }
+    #[inline(always)]
+    fn set_key(&mut self, k: u64) {
+        self.key = k;
+    }
+    #[inline(always)]
+    fn rts(&self) -> u64 {
+        self.ts
+    }
+    #[inline(always)]
+    fn pc(&self) -> Option<(u64, u32)> {
+        let p = self.meta & 0xFF_FFFF;
+        if p != 0 { Some((p, (self.meta >> 24) as u32)) } else { None }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -881,11 +978,11 @@ impl CampAcc {
 }
 
 #[inline(always)]
-fn k128(e: &EvOut) -> u128 {
-    ((e.key as u128) << 64) | (e.ts as u64 ^ (1u64 << 63)) as u128
+fn k128<E: Ev>(e: &E) -> u128 {
+    ((e.key() as u128) << 64) | e.rts() as u128
 }
 
-fn sort_small(v: &mut [EvOut]) {
+fn sort_small<E: Ev>(v: &mut [E]) {
     if v.len() <= 24 {
         for i in 1..v.len() {
             let x = v[i];
@@ -952,16 +1049,16 @@ fn isort_by<T: Copy>(v: &mut [T], less: impl Fn(&T, &T) -> bool) {
     }
 }
 
-/// Sort by (dg(key), key, ts); equal (key, ts) pairs may end up in any order. `base` is at most
-/// every ts (the window start), `span` bounds ts - base. A counting pass on the digit, then per
+/// Sort by (dg(key), key, ts); equal (key, ts) pairs may end up in any order. `span` bounds
+/// every rts. A counting pass on the digit, then per
 /// range: when the range holds one key, its (ts, index) pairs are sorted as u64s and gathered back.
-fn sort_evs(evs: &mut Vec<EvOut>, tmp: &mut Vec<EvOut>, cnt: &mut Vec<u32>, base: i64, span: i64) {
+fn sort_evs<E: Ev>(evs: &mut [E], tmp: &mut Vec<E>, cnt: &mut Vec<u32>, span: i64) {
     let n = evs.len();
     if n < 256 {
-        evs.sort_unstable_by_key(|e| (dg(e.key), k128(e)));
+        evs.sort_unstable_by_key(|e| (dg(e.key()), k128(e)));
         return;
     }
-    hk_scatter(evs, tmp, cnt, |e| e.key);
+    hk_scatter(evs, tmp, cnt, |e| e.key());
     let fast = span >= 0 && span < (1i64 << 55);
     let mut ks = [0u64; 256];
     let mut st = 0usize;
@@ -972,12 +1069,12 @@ fn sort_evs(evs: &mut Vec<EvOut>, tmp: &mut Vec<EvOut>, cnt: &mut Vec<u32>, base
         if m == 1 {
             evs[st] = r[0];
         } else if m > 1 {
-            let k0 = r[0].key;
+            let k0 = r[0].key();
             let mut same = fast && m <= 256;
             if same {
                 for (i, e) in r.iter().enumerate() {
-                    ks[i] = (((e.ts - base) as u64) << 8) | i as u64;
-                    same &= e.key == k0;
+                    ks[i] = (e.rts() << 8) | i as u64;
+                    same &= e.key() == k0;
                 }
             }
             if same {
@@ -1037,9 +1134,9 @@ fn sort_clicks(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Vec<u3
 }
 
 #[allow(clippy::too_many_arguments)]
-fn process_bucket(
-    evs: &mut Vec<EvOut>,
-    tmp: &mut Vec<EvOut>,
+fn process_bucket<E: Ev>(
+    evs: &mut [E],
+    tmp: &mut Vec<E>,
     cnt: &mut Vec<u32>,
     clicks: &mut Vec<ClickRec>,
     ctmp: &mut Vec<ClickRec>,
@@ -1051,7 +1148,7 @@ fn process_bucket(
     span: i64,
 ) {
     let mut tm = now();
-    sort_evs(evs, tmp, cnt, base, span);
+    sort_evs(evs, tmp, cnt, span);
     pt(7, &mut tm);
     sort_clicks(clicks, ctmp, cnt);
     pt(11, &mut tm);
@@ -1059,10 +1156,10 @@ fn process_bucket(
     let mut i = 0;
     let mut day = DayAcc { key: 0, day: 0, sessions: 0, events: 0, rev: 0, cats: vec![] };
     while i < evs.len() {
-        let pid = evs[i].key;
+        let pid = evs[i].key();
         let pd = dg(pid);
         let mut j = i;
-        while j < evs.len() && evs[j].key == pid {
+        while j < evs.len() && evs[j].key() == pid {
             j += 1;
         }
         while ci < clicks.len() && (dg(clicks[ci].key), clicks[ci].key) < (pd, pid) {
@@ -1084,7 +1181,8 @@ fn process_bucket(
         let mut s_purch = false;
         let mut in_sess = false;
         for e in &evs[i..j] {
-            if first || e.ts - prev > GAP {
+            let et = e.rts() as i64 + base;
+            if first || et - prev > GAP {
                 if in_sess {
                     let en = cm.at(s_camp, s_day);
                     en[0] += 1;
@@ -1093,7 +1191,7 @@ fn process_bucket(
                 }
                 first = false;
                 in_sess = true;
-                let s = e.ts;
+                let s = et;
                 let d = s.div_euclid(DAY);
                 s_day = d;
                 s_rev = 0;
@@ -1125,11 +1223,9 @@ fn process_bucket(
                 }
                 day.sessions += 1;
             }
-            prev = e.ts;
+            prev = et;
             day.events += 1;
-            if e.meta & META_PURCH != 0 {
-                let p = e.meta & 0xFF_FFFF;
-                let ecat = ((e.meta >> 24) & 0xFFFF_FFFF) as u32;
+            if let Some((p, ecat)) = e.pc() {
                 day.rev += p;
                 s_rev += p;
                 s_purch = true;
@@ -1341,13 +1437,15 @@ struct EvCtx<'a> {
     unknown_cat: u32,
     ws: i64,
     we: i64,
+    ibase: i64,
     rs: &'a RandomState,
 }
 
-/// Parses one chunk of event lines: records with a packed event_id go to `flat`, the rest to
-/// `fb`; user ids with no packed key are noted in `fbn` (hash key, packed slice).
+/// Parses one chunk of event lines. Every line with an event_id gets a record in `m` (key 0 when
+/// the line is invalid) and a dedup entry: packed event_id in `d`, others in `fb`; ingest times
+/// with an inexact key go to `side`. User ids with no packed key are noted in `fbn`.
 #[inline(never)]
-fn parse_events(c: B, cx: &EvCtx, flat: &mut Vec<EvRec>, fb: &mut Vec<EvRec>, fbn: &mut Vec<(u64, u64)>) {
+fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>) {
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
     scan::<7>(c, |&[eid, uid, ts, ing, et, pr, price]| {
@@ -1355,7 +1453,7 @@ fn parse_events(c: B, cx: &EvCtx, flat: &mut Vec<EvRec>, fb: &mut Vec<EvRec>, fb
             return;
         }
         let ingest = parse_ts_c(ing, &mut tci).unwrap_or(i64::MAX);
-        let mut r = EvRec { eid: 0, ingest, uid: 0, ts: 0, meta: 0 };
+        let mut r = E::nil();
         'v: {
             if uid.is_empty() || pr.is_empty() {
                 break 'v;
@@ -1369,20 +1467,18 @@ fn parse_events(c: B, cx: &EvCtx, flat: &mut Vec<EvRec>, fb: &mut Vec<EvRec>, fb
                 b"purchase" => true,
                 _ => break 'v,
             };
-            let mut pv = 0u64;
+            let mut pv = 0u32;
             if purch {
                 match parse_price(price) {
-                    Some(p) => pv = p as u64,
+                    Some(p) => pv = p,
                     None => break 'v,
                 }
             }
             if ingest.wrapping_sub(t) > DAY {
                 break 'v;
             }
-            r.ts = t;
-            let cat = cx.prod.get(pr).unwrap_or(cx.unknown_cat) as u64;
-            r.meta = pv | (cat << 24) | META_OK | if purch { META_PURCH } else { 0 };
-            r.uid = match pack6(uid) {
+            let cat = cx.prod.get(pr).unwrap_or(cx.unknown_cat);
+            let key = match pack6(uid) {
                 Some(k) => k,
                 None => {
                     let k = cx.rs.hash_one(uid) | HBIT;
@@ -1390,18 +1486,293 @@ fn parse_events(c: B, cx: &EvCtx, flat: &mut Vec<EvRec>, fb: &mut Vec<EvRec>, fb
                     k
                 }
             };
+            r = E::mk(key, (t - cx.ws) as u64, pv, cat);
+        }
+        let loc = m.len() as u32;
+        m.push(r);
+        let (ik, exact) = ing32(ingest, cx.ibase);
+        if !exact {
+            side.push((loc, ingest));
         }
         match pack6(eid) {
-            Some(k) => {
-                r.eid = k;
-                flat.push(r);
-            }
-            None => {
-                r.eid = pack(eid);
-                fb.push(r);
-            }
+            Some(k) => d.push(DRec { eid: k, ing: ik, loc }),
+            None => fb.push((pack(eid), ingest, loc)),
         }
     });
+}
+
+struct EvChunk<E> {
+    m: Vec<E>,
+    d: Vec<DRec>,
+    doff: Vec<u32>,
+    fb: Vec<(u64, i64, u32)>,
+    fbn: Vec<(u64, u64)>,
+    side: Vec<(u32, i64)>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ev_after<E: Ev>(
+    mut ev_out: Vec<EvChunk<E>>,
+    tab: &IdTab,
+    click_out: &[(Vec<ClickRec>, Vec<u32>)],
+    ws: i64,
+    we: i64,
+    ncamp: usize,
+    d0: i64,
+    nd: usize,
+    tick: &dyn Fn(&str),
+) -> Vec<(Vec<Vec<UD>>, CampAcc)> {
+    // dedup on event_id: every line has a global index (chunk base + its index in the chunk);
+    // each event_id's losers are marked in the dead bitmap. Each task takes DDG consecutive
+    // event_id buckets, one small (L2-sized) table at a time.
+    let mut mbase: Vec<u32> = Vec::with_capacity(ev_out.len() + 1);
+    let mut acc = 0usize;
+    for c in &ev_out {
+        mbase.push(acc as u32);
+        acc += c.m.len();
+    }
+    assert!(acc < u32::MAX as usize);
+    mbase.push(acc as u32);
+    let dead: Vec<AtomicU64> = (0..acc / 64 + 1).map(|_| AtomicU64::new(0)).collect();
+    let kill = |g: u32| {
+        dead[(g >> 6) as usize].fetch_or(1u64 << (g & 63), Relaxed);
+    };
+    {
+        let side_any = ev_out.iter().any(|c| !c.side.is_empty());
+        let ibase = ws.div_euclid(1000);
+        // exact ingest of line g with key k (only needed on key ties when some key is inexact)
+        let exact = |g: u32, k: u32| -> i64 {
+            let c = mbase.partition_point(|&b| b <= g) - 1;
+            let loc = g - mbase[c];
+            let sd = &ev_out[c].side;
+            match sd.binary_search_by_key(&loc, |x| x.0) {
+                Ok(i) => sd[i].1,
+                Err(_) => (k as i64 - IOFF + ibase) * 1000,
+            }
+        };
+        rayon::join(
+            || {
+                (0..EB / DDG).into_par_iter().for_each(|g| {
+                    let mut tm = now();
+                    let totals: [usize; DDG] =
+                        std::array::from_fn(|i| ev_out.iter().map(|c| (c.doff[g * DDG + i + 1] - c.doff[g * DDG + i]) as usize).sum());
+                    let maxcap = (totals.iter().max().unwrap() * 2).max(16).next_power_of_two();
+                    // slot: (event_id, ingest key << 32 | global index of the current winner)
+                    let mut tbuf: Vec<[u64; 2]> = vec![[0, 0]; maxcap];
+                    for (i, &total) in totals.iter().enumerate() {
+                        let b = g * DDG + i;
+                        let cap = (total * 2).max(16).next_power_of_two();
+                        let mask = cap - 1;
+                        let t = &mut tbuf[..cap];
+                        if i > 0 {
+                            t.fill([0, 0]);
+                        }
+                        for (ci, c) in ev_out.iter().enumerate() {
+                            let mb = mbase[ci];
+                            for r in &c.d[c.doff[b] as usize..c.doff[b + 1] as usize] {
+                                let gi = mb + r.loc;
+                                let pk = ((r.ing as u64) << 32) | gi as u64;
+                                let mut p = (mix(r.eid) >> 8) as usize & mask;
+                                loop {
+                                    let o = unsafe { t.get_unchecked_mut(p) };
+                                    if o[0] == 0 {
+                                        *o = [r.eid, pk];
+                                        break;
+                                    }
+                                    if o[0] == r.eid {
+                                        let ok = (o[1] >> 32) as u32;
+                                        let og = o[1] as u32;
+                                        let win = r.ing < ok || (r.ing == ok && side_any && exact(gi, r.ing) < exact(og, ok));
+                                        if win {
+                                            o[1] = pk;
+                                            kill(og);
+                                        } else {
+                                            kill(gi);
+                                        }
+                                        break;
+                                    }
+                                    p = (p + 1) & mask;
+                                }
+                            }
+                        }
+                    }
+                    pt(2, &mut tm);
+                })
+            },
+            || {
+                // events whose event_id has no packed key: exact byte comparison
+                let mut tm = now();
+                let mut m: AHashMap<B, (i64, u32)> = AHashMap::new();
+                for (ci, c) in ev_out.iter().enumerate() {
+                    for &(e, ing, loc) in &c.fb {
+                        let gi = mbase[ci] + loc;
+                        match m.get_mut(unpack(e)) {
+                            Some(o) => {
+                                if ing < o.0 {
+                                    kill(o.1);
+                                    *o = (ing, gi);
+                                } else {
+                                    kill(gi);
+                                }
+                            }
+                            None => {
+                                m.insert(unpack(e), (ing, gi));
+                            }
+                        }
+                    }
+                }
+                pt(3, &mut tm);
+            },
+        );
+    }
+    // kept lines: user key -> person key (0 marks a dropped line), counted per (chunk, bucket)
+    let mut cnts: Vec<Vec<u32>> = ev_out
+        .par_iter_mut()
+        .enumerate()
+        .map(|(ci, c)| {
+            let mut tm = now();
+            let mut cnt = vec![0u32; PB];
+            let mb = mbase[ci] as usize;
+            let m = &mut c.m;
+            let n = m.len();
+            for i in 0..n {
+                if i + PFD < n {
+                    tab.pf(m[i + PFD].key());
+                }
+                let g = mb + i;
+                let k = m[i].key();
+                if k != 0 && dead[g >> 6].load(Relaxed) & (1u64 << (g & 63)) == 0 {
+                    let pk = tab.get(k);
+                    m[i].set_key(pk);
+                    cnt[pbk(pk)] += 1;
+                } else {
+                    m[i].set_key(0);
+                }
+            }
+            pt(4, &mut tm);
+            cnt
+        })
+        .collect();
+    drop(dead);
+    // one scatter of every kept line into a person-bucket-major array
+    let mut bstart = vec![0usize; PB + 1];
+    for p in 0..PB {
+        let mut a = bstart[p];
+        for cnt in cnts.iter_mut() {
+            let x = cnt[p] as usize;
+            cnt[p] = a as u32;
+            a += x;
+        }
+        bstart[p + 1] = a;
+    }
+    let tot = bstart[PB];
+    let mut evg: Vec<E> = Vec::with_capacity(tot);
+    {
+        let gp = SPtr(evg.as_mut_ptr());
+        ev_out.par_iter().zip(cnts.into_par_iter()).for_each(|(c, mut pos)| {
+            let mut tm = now();
+            for e in &c.m {
+                if e.key() != 0 {
+                    let p = pbk(e.key());
+                    unsafe { gp.at(pos[p] as usize).write(*e) };
+                    pos[p] += 1;
+                }
+            }
+            pt(5, &mut tm);
+        });
+    }
+    unsafe { evg.set_len(tot) };
+    drop(ev_out);
+    tick("dedup done");
+
+    let ngroups = (rayon::current_num_threads() * 4).clamp(1, PB);
+    let per = PB.div_ceil(ngroups);
+    let mut gsl: Vec<(usize, &mut [E])> = Vec::with_capacity(ngroups);
+    {
+        let mut rest: &mut [E] = &mut evg;
+        for g in 0..ngroups {
+            let (a, b) = (bstart[(g * per).min(PB)], bstart[((g + 1) * per).min(PB)]);
+            let (x, y) = rest.split_at_mut(b - a);
+            gsl.push((g, x));
+            rest = y;
+        }
+    }
+    gsl
+        .into_par_iter()
+        .map(|(g, sl)| {
+            let mut cm = CampAcc::new(ncamp + 1, d0, nd);
+            let mut win = Win { cnt: vec![0; ncamp + 1], pos: vec![0; ncamp + 1], active: vec![] };
+            let mut out = vec![];
+            let mut tmp: Vec<E> = vec![];
+            let mut cnt: Vec<u32> = vec![];
+            let mut cl: Vec<ClickRec> = vec![];
+            let mut ctmp: Vec<ClickRec> = vec![];
+            let g0 = bstart[(g * per).min(PB)];
+            for p in g * per..((g + 1) * per).min(PB) {
+                let mut tm = now();
+                cl.clear();
+                for (v, o) in click_out.iter() {
+                    cl.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
+                }
+                pt(6, &mut tm);
+                let evs = &mut sl[bstart[p] - g0..bstart[p + 1] - g0];
+                let mut uds = Vec::new();
+                process_bucket(evs, &mut tmp, &mut cnt, &mut cl, &mut ctmp, &mut win, ncamp as u32, &mut uds, &mut cm, ws, we.wrapping_sub(ws));
+                out.push(uds);
+            }
+            (out, cm)
+        })
+        .collect()
+}
+
+fn ev_parse<E: Ev>(ev_chunks: &[B], cx: &EvCtx) -> Vec<EvChunk<E>> {
+    ev_chunks
+        .par_iter()
+        .map(|&c| {
+            let mut m: Vec<E> = Vec::with_capacity(c.len() / 64);
+            let mut d: Vec<DRec> = Vec::with_capacity(c.len() / 64);
+            let (mut fb, mut fbn, mut side) = (vec![], vec![], vec![]);
+            let mut tm = now();
+            parse_events(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
+            pt(0, &mut tm);
+            let (d, doff) = bucketize(&d, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize);
+            pt(1, &mut tm);
+            EvChunk { m, d, doff, fb, fbn, side }
+        })
+        .collect()
+}
+
+/// measurement aid: event parsing alone, serial, into reused buffers
+fn parse_aid<E: Ev>(ev_chunks: &[B], cx: &EvCtx) {
+    let (mut m, mut d): (Vec<E>, Vec<DRec>) = (Vec::with_capacity(CHUNK / 32), Vec::with_capacity(CHUNK / 32));
+    let (mut fb, mut fbn, mut side) = (vec![], vec![], vec![]);
+    for rep in 0..3 {
+        let t = std::time::Instant::now();
+        let mut n = 0usize;
+        for &c in ev_chunks {
+            m.clear();
+            d.clear();
+            fb.clear();
+            fbn.clear();
+            side.clear();
+            parse_events(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
+            n += m.len();
+        }
+        eprintln!("parse rep{} {:.3}s ({} recs)", rep, t.elapsed().as_secs_f64(), n);
+    }
+}
+
+fn fbn_merge<E: Ev>(v: &[EvChunk<E>], names_map: &mut AHashMap<u64, u64>) {
+    for c in v {
+        for &(k, r) in &c.fbn {
+            names_map.entry(k).or_insert(r);
+        }
+    }
+}
+
+enum Evs {
+    L(Vec<EvChunk<EvL>>),
+    W(Vec<EvChunk<EvW>>),
 }
 
 fn main() {
@@ -1442,6 +1813,8 @@ fn main() {
     cat_names.sort();
     cat_names.dedup();
     let unknown_cat = cat_names.binary_search(&(b"unknown" as B)).unwrap() as u32;
+    // 16-byte event records need a window of at most 2^32 ms and at most 256 categories
+    let lean = std::env::var_os("SHOP_WIDE").is_none() && cat_names.len() <= 256 && we.saturating_sub(ws) <= 1i64 << 32;
     // first occurrence wins in a map insert loop? original used insert (last wins); keep last wins
     let mut prod_items: Vec<(B, u32)> = vec![];
     {
@@ -1499,7 +1872,6 @@ fn main() {
         .collect();
     tick("links parsed");
     // links (serial union-find) overlaps the parallel event parse; events do not need the id table
-    type EvChunk = (Vec<EvRec>, Vec<u32>, Vec<EvRec>, Vec<(u64, u64)>);
     let ((tab, mut names_map), ev_out) = rayon::join(
         || {
             let occ: usize = link_pairs.iter().map(|v| v.len()).sum::<usize>() * 2;
@@ -1574,21 +1946,12 @@ fn main() {
         || {
             let ev_files = csv_files(&data.join("events"));
             let ev_chunks = all_chunks(&ev_files, ev_chunk(&ev_files));
-            let cx = EvCtx { prod: &prod, unknown_cat, ws, we, rs: &rs };
+            let cx = EvCtx { prod: &prod, unknown_cat, ws, we, ibase: ws.div_euclid(1000), rs: &rs };
             if std::env::var_os("SHOP_PARSE").is_some() {
-                // measurement aid: event parsing alone, serial, into reused buffers
-                let (mut flat, mut fb, mut fbn) = (Vec::with_capacity(CHUNK / 32), vec![], vec![]);
-                for rep in 0..3 {
-                    let t = std::time::Instant::now();
-                    let mut n = 0usize;
-                    for &c in &ev_chunks {
-                        flat.clear();
-                        fb.clear();
-                        fbn.clear();
-                        parse_events(c, &cx, &mut flat, &mut fb, &mut fbn);
-                        n += flat.len() + fb.len();
-                    }
-                    eprintln!("parse rep{} {:.3}s ({} recs)", rep, t.elapsed().as_secs_f64(), n);
+                if lean {
+                    parse_aid::<EvL>(&ev_chunks, &cx);
+                } else {
+                    parse_aid::<EvW>(&ev_chunks, &cx);
                 }
             }
             if std::env::var_os("SHOP_PARTS").is_some() {
@@ -1671,20 +2034,7 @@ fn main() {
                 }
                 eprintln!("probe memchr-lines {:.3}s ({})", t.elapsed().as_secs_f64(), n);
             }
-            let ev_out: Vec<EvChunk> = ev_chunks
-                .par_iter()
-                .map(|&c| {
-                    let mut flat: Vec<EvRec> = Vec::with_capacity(c.len() / 64);
-                    let mut fb: Vec<EvRec> = vec![];
-                    let mut fbn: Vec<(u64, u64)> = vec![];
-                    let mut tm = now();
-                    parse_events(c, &cx, &mut flat, &mut fb, &mut fbn);
-                    pt(0, &mut tm);
-                    let (v, off) = bucketize(&flat, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize);
-                    pt(1, &mut tm);
-                    (v, off, fb, fbn)
-                })
-                .collect();
+            let ev_out = if lean { Evs::L(ev_parse(&ev_chunks, &cx)) } else { Evs::W(ev_parse(&ev_chunks, &cx)) };
             tick("events parsed");
             ev_out
         },
@@ -1723,153 +2073,18 @@ fn main() {
         })
         .collect();
     tick("clicks parsed");
-    for (_, _, _, fbn) in &ev_out {
-        for &(k, r) in fbn {
-            names_map.entry(k).or_insert(r);
-        }
+    match &ev_out {
+        Evs::L(v) => fbn_merge(v, &mut names_map),
+        Evs::W(v) => fbn_merge(v, &mut names_map),
     }
-
-    let resolve_out = |mut sv: Vec<EvOut>| -> (Vec<EvOut>, Vec<u32>) {
-        let mut tm = now();
-        // drops the records that are not kept (META_OK clear) and maps user keys to person keys
-        let n = sv.len();
-        let mut w = 0;
-        for i in 0..n {
-            if i + PFD < n {
-                tab.pf(sv[i + PFD].key);
-            }
-            let e = sv[i];
-            if e.meta & META_OK != 0 {
-                sv[w] = EvOut { key: tab.get(e.key), ..e };
-                w += 1;
-            }
-        }
-        sv.truncate(w);
-        pt(4, &mut tm);
-        let r = bucketize(&sv, PB, |x| pbk(x.key));
-        pt(5, &mut tm);
-        r
-    };
-
-    // dedup per event_id bucket -> person buckets. Each task takes DDG consecutive event_id
-    // buckets, one small (L2-sized) table at a time, and resolves and buckets them together.
-    let mut dd: Vec<(Vec<EvOut>, Vec<u32>)> = (0..EB / DDG)
-        .into_par_iter()
-        .map(|g| {
-            let mut tm = now();
-            let totals: [usize; DDG] =
-                std::array::from_fn(|i| ev_out.iter().map(|c| (c.1[g * DDG + i + 1] - c.1[g * DDG + i]) as usize).sum());
-            let maxcap = (totals.iter().max().unwrap() * 2).max(16).next_power_of_two();
-            // One pass in record order. Every record is appended to `sv` when it is the first of
-            // its event_id or beats the current one (earlier ingest); the slot keeps the index of
-            // the current one, and a beaten one is cleared (META_OK off). Invalid records go in
-            // already cleared. What stays set is each event_id's winner, in record order.
-            let mut tbuf: Vec<(u64, u32)> = vec![(0, 0); maxcap];
-            let tsum: usize = totals.iter().sum();
-            let mut sv: Vec<EvOut> = Vec::with_capacity(tsum);
-            let mut ing: Vec<i64> = Vec::with_capacity(tsum);
-            for (i, &total) in totals.iter().enumerate() {
-                let b = g * DDG + i;
-                let cap = (total * 2).max(16).next_power_of_two();
-                let mask = cap - 1;
-                let t = &mut tbuf[..cap];
-                if i > 0 {
-                    t.fill((0, 0));
-                }
-                for c in &ev_out {
-                    for r in &c.0[c.1[b] as usize..c.1[b + 1] as usize] {
-                        let mut p = (mix(r.eid) >> 8) as usize & mask;
-                        loop {
-                            let o = unsafe { t.get_unchecked_mut(p) };
-                            if o.0 == 0 {
-                                *o = (r.eid, sv.len() as u32);
-                                break;
-                            }
-                            if o.0 == r.eid {
-                                let j = o.1 as usize;
-                                if r.ingest < ing[j] {
-                                    sv[j].meta = 0;
-                                    o.1 = sv.len() as u32;
-                                } else {
-                                    p = usize::MAX;
-                                }
-                                break;
-                            }
-                            p = (p + 1) & mask;
-                        }
-                        if p != usize::MAX {
-                            sv.push(EvOut { key: r.uid, ts: r.ts, meta: r.meta });
-                            ing.push(r.ingest);
-                        }
-                    }
-                }
-                pt(2, &mut tm);
-            }
-            drop(tbuf);
-            resolve_out(sv)
-        })
-        .collect();
-    {
-        // events whose event_id has no packed key: exact byte comparison
-        let mut m: AHashMap<B, &EvRec> = AHashMap::new();
-        let mut order: Vec<B> = vec![];
-        for c in &ev_out {
-            for r in &c.2 {
-                let k = unpack(r.eid);
-                match m.get_mut(k) {
-                    Some(o) => {
-                        if r.ingest < o.ingest {
-                            *o = r;
-                        }
-                    }
-                    None => {
-                        m.insert(k, r);
-                        order.push(k);
-                    }
-                }
-            }
-        }
-        let sv: Vec<EvOut> =
-            order.iter().map(|k| m[k]).filter(|r| r.meta & META_OK != 0).map(|r| EvOut { key: r.uid, ts: r.ts, meta: r.meta }).collect();
-        dd.push(resolve_out(sv));
-    }
-    drop(ev_out);
-    tick("dedup done");
 
     // person buckets
     let d0 = ws.div_euclid(DAY);
     let nd = if we > ws { ((we - 1).div_euclid(DAY) - d0 + 1) as usize } else { 0 };
-    let ngroups = (rayon::current_num_threads() * 4).clamp(1, PB);
-    let per = PB.div_ceil(ngroups);
-    let results: Vec<(Vec<Vec<UD>>, CampAcc)> = (0..ngroups)
-        .into_par_iter()
-        .map(|g| {
-            let mut cm = CampAcc::new(ncamp + 1, d0, nd);
-            let mut win = Win { cnt: vec![0; ncamp + 1], pos: vec![0; ncamp + 1], active: vec![] };
-            let mut out = vec![];
-            let mut evs: Vec<EvOut> = vec![];
-            let mut tmp: Vec<EvOut> = vec![];
-            let mut cnt: Vec<u32> = vec![];
-            let mut cl: Vec<ClickRec> = vec![];
-            let mut ctmp: Vec<ClickRec> = vec![];
-            for p in g * per..((g + 1) * per).min(PB) {
-                let mut tm = now();
-                evs.clear();
-                cl.clear();
-                for (v, o) in &dd {
-                    evs.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
-                }
-                for (v, o) in &click_out {
-                    cl.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
-                }
-                pt(6, &mut tm);
-                let mut uds = Vec::new();
-                process_bucket(&mut evs, &mut tmp, &mut cnt, &mut cl, &mut ctmp, &mut win, ncamp as u32, &mut uds, &mut cm, ws, we.wrapping_sub(ws));
-                out.push(uds);
-            }
-            (out, cm)
-        })
-        .collect();
+    let results = match ev_out {
+        Evs::L(v) => ev_after(v, &tab, &click_out, ws, we, ncamp, d0, nd, &tick),
+        Evs::W(v) => ev_after(v, &tab, &click_out, ws, we, ncamp, d0, nd, &tick),
+    };
     tick("sessionized");
 
     // outputs
