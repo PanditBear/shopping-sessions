@@ -1098,7 +1098,7 @@ impl IdTab {
 /// keys whose person key is not the key itself. It has no false negatives, so a key that misses it
 /// maps to itself and needs no table lookup.
 struct MoverF {
-    w: Vec<AtomicU64>,
+    w: Vec<u64>,
     mask: usize,
     /// movers of generator-form user IDs by generator person, when the user_id key is known
     g: Option<GpTab>,
@@ -1109,24 +1109,63 @@ impl MoverF {
     }
     fn build_with(tab: &IdTab, ukey: Option<u64>) -> Self {
         let nw = (tab.s.len() / 16).max(1);
-        let w: Vec<AtomicU64> = (0..nw).map(|_| AtomicU64::new(0)).collect();
         let gn = if ukey.is_some() { 2 * tab.mov + (1 << 16) } else { 0 };
-        let mut ge = vec![0u64; 2 * gn];
-        {
-            // SAFETY: AtomicU64 has the same in-memory representation as u64
-            let ga = unsafe { &*(ge.as_mut_slice() as *mut [u64] as *const [AtomicU64]) };
-            tab.s.par_chunks(1 << 15).for_each(|c| {
+        // Without atomics: each table chunk lists its movers' filter hashes and person-table
+        // entries grouped by destination range (512 KB of filter words or of person words), then
+        // each range is filled by one task with plain writes that stay in cache.
+        const WR: u32 = 16;
+        const GR: u32 = 15;
+        let (nwr, ngr) = ((nw + (1 << WR) - 1) >> WR, (gn + (1 << GR) - 1) >> GR);
+        let parts: Vec<((Vec<u64>, Vec<u32>), (Vec<[u64; 2]>, Vec<u32>))> = tab
+            .s
+            .par_chunks(1 << 15)
+            .map(|c| {
+                let (mut h, mut g) = (Vec::new(), Vec::new());
                 for e in c {
                     if e[0] != 0 && e[0] != e[1] {
-                        let h = mix(e[0]);
-                        w[h as usize & (nw - 1)].fetch_or(Self::bits(h), Relaxed);
+                        h.push(mix(e[0]));
                         if let Some(key) = ukey {
-                            GpTab::add(ga, gn, key, e[0], e[1]);
+                            if let Some(v) = gen_val(e[0], UPRE) {
+                                let idx = gen_idx(v, key);
+                                if idx & 511 < GPA && ((idx >> 9) as usize) < gn {
+                                    // person key, then generator person * 16 + alias
+                                    g.push([e[1], (idx >> 9) << 4 | (idx & 511)]);
+                                }
+                            }
                         }
                     }
                 }
-            });
-        }
+                (bucketize(&h, nwr, |&x| (x as usize & (nw - 1)) >> WR), bucketize(&g, ngr, |x| (x[1] >> (4 + GR)) as usize))
+            })
+            .collect();
+        let mut w = vec![0u64; nw];
+        let mut ge = vec![0u64; 2 * gn];
+        rayon::join(
+            || {
+                w.par_chunks_mut(1 << WR).enumerate().for_each(|(r, ws)| {
+                    for ((hv, ho), _) in &parts {
+                        for &h in &hv[ho[r] as usize..ho[r + 1] as usize] {
+                            ws[h as usize & (nw - 1) & ((1 << WR) - 1)] |= Self::bits(h);
+                        }
+                    }
+                })
+            },
+            || {
+                ge.par_chunks_mut(2 << GR).enumerate().for_each(|(r, gs)| {
+                    for (_, (gv, go)) in &parts {
+                        for x in &gv[go[r] as usize..go[r + 1] as usize] {
+                            let l = 2 * ((x[1] >> 4) as usize & ((1 << GR) - 1));
+                            let (p, m) = (gs[l], gs[l + 1]);
+                            if p == 0 {
+                                gs[l] = x[0];
+                            }
+                            let mixed = ((p != 0 && p != x[0]) as u64) << 63;
+                            gs[l + 1] = m | mixed | (1 << (x[1] & 15));
+                        }
+                    }
+                })
+            },
+        );
         let g = ukey.map(|key| GpTab { key, n: gn, e: ge });
         MoverF { w, mask: nw - 1, g }
     }
@@ -1154,7 +1193,7 @@ impl MoverF {
     fn hit(&self, k: u64) -> bool {
         let h = mix(k);
         let b = Self::bits(h);
-        unsafe { self.w.get_unchecked(h as usize & self.mask) }.load(Relaxed) & b == b
+        (unsafe { *self.w.get_unchecked(h as usize & self.mask) }) & b == b
     }
 }
 
@@ -1174,21 +1213,6 @@ const GPA: u64 = 16;
 /// pack6 code of 'u'
 const UPRE: u64 = 58;
 impl GpTab {
-    #[inline(always)]
-    fn add(ga: &[AtomicU64], n: usize, key: u64, k: u64, p: u64) {
-        let Some(v) = gen_val(k, UPRE) else { return };
-        let idx = gen_idx(v, key);
-        let (gp, a) = ((idx >> 9) as usize, idx & 511);
-        if a >= GPA || gp >= n {
-            return;
-        }
-        if let Err(o) = ga[2 * gp].compare_exchange(0, p, Relaxed, Relaxed) {
-            if o != p {
-                ga[2 * gp + 1].fetch_or(1 << 63, Relaxed);
-            }
-        }
-        ga[2 * gp + 1].fetch_or(1 << a, Relaxed);
-    }
     /// person key of user key k, or None when the filter and table must answer
     #[inline(always)]
     fn get(&self, k: u64) -> Option<u64> {
