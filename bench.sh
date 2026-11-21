@@ -262,7 +262,7 @@ SAMP
         -v $W/data:/data:ro -v $out:/output -v $scr:/scratch \
         -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
         -e NCPU=$CPUS -e SHOP_TIMING=1 ${IMGS[0]} 2>$W/xerr.txt
-      t1=$(date +%s.%N); sudo touch $sf; wait
+      t1=$(date +%s.%N); touch $sf; wait
       fa=$(ep "$(docker inspect -f '{{.State.FinishedAt}}' $nm)"); docker rm $nm >/dev/null
       ee=$(grep -o 'end=[0-9.]*' $W/xerr.txt | cut -d= -f2)
       printf 'xs %s %.3f %.3f samples %s\n' $v "$(echo "$fa - $ee" | bc)" "$(echo "$t1 - $fa" | bc)" "$(wc -l < $W/samp-$v-$k.txt)"
