@@ -1931,8 +1931,17 @@ unsafe fn iso_secs(p: *const u8, c: &mut TsCache) -> Option<i64> {
 /// `Ev::pc` never reads it). One fused pass: the `scan7` line classifier with the fields kept
 /// as pointer and length, both ids packed in one vector, ISO times straight to seconds.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
-#[inline(never)]
 fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>) {
+    parse_events_s::<E, 9>(c, cx, m, d, fb, fbn, side);
+}
+
+/// `parse_events_sol` cut after stage S (bench only): 0 = line classifier and field bounds,
+/// 1 = also both ids packed and the ingest time, 2 = also the event time; 9 = all of it.
+/// Returns a checksum of the cut stages and the number of lines that took the slow path.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(never)]
+fn parse_events_s<E: Ev, const S: u32>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>) -> (u64, usize) {
+    let (mut acc, mut nslow) = (0u64, 0usize);
     use core::arch::x86_64::_bzhi_u64;
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
@@ -2000,6 +2009,10 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
             let (pet, net) = fld(pb, xb, e3 + 1, e4);
             let (pp, np) = fld(pb, xb, e4 + 1, e5);
             let (ppr, npr) = fld(pb, xb, e5 + 1, l);
+            if S == 0 {
+                acc = acc.wrapping_add((nu + nt + ni + net + np + npr) as u64 ^ pe as u64);
+                continue 'ln;
+            }
             // SAFETY: both ids start in the first window, so 16 bytes from each stay inside
             // the 128 readable bytes at p
             let (ke, oke, ku, oku) = unsafe { pack6x2(pe, ne, pu, nu) };
@@ -2017,6 +2030,10 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
                     (ingest, k, x)
                 }
             };
+            if S == 1 {
+                acc = acc.wrapping_add(ke ^ ku ^ ingest as u64 ^ ik as u64 ^ (oke as u64) ^ (oku as u64) << 1 ^ (iex as u64) << 2);
+                continue 'ln;
+            }
             let mut r = E::nil();
             'v: {
                 if (nu == 0) | (np == 0) {
@@ -2038,6 +2055,10 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
                         None => break 'v,
                     }
                 };
+                if S == 2 {
+                    acc = acc.wrapping_add(t as u64 ^ ke ^ ku ^ ik as u64);
+                    continue 'ln;
+                }
                 if (t < ws) | (t >= we) | (ingest.wrapping_sub(t) > DAY) {
                     break 'v;
                 }
@@ -2069,6 +2090,7 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
             }
             continue 'ln;
         }
+        nslow += 1;
         sbuf.clear();
         pos = scan7_line(c, pos, &mut sbuf);
         for f in &sbuf {
@@ -2078,6 +2100,7 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
     if pos < len {
         scan::<7>(&c[pos..], |f| ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side));
     }
+    (acc, nslow)
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
@@ -2176,6 +2199,38 @@ fn sol_bench<E: Ev>(ev_chunks: &[B], cx: &EvCtx) {
         eprintln!("solbench rep{rep} old {no:.2} ns/rec new {nn:.2} ns/rec ratio {:.3} recs {n} chunks {} mismatched {bad}", no / nn, ev_chunks.len());
     }
     eprintln!("solbench best old {best_o:.2} ns/rec new {best_n:.2} ns/rec speedup {:.3}", best_o / best_n);
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    if std::env::var_os("SHOP_SOLABL").is_some() {
+        let n: usize = ev_chunks.iter().map(|&c| {
+            b.clear();
+            parse_events_sol(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side);
+            b.m.len()
+        }).sum();
+        let mut stage = |name: &str, f: &dyn Fn(B, &mut EvBufs<E>) -> (u64, usize)| {
+            let mut best = f64::MAX;
+            let (mut acc, mut slow) = (0u64, 0usize);
+            for _ in 0..reps {
+                let t = std::time::Instant::now();
+                (acc, slow) = (0, 0);
+                for &c in ev_chunks {
+                    b.clear();
+                    let (x, s) = f(c, &mut b);
+                    acc = acc.wrapping_add(x);
+                    slow += s;
+                }
+                best = best.min(t.elapsed().as_secs_f64() * 1e9 / n.max(1) as f64);
+            }
+            eprintln!("solbench stage {name}: {best:.2} ns/rec (slow lines {slow}, sum {acc:x})");
+        };
+        stage("classify", &|c, b| parse_events_s::<E, 0>(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side));
+        stage("+ids+ingest", &|c, b| parse_events_s::<E, 1>(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side));
+        stage("+evtime", &|c, b| parse_events_s::<E, 2>(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side));
+        stage("full", &|c, b| parse_events_s::<E, 9>(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side));
+        stage("old", &|c, b| {
+            parse_events(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side);
+            (0, 0)
+        });
+    }
 }
 
 struct EvChunk<E> {
