@@ -4195,7 +4195,20 @@ fn ev_after_idx<E: Ev>(
                         let mut t: Vec<u64> = vec![u64::MAX; span];
                         let mut lb: Vec<E> = Vec::new();
                         let mut lg: Vec<u64> = Vec::new();
-                        let mut em: Vec<E> = Vec::new();
+                        // em outlives the task (sessionize reads its runs), so size it once from the
+                        // record counts instead of growing it by doubling
+                        let ub: usize = (g * G..((g + 1) * G).min(ndb))
+                            .map(|b| {
+                                ev_out
+                                    .iter()
+                                    .map(|c| {
+                                        let (sa, _, oa, _) = c.dz.seg(b);
+                                        sa.len() + oa.len()
+                                    })
+                                    .sum::<usize>()
+                            })
+                            .sum();
+                        let mut em: Vec<E> = Vec::with_capacity(ub);
                         let mut ds: Vec<RunD> = Vec::new();
                         // open run: person key, start in em, ts sorted so far, last ts
                         let (mut rk, mut rs, mut rok, mut lts) = (0u64, 0usize, true, 0u64);
