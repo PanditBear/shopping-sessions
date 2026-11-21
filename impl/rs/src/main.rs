@@ -4415,22 +4415,38 @@ fn ev_after_idx<E: Ev>(
                             }
                             pt(2, &mut tm);
                             if !lb.is_empty() {
-                                const PD: usize = 16;
+                                const BL: usize = 64;
                                 em.reserve(lb.len());
                                 let emp = em.as_mut_ptr();
                                 let mut en = em.len();
                                 let tl = t.len();
-                                for j in 0..tl {
-                                    if j + PD < tl {
-                                        let n = t[j + PD];
-                                        if n != u64::MAX {
-                                            prefetch(lb.as_ptr().wrapping_add(n as u32 as usize) as *const u8);
+                                // scan BL slots: collect the occupied lb offsets, clear the slots, prefetch their lb lines
+                                let lbp0 = lb.as_ptr();
+                                let scan = |t: &mut [u64], j0: usize, offs: &mut [u32; BL]| -> usize {
+                                    let jn = (j0 + BL).min(tl);
+                                    let mut nb = 0usize;
+                                    for o in t[j0..jn].iter_mut() {
+                                        if *o != u64::MAX {
+                                            let q = *o as u32;
+                                            *o = u64::MAX;
+                                            // SAFETY: nb < BL because at most jn - j0 <= BL slots are scanned
+                                            unsafe { *offs.get_unchecked_mut(nb) = q };
+                                            nb += 1;
+                                            prefetch(lbp0.wrapping_add(q as usize) as *const u8);
                                         }
                                     }
-                                    let o = &mut t[j];
-                                    if *o != u64::MAX {
-                                        let mut e = lb[*o as u32 as usize];
-                                        *o = u64::MAX;
+                                    nb
+                                };
+                                let mut offa = [0u32; BL];
+                                let mut offb = [0u32; BL];
+                                let mut na = scan(&mut t, 0, &mut offa);
+                                let mut j0 = 0usize;
+                                while j0 < tl {
+                                    j0 += BL;
+                                    // software pipeline: scan and prefetch the next block, then process this one
+                                    let nb = if j0 < tl { scan(&mut t, j0, &mut offb) } else { 0 };
+                                    for &q in &offa[..na] {
+                                        let mut e = lb[q as usize];
                                         let k = e.key();
                                         if k != 0 {
                                             let pk = pk_of(&mut pc, k, tab, mf);
@@ -4453,6 +4469,8 @@ fn ev_after_idx<E: Ev>(
                                             en += 1;
                                         }
                                     }
+                                    std::mem::swap(&mut offa, &mut offb);
+                                    na = nb;
                                 }
                                 // SAFETY: en - old len records were written, en <= capacity
                                 unsafe { em.set_len(en) };
