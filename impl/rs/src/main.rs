@@ -2502,6 +2502,31 @@ unsafe fn hms(p: *const u8) -> Option<i64> {
     Some((h * 60 + ((v >> 24) & 0xFF) as i64) * 60 + ((v >> 48) & 0xFF) as i64)
 }
 
+/// Milliseconds of the 25 bytes "YYYY-MM-DDTHH:MM:SS+HH:MM" (or '-') at `p`, the same value as
+/// `ts_iso`; None means "use the general parser". `(ra, rb, rd)` is a valid date key and its day
+/// start. The 8 bytes "SS+HH:MM" get one range test per byte (',' sits between '+' and '-').
+#[inline(always)]
+unsafe fn ts25(p: *const u8, ra: u64, rb: u64, rd: i64, c: &mut DayCache) -> Option<i64> {
+    const LO: u64 = u64::from_le_bytes(*b"00+00:00");
+    const HI: u64 = u64::from_le_bytes([0x7F - b'5', 0x7F - b'9', 0x7F - b'-', 0x7F - b'9', 0x7F - b'9', 0x7F - b':', 0x7F - b'5', 0x7F - b'9']);
+    let w = ldp(p.add(17));
+    let v = w.wrapping_sub(LO);
+    let sg = ((w >> 16) & 0xFF) as u8;
+    if ((v | w.wrapping_add(HI)) & h8(0x80)) != 0 || sg == b',' {
+        return None;
+    }
+    let u = v.wrapping_mul(10).wrapping_add(v >> 8);
+    let (oh, om) = (((u >> 24) & 0xFF) as i64, ((u >> 48) & 0xFF) as i64);
+    if oh > 23 {
+        return None;
+    }
+    let (a, b) = (ldp(p), ldp(p.add(3)));
+    let d = if (a == ra) & (b == rb) { rd } else { day_get(a, b, p, c)? };
+    let h = hms(p.add(11))?;
+    let off = (oh * 60 + om) * 60_000;
+    Some((d + h) * 1000 - if sg == b'-' { -off } else { off })
+}
+
 /// Same records, dedup entries and side lists, in the same order, as `parse_events`, except
 /// that the category of a record with no price is 0 (no product lookup for views and carts;
 /// `Ev::pc` never reads it). One fused pass: the `scan7` line classifier with the fields kept
@@ -2635,7 +2660,9 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
                         None => break 'v,
                     }
                 } else {
-                    match parse_ts_c(sl(pt, nt), &mut tct) {
+                    // SAFETY (ts25): a 25-byte field lies inside its window
+                    let f = if nt == 25 { unsafe { ts25(pt, ra, rb, rd, &mut dct) } } else { None };
+                    match f.or_else(|| parse_ts_c(sl(pt, nt), &mut tct)) {
                         Some(t) => t,
                         None => break 'v,
                     }
@@ -3965,5 +3992,63 @@ mod pack_simd_tests {
             ok += want.is_some() as u32;
         }
         assert!(ok > 50_000, "{ok}");
+    }
+
+    #[test]
+    fn ts25_fixed_matches_parse_ts_c() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+            fn chance(&mut self, pct: u64) -> bool {
+                self.below(100) < pct
+            }
+        }
+        let mut r = Rng(0x25AD_0FF5_E7C0_FFEE);
+        let alpha = b"0123456789:-+TZ ,\"";
+        let (mut dc, mut dk) = (DayCache::new(), DayCache::new());
+        let mut buf = [0u8; 32];
+        let (mut ok, mut fast) = (0u32, 0u32);
+        for i in 0..400_000u32 {
+            let y = 1990 + r.below(60);
+            let mo = 1 + r.below(13);
+            let d = 1 + r.below(31);
+            let (h, mi, s) = (r.below(25), r.below(61), r.below(61));
+            let (oh, om) = (r.below(26), r.below(61));
+            let sg = if r.chance(50) { '+' } else { '-' };
+            let t = format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}{sg}{oh:02}:{om:02}");
+            buf[..25].copy_from_slice(t.as_bytes());
+            // the date key handed in: this value's own date half the time when valid
+            let p = buf.as_ptr();
+            // SAFETY: buf has 32 bytes
+            let (ra, rb, rd) = unsafe {
+                match day_get(ldp(p), ldp(p.add(3)), p, &mut dk) {
+                    Some(d) if r.chance(50) => (ldp(p), ldp(p.add(3)), d),
+                    _ => (D0_A, D0_B, D0_S),
+                }
+            };
+            let k = if i % 4 == 0 { 0 } else { 1 + r.below(3) };
+            for _ in 0..k {
+                let at = r.below(25) as usize;
+                buf[at] = if r.chance(70) { alpha[r.below(alpha.len() as u64) as usize] } else { r.next() as u8 };
+            }
+            let b = &buf[..25];
+            let want = parse_ts_c(b, &mut TsCache::with_bits(1));
+            let p = buf.as_ptr();
+            // SAFETY: buf has 32 bytes
+            if let Some(g) = unsafe { ts25(p, ra, rb, rd, &mut dc) } {
+                assert_eq!(Some(g), want, "{:?}", String::from_utf8_lossy(b));
+                fast += 1;
+            }
+            ok += want.is_some() as u32;
+        }
+        assert!(ok > 50_000 && fast > 50_000, "{ok} {fast}");
     }
 }
