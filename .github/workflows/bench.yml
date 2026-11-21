@@ -159,8 +159,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
       - name: pqcheck
         env:
           REFS: ${{ github.event.inputs.pqrefs }}
-          JAVA_HOME: ${{ env.JAVA_HOME_17_X64 }}
         run: bash pqcheck.sh $REFS
