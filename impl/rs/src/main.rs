@@ -1151,60 +1151,14 @@ struct DR<E> {
     e: E,
 }
 
-/// Compact dense record (16 bytes) of a line that is not a purchase: its user key, its ts, and a
-/// tag with the low sh bits of the index and above them dd = ingest key - (IOFF + ts / 1000) + 1.
-/// dd 0 marks a dropped line (key 0, ts 0), whose ts field holds the ingest key itself.
-#[derive(Clone, Copy)]
-struct R16 {
-    key: u64,
-    ts: u32,
-    tag: u32,
-}
-
-impl R16 {
-    /// None when the record does not fit: a purchase, a ts above 32 bits, a dropped line with a
-    /// ts, or an ingest key too far from the ts second (those keep the 24-byte form)
-    #[inline(always)]
-    fn pack<E: Ev>(i: u64, ing: u32, e: &E, sh: u32) -> Option<R16> {
-        let lo = (i & ((1u64 << sh) - 1)) as u32;
-        let (k, ts) = (e.key(), e.rts());
-        if e.pc().is_some() || ts > u32::MAX as u64 {
-            return None;
-        }
-        if k == 0 {
-            return if ts == 0 { Some(R16 { key: 0, ts: ing, tag: lo }) } else { None };
-        }
-        let dd = ing as i64 - (IOFF + (ts / 1000) as i64) + 1;
-        if dd < 1 || dd >= (1i64 << (32 - sh)) {
-            return None;
-        }
-        Some(R16 { key: k, ts: ts as u32, tag: lo | ((dd as u32) << sh) })
-    }
-    /// (low index bits, ingest key, line record)
-    #[inline(always)]
-    fn unpack<E: Ev>(&self, sh: u32) -> (u32, u32, E) {
-        let lo = self.tag & ((1u32 << sh) - 1);
-        let dd = self.tag >> sh;
-        if dd == 0 {
-            (lo, self.ts, E::nil())
-        } else {
-            let ing = (IOFF + (self.ts / 1000) as i64 + dd as i64 - 1) as u32;
-            (lo, ing, E::mk(self.key, self.ts as u64, 0, 0))
-        }
-    }
-}
-
 /// One 64-byte cache line.
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 struct Line([u64; 8]);
 
-/// records staged per bucket before they go to the slots as whole cache lines (WK records of 16
-/// bytes are 2 lines)
+/// records staged per bucket before they go to the slots as whole cache lines (WK records of 24 or
+/// 32 bytes are 3 or 4 lines)
 const WK: usize = 8;
-
-/// slot margin over the expected bucket size, in standard deviations
-const SLK: f64 = 1.5;
 
 thread_local! {
     /// a parser thread's staging lines, reused from chunk to chunk
@@ -1247,8 +1201,8 @@ impl<E: Ev> Dz<E> {
         let Some(c) = cfg else { return Self::off() };
         let lines = len as f64 * c.lpb;
         let mean = lines * (1u64 << c.sh) as f64 / ((c.lim - 64) as f64 / 1.3).max(1.0) * 1.04;
-        let cap = ((mean + SLK * mean.sqrt() + 1.0) as usize).min(lines as usize + 16).next_multiple_of(4);
-        let sz = std::mem::size_of::<R16>();
+        let cap = ((mean + 1.5 * mean.sqrt() + 1.0) as usize).min(lines as usize + 16).next_multiple_of(WK);
+        let sz = std::mem::size_of::<DR<E>>();
         let nl = (c.ndb * cap * sz).div_ceil(64);
         let mut r = Vec::with_capacity(nl);
         // SAFETY: MaybeUninit needs no initialization
@@ -1283,30 +1237,30 @@ impl<E: Ev> Dz<E> {
     #[inline(always)]
     fn put(&mut self, i: u64, ing: u32, e: E, exact: bool, ingest: i64) {
         let b = (i >> self.sh) as usize;
+        let x = DR { i: i as u32, ing, e };
         // SAFETY: i < lim, so b < ndb; a slot below cap lies in b's stretch of r
         let n = unsafe { *self.dn.get_unchecked(b) } as usize;
-        let pos = match R16::pack(i, ing, &e, self.sh) {
-            Some(x) if n < self.cap => {
-                // SAFETY: b < ndb, so b's WK staging records lie in wc; n + 1 - WK is a multiple
-                // of WK below cap, so the copied slots lie in b's stretch of r (line-aligned, as
-                // cap is a multiple of 4 records)
-                unsafe {
-                    let w = (self.wc.as_mut_ptr() as *mut R16).add(b * WK);
-                    w.add(n % WK).write(x);
-                    *self.dn.get_unchecked_mut(b) = n as u32 + 1;
-                    if (n + 1) % WK == 0 {
-                        let d = (self.r.as_mut_ptr() as *mut R16).add(b * self.cap + n + 1 - WK);
-                        stream_lines(w as *const Line, d as *mut Line, WK * std::mem::size_of::<R16>() / 64);
-                    }
+        let pos = if n < self.cap {
+            // SAFETY: b < ndb, so b's WK staging records lie in wc; n + 1 - WK is a multiple of
+            // WK below cap, so the copied slots lie in b's stretch of r
+            unsafe {
+                let w = (self.wc.as_mut_ptr() as *mut DR<E>).add(b * WK);
+                w.add(n % WK).write(x);
+                *self.dn.get_unchecked_mut(b) = n as u32 + 1;
+                if (n + 1) % WK == 0 {
+                    let d = (self.r.as_mut_ptr() as *mut DR<E>).add(b * self.cap + n + 1 - WK);
+                    stream_lines(w as *const Line, d as *mut Line, WK * std::mem::size_of::<DR<E>>() / 64);
                 }
-                b * self.cap + n
             }
-            _ => self.ov_put(b, DR { i: i as u32, ing, e }),
+            b * self.cap + n
+        } else {
+            self.ov_put(b, x)
         };
         if !exact {
             self.dside.push((pos as u32, ingest));
         }
     }
+    #[cold]
     #[inline(never)]
     fn ov_put(&mut self, b: usize, x: DR<E>) -> usize {
         self.ov.push(x);
@@ -1322,8 +1276,8 @@ impl<E: Ev> Dz<E> {
                 let t = n % WK;
                 // SAFETY: the t records staged last for b are its slots n - t .. n
                 unsafe {
-                    let w = (self.wc.as_ptr() as *const R16).add(b * WK);
-                    let d = (self.r.as_mut_ptr() as *mut R16).add(b * self.cap + n - t);
+                    let w = (self.wc.as_ptr() as *const DR<E>).add(b * WK);
+                    let d = (self.r.as_mut_ptr() as *mut DR<E>).add(b * self.cap + n - t);
                     std::ptr::copy_nonoverlapping(w, d, t);
                 }
             }
@@ -1365,12 +1319,12 @@ impl<E: Ev> Dz<E> {
     /// bucket b's records: its slots and the position of the first, then its overflow records and
     /// the position of the first
     #[inline]
-    fn seg(&self, b: usize) -> (&[R16], usize, &[DR<E>], usize) {
+    fn seg(&self, b: usize) -> (&[DR<E>], usize, &[DR<E>], usize) {
         if b >= self.dn.len() {
             return (&[], 0, &[], 0);
         }
         // SAFETY: put wrote the first dn[b] slots of b's stretch
-        let s = unsafe { std::slice::from_raw_parts((self.r.as_ptr() as *const R16).add(b * self.cap), self.dn[b] as usize) };
+        let s = unsafe { std::slice::from_raw_parts((self.r.as_ptr() as *const DR<E>).add(b * self.cap), self.dn[b] as usize) };
         let (o, p) = if self.ovoff.is_empty() {
             (&self.ov[..0], 0)
         } else {
@@ -3656,40 +3610,29 @@ fn ev_after_idx<E: Ev>(
                             lg.clear();
                             for (ci, c) in ev_out.iter().enumerate() {
                                 let (sa, sp, oa, op) = c.dz.seg(b);
-                                // one record into the slot table (a macro, so both loops get it inline)
-                                macro_rules! one {
-                                    ($xi:expr, $xing:expr, $xe:expr, $p:expr) => {{
-                                        let (xi, xing, xe, p): (u64, u32, E, usize) = ($xi, $xing, $xe, $p);
+                                for (part, p0) in [(sa, sp), (oa, op)] {
+                                    for (j, x) in part.iter().enumerate() {
                                         let q = lb.len() as u32;
-                                        lb.push(xe);
+                                        lb.push(x.e);
                                         if dside_any {
-                                            lg.push(((ci as u64) << 32) | p as u64);
+                                            lg.push(((ci as u64) << 32) | (p0 + j) as u64);
                                         }
-                                        let pk = ((xing as u64) << 32) | q as u64;
+                                        let pk = ((x.ing as u64) << 32) | q as u64;
                                         // SAFETY: the slot index is masked to span
-                                        let o = unsafe { t.get_unchecked_mut((xi & mask) as usize) };
+                                        let o = unsafe { t.get_unchecked_mut((x.i as u64 & mask) as usize) };
                                         if *o == u64::MAX {
                                             *o = pk;
-                                        } else {
-                                            let ok = (*o >> 32) as u32;
-                                            if xing < ok
-                                                || (xing == ok
-                                                    && dside_any
-                                                    && dexact(lg[q as usize], xing) < dexact(lg[*o as u32 as usize], ok))
-                                            {
-                                                *o = pk;
-                                            }
+                                            continue;
                                         }
-                                    }};
-                                }
-                                let sh = c.dz.sh;
-                                lb.reserve(sa.len() + oa.len());
-                                for (j, x) in sa.iter().enumerate() {
-                                    let (lo, xing, xe) = x.unpack::<E>(sh);
-                                    one!(lo as u64, xing, xe, sp + j);
-                                }
-                                for (j, x) in oa.iter().enumerate() {
-                                    one!(x.i as u64, x.ing, x.e, op + j);
+                                        let ok = (*o >> 32) as u32;
+                                        if x.ing < ok
+                                            || (x.ing == ok
+                                                && dside_any
+                                                && dexact(lg[q as usize], x.ing) < dexact(lg[*o as u32 as usize], ok))
+                                        {
+                                            *o = pk;
+                                        }
+                                    }
                                 }
                             }
                             pt(2, &mut tm);
@@ -4204,21 +4147,12 @@ fn hash_chunk<E: Ev>(mut h: u64, r: &EvChunk<E>) -> u64 {
     }
     for b in 0..r.dz.dn.len() {
         let (sa, sp, oa, op) = r.dz.seg(b);
-        let sh = r.dz.sh;
-        let recs = sa
-            .iter()
-            .map(|x| {
-                let (lo, ing, e) = x.unpack::<E>(sh);
-                (((b as u64) << sh) as u32 | lo, ing, e)
-            })
-            .collect::<Vec<_>>();
-        let ovr = oa.iter().map(|x| (x.i, x.ing, x.e)).collect::<Vec<_>>();
-        for (part, p0) in [(recs, sp), (ovr, op)] {
+        for (part, p0) in [(sa, sp), (oa, op)] {
             add(part.len() as u64 ^ ((p0 as u64) << 32));
-            for (xi, xing, xe) in part {
-                add(xi as u64 ^ ((xing as u64) << 32));
-                add(xe.key() ^ (xe.rts() << 1));
-                if let Some((p, cat)) = xe.pc() {
+            for x in part {
+                add(x.i as u64 ^ ((x.ing as u64) << 32));
+                add(x.e.key() ^ (x.e.rts() << 1));
+                if let Some((p, cat)) = x.e.pc() {
                     add(p ^ ((cat as u64) << 32));
                 }
             }
