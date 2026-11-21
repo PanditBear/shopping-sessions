@@ -918,7 +918,7 @@ fn ev_chunk(files: &[B]) -> usize {
         return mb << 20;
     }
     let total: usize = files.iter().map(|f| f.len()).sum();
-    (total / 300).next_multiple_of(1 << 20).clamp(CHUNK, 8 * CHUNK)
+    (total / 150).next_multiple_of(1 << 20).clamp(CHUNK, 16 * CHUNK)
 }
 
 fn all_chunks(files: &[B], sz: usize) -> Vec<B> {
