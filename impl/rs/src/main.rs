@@ -865,8 +865,46 @@ fn drop_inputs() {
         let _ = unsafe { m.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, o, n) };
     });
 }
+/// SHOP_DROPANON=1: also release the big anonymous read-write regions (allocator arenas) in parallel
+/// before exit, so the single-threaded exit_mmap has fewer pages to free.
+#[cfg(target_os = "linux")]
+fn drop_anon() {
+    extern "C" {
+        fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+    }
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+    let mut parts: Vec<(usize, usize)> = vec![];
+    const CH: usize = 64 << 20;
+    for l in maps.lines() {
+        let mut it = l.split_whitespace();
+        let (Some(range), Some(perm)) = (it.next(), it.next()) else { continue };
+        if perm != "rw-p" {
+            continue;
+        }
+        let rest: Vec<&str> = l.split_whitespace().skip(5).collect();
+        if !rest.is_empty() {
+            continue; // file-backed or named (stack, heap)
+        }
+        let Some((a, b)) = range.split_once('-') else { continue };
+        let (Ok(a), Ok(b)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16)) else { continue };
+        if b - a < (16 << 20) {
+            continue;
+        }
+        let mut o = a;
+        while o < b {
+            let n = CH.min(b - o);
+            parts.push((o, n));
+            o += n;
+        }
+    }
+    parts.par_iter().for_each(|&(o, n)| unsafe {
+        madvise(o as *mut std::ffi::c_void, n, 4); // MADV_DONTNEED
+    });
+}
 #[cfg(not(target_os = "linux"))]
 fn drop_inputs() {}
+#[cfg(not(target_os = "linux"))]
+fn drop_anon() {}
 
 fn leak_file(p: &Path) -> Option<B> {
     let f = File::open(p).ok()?;
@@ -4949,6 +4987,9 @@ fn main() {
     if std::env::var("SHOP_DROPIN").map_or(true, |v| v != "off") {
         let t = ep();
         drop_inputs();
+        if std::env::var_os("SHOP_DROPANON").is_some() {
+            drop_anon();
+        }
         if timing {
             eprintln!("dropin end {:.3}s", ep() - t);
         }
