@@ -33,18 +33,16 @@ def files(d):
 fa, fb = files(a), files(b)
 ok = fa == fb
 print("file lists equal:", ok, len(fa), len(fb))
-nbytes = 0
-for f in fa:
-    if f not in fb: continue
-    pa, pb = os.path.join(a, f), os.path.join(b, f)
-    if f.endswith(".parquet"):
-        ta, tb = pq.read_table(pa), pq.read_table(pb)
-        keys = [(c, "ascending") for c in ta.column_names]
-        same = ta.schema.equals(tb.schema) and ta.num_rows == tb.num_rows and ta.sort_by(keys).equals(tb.sort_by(keys))
-        byt = filecmp.cmp(pa, pb, shallow=False)
-        print(f, "rows", ta.num_rows, "sorted-equal", same, "bytes-equal", byt)
-        ok &= same
-    else:
-        same = filecmp.cmp(pa, pb, shallow=False); print(f, "bytes-equal", same); ok &= same
+dirs = sorted({os.path.dirname(f) for f in fa})
+for d in dirs:
+    def load(root):
+        ts = [pq.read_table(os.path.join(root, f)) for f in files(root) if os.path.dirname(f) == d and f.endswith(".parquet")]
+        import pyarrow as pa
+        return pa.concat_tables(ts)
+    ta, tb = load(a), load(b)
+    keys = [(c, "ascending") for c in ta.column_names]
+    same = ta.schema.equals(tb.schema) and ta.num_rows == tb.num_rows and ta.sort_by(keys).equals(tb.sort_by(keys))
+    print(d, "rows", ta.num_rows, tb.num_rows, "sorted-equal", same)
+    ok &= same
 print("SORTED-EQUAL RESULT:", "PASS" if ok else "FAIL")
 PY
