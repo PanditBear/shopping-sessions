@@ -1091,6 +1091,8 @@ struct ClickRec {
     ts: i64,
     cid: u64,
     camp: u32,
+    /// mix(key) >> 20 truncated: bits 0..PBB the person bucket, bits 16..16+NBK the digit
+    h: u32,
 }
 
 struct UD {
@@ -1329,12 +1331,17 @@ fn dg(key: u64) -> usize {
 
 /// Counting-sort pass of `v` into `out` on `dg`. Afterwards cnt[d] is the end of range d.
 fn hk_scatter<T: Copy>(v: &[T], out: &mut Vec<T>, cnt: &mut Vec<u32>, key: impl Fn(&T) -> u64) {
+    hk_scatter_d(v, out, cnt, |e| dg(key(e)))
+}
+
+/// `hk_scatter` with the digit given directly.
+fn hk_scatter_d<T: Copy>(v: &[T], out: &mut Vec<T>, cnt: &mut Vec<u32>, dgf: impl Fn(&T) -> usize) {
     let n = v.len();
     let nb = 1usize << NBK;
     cnt.clear();
     cnt.resize(nb + 1, 0);
     for e in v {
-        cnt[dg(key(e)) + 1] += 1;
+        cnt[dgf(e) + 1] += 1;
     }
     for i in 0..nb {
         cnt[i + 1] += cnt[i];
@@ -1344,7 +1351,7 @@ fn hk_scatter<T: Copy>(v: &[T], out: &mut Vec<T>, cnt: &mut Vec<u32>, key: impl 
     {
         let sp = out.spare_capacity_mut();
         for e in v {
-            let d = dg(key(e));
+            let d = dgf(e);
             sp[cnt[d] as usize].write(*e);
             cnt[d] += 1;
         }
@@ -1493,6 +1500,11 @@ fn radix_rts<E: Ev>(a: &mut [E], b: &mut [E]) {
 }
 
 #[inline(always)]
+#[inline(always)]
+fn cdg(c: &ClickRec) -> usize {
+    (c.h >> 16) as usize & ((1 << NBK) - 1)
+}
+
 fn click_less(a: &ClickRec, b: &ClickRec) -> bool {
     match (a.key, a.ts).cmp(&(b.key, b.ts)) {
         std::cmp::Ordering::Less => true,
@@ -1509,12 +1521,12 @@ fn sort_clicks(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Vec<u3
         cl.sort_unstable_by(|a, b| (dg(a.key), a.key, a.ts).cmp(&(dg(b.key), b.key, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid))));
         return;
     }
-    hk_scatter(cl, tmp, cnt, |c| c.key);
+    hk_scatter_d(cl, tmp, cnt, |c| cdg(c));
     let mut pk: Vec<u64> = vec![];
     // walk the non-empty digit ranges only: a bucket holds fewer clicks than there are digits
     let mut st = 0usize;
     while st < n {
-        let en = cnt[dg(tmp[st].key)] as usize;
+        let en = cnt[cdg(&tmp[st])] as usize;
         let m = en - st;
         if m == 1 {
             cl[st] = tmp[st];
@@ -1598,7 +1610,7 @@ fn process_bucket<E: Ev>(
         while j < evs.len() && evs[j].key() == pid {
             j += 1;
         }
-        while ci < clicks.len() && (dg(clicks[ci].key), clicks[ci].key) < (pd, pid) {
+        while ci < clicks.len() && (cdg(&clicks[ci]), clicks[ci].key) < (pd, pid) {
             ci += 1;
         }
         let mut cj = ci;
@@ -3319,11 +3331,13 @@ fn main() {
                 if t < ws - WEEK || t >= we {
                     return;
                 }
-                tmp.push(ClickRec { key: ukey(&rs, uid), ts: t, cid: pack(cid), camp: ci });
+                tmp.push(ClickRec { key: ukey(&rs, uid), ts: t, cid: pack(cid), camp: ci, h: 0 });
             });
             pt(9, &mut tm);
-            // keys that miss the mover filter map to themselves without a table lookup
+            // keys that miss the mover filter map to themselves without a table lookup; one mix per
+            // click gives the person bucket and the sort digit, and the bucket counts are taken here
             let n = tmp.len();
+            let mut cnt = vec![0u32; PB + 1];
             for i in 0..n {
                 if i + 2 * RPD < n {
                     mf.pf(tmp[i + 2 * RPD].key);
@@ -3335,11 +3349,31 @@ fn main() {
                     }
                 }
                 let k = tmp[i].key;
+                let mut hh = mix(k);
                 if mf.hit(k) {
-                    tmp[i].key = tab.get(k);
+                    let k2 = tab.get(k);
+                    tmp[i].key = k2;
+                    hh = mix(k2);
+                }
+                let h = (hh >> 20) as u32;
+                tmp[i].h = h;
+                cnt[(h as usize & (PB - 1)) + 1] += 1;
+            }
+            for i in 0..PB {
+                cnt[i + 1] += cnt[i];
+            }
+            let mut w = cnt.clone();
+            let mut out: Vec<ClickRec> = Vec::with_capacity(n);
+            {
+                let sp = out.spare_capacity_mut();
+                for x in &tmp {
+                    let b = x.h as usize & (PB - 1);
+                    sp[w[b] as usize].write(*x);
+                    w[b] += 1;
                 }
             }
-            let r = bucketize(&tmp, PB, |x| pbk(x.key));
+            unsafe { out.set_len(n) };
+            let r = (out, cnt);
             pt(10, &mut tm);
             r
         })
