@@ -2895,8 +2895,12 @@ fn ev_after<E: Ev>(
     // resolved on its own, so the slice of the table it probes stays cache resident, and the
     // resolved lines are grouped by person bucket into extra parts. The sessionizer gathers a
     // bucket from every part; the order inside a bucket does not matter.
-    let sl = |k: u64| (mix(k) >> (64 - RSB)) as usize;
-    let pass: Vec<((Vec<E>, Vec<u32>), (Vec<E>, Vec<u32>))> = ev_out
+    // per line code: person bucket of an own key (< PB), PB + id table slice of a candidate mover,
+    // or DROP for a dropped line. One buffer per chunk holds the own buckets, then the slices;
+    // codes are counted and scattered without data dependent branches (dropped lines are
+    // written to a spare slot past the end).
+    const DROP: usize = PB + RNS;
+    let pass: Vec<(Vec<E>, Vec<u32>)> = ev_out
         .into_par_iter()
         .enumerate()
         .map(|(ci, c)| {
@@ -2904,64 +2908,49 @@ fn ev_after<E: Ev>(
             let mb = mbase[ci] as usize;
             let m = c.m;
             let n = m.len();
-            // 0 dropped, 1 own key, 2 candidate mover
-            let mut cls = vec![0u8; n];
-            let mut cnt = vec![0u32; PB + 1];
-            let mut ccnt = vec![0u32; RNS + 1];
+            let mut code = vec![0u16; n];
+            let mut cnt = vec![0u32; DROP + 2];
             for i in 0..n {
                 if i + 2 * RPD < n {
                     mf.pf(m[i + 2 * RPD].key());
                 }
                 let g = mb + i;
                 let k = m[i].key();
-                if k != 0 && dead[g >> 6].load(Relaxed) & (1u64 << (g & 63)) == 0 {
-                    if mf.hit(k) {
-                        cls[i] = 2;
-                        ccnt[sl(k) + 1] += 1;
-                    } else {
-                        cls[i] = 1;
-                        cnt[pbk(k) + 1] += 1;
-                    }
-                }
+                let h = mix(k);
+                let live = (k != 0) & ((dead[g >> 6].load(Relaxed) >> (g & 63)) & 1 == 0);
+                let own = (h >> 20) as usize & (PB - 1);
+                let cand = PB + (h >> (64 - RSB)) as usize;
+                let t = if mf.hit(k) { cand } else { own };
+                let t = if live { t } else { DROP };
+                code[i] = t as u16;
+                unsafe { *cnt.get_unchecked_mut(t + 1) += 1 };
             }
             pt(4, &mut tm);
-            for p in 0..PB {
+            for p in 0..=DROP {
                 cnt[p + 1] += cnt[p];
             }
-            for p in 0..RNS {
-                ccnt[p + 1] += ccnt[p];
-            }
-            let tot = cnt[PB] as usize;
-            let ctot = ccnt[RNS] as usize;
-            let mut out: Vec<E> = Vec::with_capacity(tot);
-            let mut cand: Vec<E> = Vec::with_capacity(ctot);
+            let tot = cnt[DROP] as usize;
+            let mut out: Vec<E> = Vec::with_capacity(tot + 1);
             {
+                // w[DROP] = tot: the spare slot
                 let mut w = cnt.clone();
-                let mut cw = ccnt.clone();
                 let sp = out.spare_capacity_mut();
-                let cp = cand.spare_capacity_mut();
-                for (e, &t) in m.iter().zip(cls.iter()) {
-                    if t == 1 {
-                        let p = pbk(e.key());
-                        sp[w[p] as usize].write(*e);
-                        w[p] += 1;
-                    } else if t == 2 {
-                        let p = sl(e.key());
-                        cp[cw[p] as usize].write(*e);
-                        cw[p] += 1;
+                for (e, &t) in m.iter().zip(code.iter()) {
+                    let t = t as usize;
+                    unsafe {
+                        let wt = w.get_unchecked_mut(t);
+                        sp.get_unchecked_mut(*wt as usize).write(*e);
+                        *wt += (t != DROP) as u32;
                     }
                 }
             }
-            unsafe {
-                out.set_len(tot);
-                cand.set_len(ctot);
-            }
+            unsafe { out.set_len(tot) };
             pt(5, &mut tm);
-            ((out, cnt), (cand, ccnt))
+            (out, cnt)
         })
         .collect();
     drop(dead);
-    let (mut parts, cands): (Vec<(Vec<E>, Vec<u32>)>, Vec<(Vec<E>, Vec<u32>)>) = pass.into_iter().unzip();
+    let cands = &pass;
     let ng = (rayon::current_num_threads() * 8).clamp(1, RNS);
     let per = RNS.div_ceil(ng);
     let mparts: Vec<(Vec<E>, Vec<u32>)> = (0..RNS.div_ceil(per))
@@ -2969,13 +2958,13 @@ fn ev_after<E: Ev>(
         .map(|gi| {
             let mut tm = now();
             let (s0, s1) = (gi * per, ((gi + 1) * per).min(RNS));
-            let tot: usize = cands.iter().map(|(_, o)| (o[s1] - o[s0]) as usize).sum();
+            let tot: usize = cands.iter().map(|(_, o)| (o[PB + s1] - o[PB + s0]) as usize).sum();
             let mut gl: Vec<E> = Vec::with_capacity(tot);
             let mut cnt = vec![0u32; PB + 1];
             for s in s0..s1 {
                 let a = gl.len();
                 for (v, o) in cands.iter() {
-                    gl.extend_from_slice(&v[o[s] as usize..o[s + 1] as usize]);
+                    gl.extend_from_slice(&v[o[PB + s] as usize..o[PB + s + 1] as usize]);
                 }
                 let b = gl.len();
                 for i in a..b {
@@ -3006,7 +2995,7 @@ fn ev_after<E: Ev>(
             (out, cnt)
         })
         .collect();
-    drop(cands);
+    let mut parts = pass;
     parts.extend(mparts);
     tick("dedup done");
 
