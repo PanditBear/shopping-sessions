@@ -2251,44 +2251,50 @@ impl Pqf {
 }
 
 /// An integer column as a range dictionary (`lo..=hi`) with bit-packed `v - lo` indices when the
-/// range is small, else PLAIN. `c.ty` 1 = INT32, 2 = INT64.
-fn int_col(f: &mut Pqf, c: &mut Cm, rows: &[&[UD]], n: usize, get: impl Fn(&UD) -> i64, lo: i64, hi: i64) {
-    let int32 = c.ty == 1;
-    if n > 0 && (hi - lo) < (1 << 16) {
-        let mut d: Vec<u8> = Vec::with_capacity(((hi - lo + 1) * 8) as usize);
-        for v in lo..=hi {
-            if int32 {
-                d.extend_from_slice(&(v as i32).to_le_bytes());
-            } else {
-                d.extend_from_slice(&v.to_le_bytes());
-            }
+/// range is small, else PLAIN (INT32 or INT64), filled one value at a time.
+enum IntCol {
+    D(i64, i64, Bp),
+    P(Vec<u8>, bool),
+}
+impl IntCol {
+    fn new(int32: bool, n: usize, lo: i64, hi: i64) -> Self {
+        if n > 0 && (hi - lo) < (1 << 16) {
+            let w = bwid((hi - lo) as u64);
+            IntCol::D(lo, hi, Bp::new(w, n, &[w as u8]))
+        } else {
+            IntCol::P(Vec::with_capacity(n * 8), int32)
         }
-        f.page(c, true, (hi - lo + 1) as usize, 0, &d);
-        let w = bwid((hi - lo) as u64);
-        let mut bp = Bp::new(w, n, &[w as u8]);
-        for g in rows {
-            for r in g.iter() {
-                bp.put((get(r) - lo) as u32);
-            }
+    }
+    #[inline(always)]
+    fn put(&mut self, v: i64) {
+        match self {
+            IntCol::D(lo, _, bp) => bp.put((v - *lo) as u32),
+            IntCol::P(b, true) => b.extend_from_slice(&(v as i32).to_le_bytes()),
+            IntCol::P(b, false) => b.extend_from_slice(&v.to_le_bytes()),
         }
-        let b = bp.finish();
-        f.page(c, false, n, 8, &b);
-    } else {
-        let mut b: Vec<u8> = Vec::with_capacity(n * 8);
-        for g in rows {
-            for r in g.iter() {
-                if int32 {
-                    b.extend_from_slice(&(get(r) as i32).to_le_bytes());
-                } else {
-                    b.extend_from_slice(&get(r).to_le_bytes());
+    }
+    /// `c.ty` 1 = INT32, 2 = INT64.
+    fn emit(self, f: &mut Pqf, c: &mut Cm, n: usize) {
+        match self {
+            IntCol::D(lo, hi, bp) => {
+                let int32 = c.ty == 1;
+                let mut d: Vec<u8> = Vec::with_capacity(((hi - lo + 1) * 8) as usize);
+                for v in lo..=hi {
+                    if int32 {
+                        d.extend_from_slice(&(v as i32).to_le_bytes());
+                    } else {
+                        d.extend_from_slice(&v.to_le_bytes());
+                    }
                 }
+                f.page(c, true, (hi - lo + 1) as usize, 0, &d);
+                let b = bp.finish();
+                f.page(c, false, n, 8, &b);
             }
+            IntCol::P(b, _) => f.page(c, false, n, 0, &b),
         }
-        f.page(c, false, n, 0, &b);
     }
 }
 
-/// Writes one row group of `rows` (a list of row runs, n rows in all); returns its column chunks.
 fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names) -> Vec<Cm> {
     // pass 1: ranges and counts
     let (mut dlo, mut dhi) = (i64::MAX, i64::MIN);
@@ -2319,62 +2325,73 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
         cm(2, "revenue_cents"),
         cm(6, "top_category"),
     ];
-    // user_id: dictionary of the persons in row order, indices as one RLE run per person
-    {
-        let w = bwid(persons.saturating_sub(1) as u64);
-        let vb = ((w + 7) / 8) as usize;
-        let mut dict: Vec<u8> = Vec::with_capacity(persons * 14);
-        let mut idx: Vec<u8> = Vec::with_capacity(1 + persons * (3 + vb));
-        idx.push(w as u8);
-        let mut tmp: Vec<u8> = Vec::with_capacity(16);
-        let mut k = 0u64;
-        let mut run = 0u64;
-        let mut last = None;
-        for g in rows {
-            for r in g.iter() {
-                if last != Some(r.key) {
-                    if run > 0 {
-                        uvar(&mut idx, run << 1);
-                        idx.extend_from_slice(&(k - 1).to_le_bytes()[..vb]);
-                    }
-                    last = Some(r.key);
-                    k += 1;
-                    run = 0;
-                    if r.key & HBIT == 0 {
-                        tmp.clear();
-                        decode6(r.key, &mut tmp);
-                        dict.extend_from_slice(&(tmp.len() as u32).to_le_bytes());
-                        dict.extend_from_slice(&tmp);
-                    } else {
-                        let s = unpack(*names.map.get(&r.key).expect("name for hashed key"));
-                        dict.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                        dict.extend_from_slice(s);
-                    }
+    // one pass over the rows fills every column's buffers (the rows of a file do not fit in
+    // cache, so a pass per column would read them from memory six times); the pages are written
+    // afterwards in column order
+    let pw = bwid(persons.saturating_sub(1) as u64);
+    let vb = ((pw + 7) / 8) as usize;
+    let mut udict: Vec<u8> = Vec::with_capacity(persons * 14);
+    let mut uidx: Vec<u8> = Vec::with_capacity(1 + persons * (3 + vb));
+    uidx.push(pw as u8);
+    let mut tmp: Vec<u8> = Vec::with_capacity(16);
+    let mut k = 0u64;
+    let mut run = 0u64;
+    let mut last = None;
+    let mut day = IntCol::new(true, n, dlo, dhi);
+    let mut ses = IntCol::new(false, n, slo as i64, shi as i64);
+    let mut evc = IntCol::new(false, n, elo as i64, ehi as i64);
+    let mut rev: Vec<u8> = Vec::with_capacity(n * 8);
+    let mut defs = Bp::new(1, n, &[0, 0, 0, 0]);
+    let cw = bwid(cats.len().saturating_sub(1) as u64);
+    let mut vals = Bp::new(cw, nn, &[cw as u8]);
+    for g in rows {
+        for r in g.iter() {
+            // user_id: dictionary of the persons in row order, indices as one RLE run per person
+            if last != Some(r.key) {
+                if run > 0 {
+                    uvar(&mut uidx, run << 1);
+                    uidx.extend_from_slice(&(k - 1).to_le_bytes()[..vb]);
                 }
-                run += 1;
+                last = Some(r.key);
+                k += 1;
+                run = 0;
+                if r.key & HBIT == 0 {
+                    tmp.clear();
+                    decode6(r.key, &mut tmp);
+                    udict.extend_from_slice(&(tmp.len() as u32).to_le_bytes());
+                    udict.extend_from_slice(&tmp);
+                } else {
+                    let s = unpack(*names.map.get(&r.key).expect("name for hashed key"));
+                    udict.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    udict.extend_from_slice(s);
+                }
+            }
+            run += 1;
+            day.put(r.day as i64);
+            ses.put(r.sessions as i64);
+            evc.put(r.events as i64);
+            // revenue: PLAIN (wide range, mostly zeros)
+            rev.extend_from_slice(&(r.rev as i64).to_le_bytes());
+            // top_category: definition levels, then the non-null indices
+            if r.top == u32::MAX {
+                defs.put(0);
+            } else {
+                defs.put(1);
+                vals.put(r.top);
             }
         }
-        if run > 0 {
-            uvar(&mut idx, run << 1);
-            idx.extend_from_slice(&(k - 1).to_le_bytes()[..vb]);
-        }
-        f.page(&mut cols[0], true, persons, 0, &dict);
-        f.page(&mut cols[0], false, n, 8, &idx);
     }
-    int_col(f, &mut cols[1], rows, n, |r| r.day as i64, dlo, dhi);
-    int_col(f, &mut cols[2], rows, n, |r| r.sessions as i64, slo as i64, shi as i64);
-    int_col(f, &mut cols[3], rows, n, |r| r.events as i64, elo as i64, ehi as i64);
-    // revenue: PLAIN (wide range, mostly zeros)
-    {
-        let mut b: Vec<u8> = Vec::with_capacity(n * 8);
-        for g in rows {
-            for r in g.iter() {
-                b.extend_from_slice(&(r.rev as i64).to_le_bytes());
-            }
-        }
-        f.page(&mut cols[4], false, n, 0, &b);
+    if run > 0 {
+        uvar(&mut uidx, run << 1);
+        uidx.extend_from_slice(&(k - 1).to_le_bytes()[..vb]);
     }
-    // top_category: dictionary = the category list; definition levels, then the non-null indices
+    f.page(&mut cols[0], true, persons, 0, &udict);
+    f.page(&mut cols[0], false, n, 8, &uidx);
+    day.emit(f, &mut cols[1], n);
+    ses.emit(f, &mut cols[2], n);
+    evc.emit(f, &mut cols[3], n);
+    f.page(&mut cols[4], false, n, 0, &rev);
+    // top_category: dictionary = the category list
     {
         let mut dict: Vec<u8> = Vec::with_capacity(cats.iter().map(|c| c.len() + 4).sum());
         for c in cats {
@@ -2382,19 +2399,6 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
             dict.extend_from_slice(c);
         }
         f.page(&mut cols[5], true, cats.len(), 0, &dict);
-        let mut defs = Bp::new(1, n, &[0, 0, 0, 0]);
-        let w = bwid(cats.len().saturating_sub(1) as u64);
-        let mut vals = Bp::new(w, nn, &[w as u8]);
-        for g in rows {
-            for r in g.iter() {
-                if r.top == u32::MAX {
-                    defs.put(0);
-                } else {
-                    defs.put(1);
-                    vals.put(r.top);
-                }
-            }
-        }
         let mut b = defs.finish();
         let dl = (b.len() - 4) as u32;
         b[..4].copy_from_slice(&dl.to_le_bytes());
