@@ -4,3 +4,4 @@ time,event,ticket,branch,dev,holdout,runtime_s,board,commit,note
 2026-11-20 17:33:07,land,A-pyref,lane/A-pyref,1.0,1.0,29.159,,050b3edb00,
 2026-11-20 18:03:36,land,B-rust,lane/B-rust,1.0,1.0,62.057,,d3297f3980,
 2026-11-20 18:24:15,land,B-speed1,worktree-agent-adf1a07a213ba28af,1.0,1.0,125.795,,a97e351e19,
+2026-11-20 18:34:26,land,C-fuzz,worktree-agent-a79a139d2c50ed7d0,1.0,1.0,73.064,,0f2f12fd31,
