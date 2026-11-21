@@ -1996,21 +1996,7 @@ fn ev_after<E: Ev>(
             for p in 0..PB {
                 cnt[p + 1] += cnt[p];
             }
-            let tot = cnt[PB] as usize;
-            let mut out: Vec<E> = Vec::with_capacity(tot);
-            {
-                let mut w = cnt.clone();
-                let sp = out.spare_capacity_mut();
-                for e in &m {
-                    let k = e.key();
-                    if k != 0 {
-                        let p = pbk(k);
-                        sp[w[p] as usize].write(*e);
-                        w[p] += 1;
-                    }
-                }
-            }
-            unsafe { out.set_len(tot) };
+            let out = bucket_scatter(&m, &cnt);
             pt(5, &mut tm);
             (out, cnt)
         })
@@ -2049,6 +2035,76 @@ fn ev_after<E: Ev>(
             (out, cm)
         })
         .collect()
+}
+
+/// Scatter the kept lines of `m` (key != 0) by person bucket; `cnt` holds the PB + 1 bucket starts.
+/// 16-byte records use software write-combining: each bucket stages its records in a 64-byte line
+/// buffer whose slots follow the output's line alignment, and a full line goes out as one
+/// non-temporal store (no read-for-ownership; the output is read back much later, so caching it
+/// buys nothing). The bucket owning a line's last slot writes the line; slots before that bucket's
+/// start hold stale data and belong to earlier buckets, whose partial last lines are written with
+/// plain stores after a fence.
+fn bucket_scatter<E: Ev>(m: &[E], cnt: &[u32]) -> Vec<E> {
+    use core::arch::x86_64::*;
+    let tot = cnt[PB] as usize;
+    let mut out: Vec<E> = Vec::with_capacity(tot);
+    let base = out.as_mut_ptr();
+    if std::mem::size_of::<E>() != 16 || (base as usize) % 16 != 0 {
+        let mut w = cnt.to_vec();
+        let sp = out.spare_capacity_mut();
+        for e in m {
+            let k = e.key();
+            if k != 0 {
+                let p = pbk(k);
+                sp[w[p] as usize].write(*e);
+                w[p] += 1;
+            }
+        }
+        unsafe { out.set_len(tot) };
+        return out;
+    }
+    #[derive(Clone, Copy)]
+    #[repr(C, align(64))]
+    struct Line([u64; 8]);
+    let mut buf: Vec<Line> = vec![Line([0; 8]); PB];
+    let bp = buf.as_mut_ptr() as *mut E;
+    let mut w: Vec<u32> = cnt[..PB].to_vec();
+    let boff = ((base as usize) >> 4) & 3;
+    unsafe {
+        for e in m {
+            let k = e.key();
+            if k != 0 {
+                let p = pbk(k);
+                let j = *w.get_unchecked(p) as usize;
+                let sl = (j + boff) & 3;
+                bp.add(p * 4 + sl).write(*e);
+                *w.get_unchecked_mut(p) = j as u32 + 1;
+                if sl == 3 {
+                    if j >= 3 {
+                        let src = bp.add(p * 4) as *const __m256i;
+                        let dst = base.add(j - 3) as *mut __m256i;
+                        _mm256_stream_si256(dst, _mm256_load_si256(src));
+                        _mm256_stream_si256(dst.add(1), _mm256_load_si256(src.add(1)));
+                    } else {
+                        // the output's first line starts before the allocation
+                        for i in cnt[p] as usize..=j {
+                            base.add(i).write(*bp.add(p * 4 + ((i + boff) & 3)));
+                        }
+                    }
+                }
+            }
+        }
+        _mm_sfence();
+        for p in 0..PB {
+            let en = w[p] as usize;
+            let from = (cnt[p] as usize).max(en.saturating_sub((en + boff) & 3));
+            for i in from..en {
+                base.add(i).write(*bp.add(p * 4 + ((i + boff) & 3)));
+            }
+        }
+        out.set_len(tot);
+    }
+    out
 }
 
 fn ev_parse<E: Ev>(ev_chunks: &[B], cx: &EvCtx) -> Vec<EvChunk<E>> {
