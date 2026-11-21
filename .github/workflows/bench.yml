@@ -22,6 +22,9 @@ on:
       perf:
         description: "1 = perf profile of the first image's binary on the host"
         default: "1"
+      train:
+        description: "if set: build an instrumented binary of this commit, train, upload merged profile"
+        default: ""
       exitprobe:
         description: "1 = split exit time: teardown vs docker, native run, kernel profile"
         default: "0"
@@ -35,7 +38,7 @@ permissions:
   contents: read
 jobs:
   bench:
-    if: ${{ github.event.inputs.perfsha == '' }}
+    if: ${{ github.event.inputs.perfsha == '' && github.event.inputs.train == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -47,7 +50,9 @@ jobs:
       - name: toolchain
         run: |
           sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends musl-tools bc
-          rustup target add x86_64-unknown-linux-musl
+          rustup toolchain install 1.100.0 --profile minimal -t x86_64-unknown-linux-musl
+          rustup default 1.100.0
+          rustc -vV
       - name: bench
         env:
           RUNS: ${{ github.event.inputs.runs || '5' }}
@@ -139,3 +144,29 @@ jobs:
             done < $W/syms.txt
             sudo find $o $s2 -mindepth 1 -delete; sudo rm -f $R; sudo find $D -mindepth 1 -delete
           done
+  train:
+    if: ${{ github.event.inputs.train != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: bench-pgo
+      - name: toolchain
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends musl-tools bc
+          rustup toolchain install 1.100.0 --profile minimal -c llvm-tools -t x86_64-unknown-linux-musl
+          rustup default 1.100.0
+          rustc -vV
+      - name: train
+        env:
+          SHA: ${{ github.event.inputs.train }}
+          EVENTS: ${{ github.event.inputs.events || '20000000' }}
+          CLICKS: ${{ github.event.inputs.clicks || '5000000' }}
+        run: bash train.sh $SHA
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pgo-profile
+          path: /tmp/pgo/merged.profdata
