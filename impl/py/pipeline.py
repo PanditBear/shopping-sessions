@@ -174,18 +174,18 @@ def main():
         per_person[person(uid)].append((t, p, cat))
 
     # clicks
+    # copies of a click are identical in valid data, so validating each copy before the dedup equals dedup first;
+    # a copy that differs (a stray CR on one line) must not hide a valid one
     seen = {}
     for clid, uid, cid, ts in read_rows(DATA / "clicks", 4):
-        if clid is None:
-            continue
-        seen.setdefault(clid, (uid, cid, ts))
-    clicks = defaultdict(list)  # person -> sorted [(ts, click_id, campaign)]
-    for clid, (uid, cid, ts) in seen.items():
-        if uid is None or cid is None or cid not in campaigns:
+        if clid is None or uid is None or cid is None or cid not in campaigns:
             continue
         t = parse_ts(ts)
         if t is None or not (ws - WEEK_MS <= t < we):
             continue
+        seen.setdefault(clid, (uid, cid, t))
+    clicks = defaultdict(list)  # person -> sorted [(ts, click_id, campaign)]
+    for clid, (uid, cid, t) in seen.items():
         clicks[person(uid)].append((t, clid, cid))
     for v in clicks.values():
         v.sort()
