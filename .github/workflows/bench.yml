@@ -22,6 +22,9 @@ on:
       perf:
         description: "1 = perf profile of the first image's binary on the host"
         default: "1"
+      dockerproof:
+        description: "if set: docker build of the Dockerfile at refs (base new), run both, compare outputs"
+        default: ""
       train:
         description: "if set: build an instrumented binary of this commit, train, upload merged profile"
         default: ""
@@ -38,7 +41,7 @@ permissions:
   contents: read
 jobs:
   bench:
-    if: ${{ github.event.inputs.perfsha == '' && github.event.inputs.train == '' }}
+    if: ${{ github.event.inputs.perfsha == '' && github.event.inputs.train == '' && github.event.inputs.dockerproof == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -170,3 +173,23 @@ jobs:
         with:
           name: pgo-profile
           path: /tmp/pgo/merged.profdata
+  dockerproof:
+    if: ${{ github.event.inputs.dockerproof != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: bench-pgo
+      - name: toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: dockerproof
+        env:
+          REFS: ${{ github.event.inputs.dockerproof }}
+          EVENTS: ${{ github.event.inputs.events || '20000000' }}
+          CLICKS: ${{ github.event.inputs.clicks || '5000000' }}
+        run: bash dockerproof.sh $REFS

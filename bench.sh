@@ -69,8 +69,11 @@ for k in 1 2 3; do echo "empty ${IMGS[0]}: $(run ${IMGS[0]} $W/empty)"; done
 
 echo "== timed (wall internal start exit), interleaved"
 for k in $(seq $RUNS); do
-  for im in "${IMGS[@]}"; do echo "$im $(run $im $W/data)" | tee -a $W/times.txt; done
+  for im in "${IMGS[@]}"; do echo "$im $(run $im $W/data)" | tee -a $W/times.txt
+    echo "$im $(grep '^prof' $W/err.txt | grep -o '=[0-9.]*' | tr -d = | paste -sd+ | bc)" >> $W/profsum.txt; done
 done
+echo "== prof cpu-s sum per timed run (image, sum), run order"
+cat $W/profsum.txt
 
 echo "== medians"
 for im in "${IMGS[@]}"; do
