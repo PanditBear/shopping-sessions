@@ -105,6 +105,12 @@ jobs:
           for n in 1 2; do
             sudo $P script -i $W/perf$n.data --no-inline -F time,ip,sym 2>/dev/null | gzip -6 > $R/script$n.txt.gz
           done
+          for n in 1 2; do
+            sudo $P script -i $W/perf$n.data -G -F ip,sym 2>/dev/null | awk 'NF>=2 {c[$1" "$2]++} END{for(k in c) print c[k], k}' | sort -rn > $R/ipcount$n.txt
+            grep -E 'parse_events_sol|parse_clicks' $R/ipcount$n.txt | head -4000 | awk '{print $2}' > $W/ips$n.txt
+            addr2line -i -f -a -e $W/shop-prof < $W/ips$n.txt 2>/dev/null | gzip -6 > $R/a2l$n.txt.gz
+            grep -E 'parse_events_sol|parse_clicks' $R/ipcount$n.txt | head -4000 | gzip -6 > $R/ipparse$n.txt.gz
+          done
           echo "== done"; ls -l $R; head -40 $R/overall1.self.txt; head -40 $R/overall2.self.txt
       - uses: actions/upload-artifact@v4
         if: always()
