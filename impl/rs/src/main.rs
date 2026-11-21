@@ -1500,6 +1500,23 @@ struct ClickRec {
     ts: i64,
     cid: u64,
     camp: u32,
+    /// the first 4 click_id bytes, big-endian, zero padded: orders two click_ids whenever it differs
+    cp: u32,
+}
+
+/// `ClickRec::cp` of a click_id.
+#[inline(always)]
+fn cpre(b: B) -> u32 {
+    let mut a = [0u8; 4];
+    let n = b.len().min(4);
+    a[..n].copy_from_slice(&b[..n]);
+    u32::from_be_bytes(a)
+}
+
+/// click_id byte order of two clicks: the prefix, then the bytes.
+#[inline(always)]
+fn cid_cmp(a: &ClickRec, b: &ClickRec) -> std::cmp::Ordering {
+    a.cp.cmp(&b.cp).then_with(|| unpack(a.cid).cmp(unpack(b.cid)))
 }
 
 /// One click line of `scan4`: its record when the ids are not empty, the campaign is known and
@@ -1516,7 +1533,7 @@ fn click_line(f: &[B; 4], camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, l
     if t < ws - WEEK || t >= we {
         return;
     }
-    out.push(ClickRec { key: ukey(rs, uid), ts: t, cid: pack(cid), camp: ci });
+    out.push(ClickRec { key: ukey(rs, uid), ts: t, cid: pack(cid), camp: ci, cp: cpre(cid) });
 }
 
 /// The click records of one chunk, in line order: `scan4` with `click_line` on every line.
@@ -1611,7 +1628,10 @@ fn parse_clicks(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: 
                 (k, true) => k,
                 _ => ukey(rs, uid),
             };
-            out.push(ClickRec { key, ts: t, cid: pack(sl(pc, nc)), camp: ci });
+            // SAFETY: pc <= p + 1, so its 4 bytes lie inside the window; nc >= 1
+            let w = u32::from_be(unsafe { (pc as *const u32).read_unaligned() });
+            let cp = if nc >= 4 { w } else { w & !(u32::MAX >> (8 * nc)) };
+            out.push(ClickRec { key, ts: t, cid: pack(sl(pc, nc)), camp: ci, cp });
             continue;
         }
         sbuf.clear();
@@ -2052,7 +2072,7 @@ fn click_less(a: &ClickRec, b: &ClickRec) -> bool {
     match (a.key, a.ts).cmp(&(b.key, b.ts)) {
         std::cmp::Ordering::Less => true,
         std::cmp::Ordering::Greater => false,
-        std::cmp::Ordering::Equal => unpack(a.cid) < unpack(b.cid),
+        std::cmp::Ordering::Equal => cid_cmp(a, b).is_lt(),
     }
 }
 
@@ -2061,7 +2081,7 @@ fn click_less(a: &ClickRec, b: &ClickRec) -> bool {
 fn sort_clicks(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Vec<u32>) {
     let n = cl.len();
     if n < 256 {
-        cl.sort_unstable_by(|a, b| (dg(a.key), a.key, a.ts).cmp(&(dg(b.key), b.key, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid))));
+        cl.sort_unstable_by(|a, b| (dg(a.key), a.key, a.ts).cmp(&(dg(b.key), b.key, b.ts)).then_with(|| cid_cmp(a, b)));
         return;
     }
     if ck_rdx() && sort_clicks_rdx(cl, tmp, cnt) {
@@ -2083,7 +2103,7 @@ fn sort_clicks(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Vec<u3
             if m <= 32 {
                 isort_by(o, click_less);
             } else {
-                o.sort_unstable_by(|a, b| (a.key, a.ts).cmp(&(b.key, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid))));
+                o.sort_unstable_by(|a, b| (a.key, a.ts).cmp(&(b.key, b.ts)).then_with(|| cid_cmp(a, b)));
             }
         }
         st = en;
@@ -2176,7 +2196,7 @@ fn sort_clicks_rdx(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Ve
             if r.len() <= 32 {
                 isort_by(r, click_less);
             } else {
-                r.sort_unstable_by(|a, b| (a.key, a.ts).cmp(&(b.key, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid))));
+                r.sort_unstable_by(|a, b| (a.key, a.ts).cmp(&(b.key, b.ts)).then_with(|| cid_cmp(a, b)));
             }
         }
         st = en;
@@ -2189,7 +2209,7 @@ fn sort_clicks_rdx(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Ve
 fn isort_one(r: &mut [ClickRec]) -> bool {
     #[inline(always)]
     fn less(a: &ClickRec, b: &ClickRec) -> bool {
-        a.ts < b.ts || (a.ts == b.ts && unpack(a.cid) < unpack(b.cid))
+        a.ts < b.ts || (a.ts == b.ts && cid_cmp(a, b).is_lt())
     }
     let mut budget = 2 * r.len() + 16;
     for i in 1..r.len() {
@@ -2242,7 +2262,7 @@ fn sort_one_clicker(src: &[ClickRec], out: &mut [ClickRec], pk: &mut Vec<u64>) -
             b += 1;
         }
         if b - a > 1 {
-            out[a..b].sort_unstable_by(|x, y| unpack(x.cid).cmp(unpack(y.cid)));
+            out[a..b].sort_unstable_by(cid_cmp);
         }
         a = b;
     }
@@ -6099,7 +6119,7 @@ mod ck_sort_tests {
     }
 
     fn mk(key: u64, ts: i64, id: B, camp: u32) -> ClickRec {
-        ClickRec { key, ts, cid: pack(id), camp }
+        ClickRec { key, ts, cid: pack(id), camp, cp: cpre(id) }
     }
 
     #[test]
