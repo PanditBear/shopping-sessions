@@ -1304,8 +1304,8 @@ fn isort_by<T: Copy>(v: &mut [T], less: impl Fn(&T, &T) -> bool) {
 }
 
 /// Sort by (dg(key), key, ts); equal (key, ts) pairs may end up in any order. `span` bounds
-/// every rts. A counting pass on the digit, then per
-/// range: when the range holds one key, its (ts, index) pairs are sorted as u64s and gathered back.
+/// every rts. A counting pass on the digit, then per range: a range shorter than RADIX_MIN with
+/// few keys is ordered as packed u64s (`pack_sort`), a long one-key range with `radix_rts`.
 fn sort_evs<E: Ev>(evs: &mut [E], tmp: &mut Vec<E>, cnt: &mut Vec<u32>, span: i64) {
     let n = evs.len();
     if n < 256 {
@@ -1314,7 +1314,8 @@ fn sort_evs<E: Ev>(evs: &mut [E], tmp: &mut Vec<E>, cnt: &mut Vec<u32>, span: i6
     }
     hk_scatter(evs, tmp, cnt, |e| e.key());
     let fast = span >= 0 && span < (1i64 << 55);
-    let mut ks = [0u64; 256];
+    let sb = 64 - (span as u64).leading_zeros();
+    let mut ks = vec![0u64; RADIX_MIN];
     let mut st = 0usize;
     for d in 0..1usize << NBK {
         let en = cnt[d] as usize;
@@ -1324,23 +1325,7 @@ fn sort_evs<E: Ev>(evs: &mut [E], tmp: &mut Vec<E>, cnt: &mut Vec<u32>, span: i6
             evs[st] = r[0];
         } else if m > 1 {
             let k0 = r[0].key();
-            let mut same = fast && m <= 256;
-            if same {
-                for (i, e) in r.iter().enumerate() {
-                    ks[i] = (e.rts() << 8) | i as u64;
-                    same &= e.key() == k0;
-                }
-            }
-            if same {
-                let ks = &mut ks[..m];
-                if m <= 32 {
-                    isort_by(ks, |a, b| a < b);
-                } else {
-                    ks.sort_unstable();
-                }
-                for (j, &k) in ks.iter().enumerate() {
-                    evs[st + j] = r[(k & 0xFF) as usize];
-                }
+            if fast && m < RADIX_MIN && pack_sort(r, &mut evs[st..en], &mut ks, sb) {
             } else if fast && m >= RADIX_MIN && r.iter().all(|e| e.key() == k0) {
                 radix_rts(&mut tmp[st..en], &mut evs[st..en]);
             } else {
@@ -1350,6 +1335,59 @@ fn sort_evs<E: Ev>(evs: &mut [E], tmp: &mut Vec<E>, cnt: &mut Vec<u32>, span: i6
         }
         st = en;
     }
+}
+
+/// Orders `r` (2 <= len < RADIX_MIN, every rts below 2^sb) into `out` by (key, rts) when it holds
+/// at most 16 keys: (key rank, rts, index) packed into u64s are sorted, then gathered. Returns
+/// false and leaves `out` alone for more keys or when the fields do not fit in 64 bits.
+#[inline(always)]
+fn pack_sort<E: Ev>(r: &[E], out: &mut [E], ks: &mut [u64], sb: u32) -> bool {
+    let m = r.len();
+    let ib = 64 - ((m - 1) as u64).leading_zeros();
+    let sh = sb + ib;
+    if sh > 60 {
+        return false;
+    }
+    let k0 = r[0].key();
+    let mut uk = [0u64; 16];
+    uk[0] = k0;
+    let mut nk = 1usize;
+    let ks = &mut ks[..m];
+    for (i, e) in r.iter().enumerate() {
+        let k = e.key();
+        let mut s = 0usize;
+        if k != k0 {
+            s = 1;
+            while s < nk && uk[s] != k {
+                s += 1;
+            }
+            if s == nk {
+                if nk == 16 {
+                    return false;
+                }
+                uk[nk] = k;
+                nk += 1;
+            }
+        }
+        ks[i] = ((s as u64) << sh) | (e.rts() << ib) | i as u64;
+    }
+    if nk > 1 {
+        // slot (order of first appearance) -> rank of its key
+        let mut rk = [0u64; 16];
+        for s in 0..nk {
+            rk[s] = uk[..nk].iter().filter(|&&x| x < uk[s]).count() as u64;
+        }
+        let lo = (1u64 << sh) - 1;
+        for k in ks.iter_mut() {
+            *k = (rk[(*k >> sh) as usize] << sh) | (*k & lo);
+        }
+    }
+    ks.sort_unstable();
+    let im = (1u64 << ib) - 1;
+    for (o, &k) in out.iter_mut().zip(ks.iter()) {
+        *o = r[(k & im) as usize];
+    }
+    true
 }
 
 /// Smallest one-person range that `sort_evs` orders with `radix_rts`.
