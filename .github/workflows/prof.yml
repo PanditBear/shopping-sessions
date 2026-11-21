@@ -1,0 +1,45 @@
+name: prof (linux perf profile)
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "commit to profile"
+        default: "1d465e9"
+      sizes:
+        description: "events:clicks pairs, space separated"
+        default: "20000000:5000000 60000000:15000000"
+      cpus:
+        description: "cpu count to pin"
+        default: "8"
+permissions:
+  contents: read
+jobs:
+  prof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: prof
+      - name: toolchain
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends musl-tools bc strace
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get install -y -q --no-install-recommends linux-tools-common "linux-tools-$(uname -r)" \
+            || sudo apt-get install -y -q --no-install-recommends linux-tools-common linux-tools-azure || true
+          sudo apt-get install -y -q --no-install-recommends linux-perf || true
+      - name: profile
+        env:
+          SHA: ${{ github.event.inputs.sha }}
+          SIZES: ${{ github.event.inputs.sizes }}
+          CPUS: ${{ github.event.inputs.cpus }}
+        run: bash prof.sh 2>&1 | tee /tmp/prof-log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prof-reports
+          path: |
+            /tmp/pf/out
+            /tmp/prof-log.txt
