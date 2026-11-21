@@ -501,7 +501,7 @@ fn parse_price(b: &[u8]) -> Option<u32> {
     }
 }
 
-fn chunks(data: B) -> Vec<B> {
+fn chunks(data: B, sz: usize) -> Vec<B> {
     let start = match memchr(b'\n', data) {
         Some(i) => i + 1,
         None => return vec![],
@@ -509,7 +509,7 @@ fn chunks(data: B) -> Vec<B> {
     let mut v = vec![];
     let mut a = start;
     while a < data.len() {
-        let mut b = (a + CHUNK).min(data.len());
+        let mut b = (a + sz).min(data.len());
         if b < data.len() {
             b = match memchr(b'\n', &data[b - 1..]) {
                 Some(i) => b - 1 + i + 1,
@@ -562,8 +562,19 @@ fn csv_files(dir: &Path) -> Vec<B> {
     v
 }
 
-fn all_chunks(files: &[B]) -> Vec<B> {
-    files.iter().flat_map(|f| chunks(f)).collect()
+/// Event chunk size. The event-id dedup walks every (bucket, chunk) slice, so on large inputs
+/// small chunks cost more in slice starts and cache misses than they gain in balance: aim for
+/// about 300 chunks in all, never below CHUNK.
+fn ev_chunk(files: &[B]) -> usize {
+    if let Some(mb) = std::env::var("SHOP_CHUNK").ok().and_then(|s| s.parse::<usize>().ok()) {
+        return mb << 20;
+    }
+    let total: usize = files.iter().map(|f| f.len()).sum();
+    (total / 300).next_multiple_of(1 << 20).clamp(CHUNK, 8 * CHUNK)
+}
+
+fn all_chunks(files: &[B], sz: usize) -> Vec<B> {
+    files.iter().flat_map(|f| chunks(f, sz)).collect()
 }
 
 #[inline]
@@ -1393,7 +1404,7 @@ fn main() {
     // products
     let mut prod_raw: Vec<(B, B)> = vec![];
     if let Some(f) = leak_file(&data.join("products.csv")) {
-        for c in chunks(f) {
+        for c in chunks(f, CHUNK) {
             scan::<2>(c, |&[p, c]| prod_raw.push((p, c)));
         }
     }
@@ -1425,7 +1436,7 @@ fn main() {
     let mut channels: Vec<B> = vec![];
     if let Some(f) = leak_file(&data.join("campaigns.csv")) {
         let mut seen: AHashMap<B, u32> = AHashMap::new();
-        for c in chunks(f) {
+        for c in chunks(f, CHUNK) {
             scan::<2>(c, |&[id, ch]| {
                 if !seen.contains_key(id) {
                     seen.insert(id, camp_names.len() as u32);
@@ -1444,7 +1455,7 @@ fn main() {
     tick("prod/camp loaded");
     let rs = hasher();
 
-    let link_chunks = all_chunks(&csv_files(&data.join("links")));
+    let link_chunks = all_chunks(&csv_files(&data.join("links")), CHUNK);
     let link_pairs: Vec<Vec<[u64; 4]>> = link_chunks
         .par_iter()
         .map(|&c| {
@@ -1532,7 +1543,8 @@ fn main() {
             (tab, names_map)
         },
         || {
-            let ev_chunks = all_chunks(&csv_files(&data.join("events")));
+            let ev_files = csv_files(&data.join("events"));
+            let ev_chunks = all_chunks(&ev_files, ev_chunk(&ev_files));
             let cx = EvCtx { prod: &prod, unknown_cat, ws, we, rs: &rs };
             if std::env::var_os("SHOP_PARSE").is_some() {
                 // measurement aid: event parsing alone, serial, into reused buffers
@@ -1650,7 +1662,7 @@ fn main() {
     );
 
     // clicks
-    let click_chunks = all_chunks(&csv_files(&data.join("clicks")));
+    let click_chunks = all_chunks(&csv_files(&data.join("clicks")), CHUNK);
     let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_chunks
         .par_iter()
         .map(|&c| {
