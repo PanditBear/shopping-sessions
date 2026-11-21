@@ -797,7 +797,16 @@ fn unpack(r: u64) -> B {
 fn canon_num(b: &[u8], prefix: &[u8]) -> Option<usize> {
     let pl = prefix.len();
     let n = b.len();
-    if n <= pl || n > pl + 9 || &b[..pl] != prefix || b[pl] == b'0' {
+    if n <= pl || n > pl + 9 || b[pl] == b'0' {
+        return None;
+    }
+    // no memcmp call for the short prefixes (musl's is a byte loop behind a call)
+    let same = match pl {
+        1 => b[0] == prefix[0],
+        2 => (b[0] == prefix[0]) & (b[1] == prefix[1]),
+        _ => &b[..pl] == prefix,
+    };
+    if !same {
         return None;
     }
     let mut v = 0usize;
@@ -857,10 +866,14 @@ impl IdLookup {
     fn get_fast(&self, b: B, lo: usize) -> Option<u32> {
         let n = b.len();
         let p = b.as_ptr() as usize;
-        if self.prefix.len() == 1 && (2..=9).contains(&n) && p + n >= lo + 8 && b[0] == self.prefix[0] && b[1] != b'0' {
+        let pl = self.prefix.len();
+        if (pl == 1 || pl == 2) && n > pl && n <= pl + 8 && p + n >= lo + 8 && b[pl] != b'0' && {
+            let (b0, b1) = (b[0], b[pl - 1]);
+            (b0 == self.prefix[0]) & (b1 == self.prefix[pl - 1])
+        } {
             // SAFETY: [p + n - 8, p + n) lies inside the chunk that starts at lo
             let w = unsafe { std::ptr::read_unaligned((p + n - 8) as *const u64) };
-            let d = (n - 1) as u32;
+            let d = (n - pl) as u32;
             let low = (u64::MAX >> (8 * d - 1)) >> 1;
             let w2 = (w & !low) | (h8(b'0') & low);
             if dig8(w2) {
@@ -3326,7 +3339,7 @@ fn main() {
                 if cid.is_empty() || uid.is_empty() {
                     return;
                 }
-                let Some(ci) = camp.get(cmp) else { return };
+                let Some(ci) = camp.get_fast(cmp, c.as_ptr() as usize) else { return };
                 let Some(t) = parse_ts_c(ts, &mut tc) else { return };
                 if t < ws - WEEK || t >= we {
                     return;
