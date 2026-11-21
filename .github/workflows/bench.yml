@@ -45,6 +45,7 @@ jobs:
           P=$(command -v perf || ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1 || true); echo "perf=$P" | tee -a $R/machine.txt
           $P --version 2>&1 | tee -a $R/machine.txt
           sudo sysctl kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 2>&1 | tee -a $R/machine.txt
+          grep -q "6975P" $R/machine.txt || { echo "SKIP: no counters on this CPU" | tee -a $R/machine.txt; exit 0; }
           curl -sSfL -o $W/gen.zip https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
           echo "13724cadbac5a99d847e27cea911cd2e338ff972b46c2039da87452011bb101e  $W/gen.zip" | sha256sum -c --quiet
           (cd $W && unzip -q -o gen.zip && cd generator && cargo build --release -q)
@@ -94,7 +95,7 @@ jobs:
           rec l1m mem_load_retired.l1_miss ml
           rec tlbs dtlb_store_misses.walk_completed tlb
           rec l3m mem_load_retired.l3_miss ml
-          echo "== done"; ls -l $R; head -20 $R/top.*.txt
+          echo "== done"; ls -l $R; head -20 $R/top.*.txt || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
