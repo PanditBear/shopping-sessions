@@ -1049,6 +1049,9 @@ struct IdTab {
 impl IdTab {
     fn with_cap(n: usize) -> Self {
         let cap = (n + n / 2).max(16).next_power_of_two();
+        Self::with_slots(cap)
+    }
+    fn with_slots(cap: usize) -> Self {
         IdTab { s: vec![[0u64; 2]; cap], shift: 64 - cap.trailing_zeros(), mask: cap - 1, mov: 0 }
     }
     #[inline(always)]
@@ -4383,24 +4386,44 @@ fn main() {
         .collect();
     tick("links parsed");
     // links (serial union-find) overlaps the parallel event parse; events do not need the id table
-    let ((tab, mut names_map), ev_out) = rayon::join(
+    let ((mut tab, root, bk, nl, nroot, mut names_map), ev_out) = rayon::join(
         || {
             let occ: usize = link_pairs.iter().map(|v| v.len()).sum::<usize>() * 2;
             let mut names_map: AHashMap<u64, u64> = AHashMap::new();
-            let tab = {
-                let mut t = IdTab::with_cap(occ);
-                let mut idx_key: Vec<u64> = vec![];
-                let mut idx_ref: Vec<u64> = vec![];
-                let mut parent: Vec<u32> = vec![];
-                fn find(p: &mut [u32], mut x: u32) -> u32 {
-                    while p[x as usize] != x {
-                        let g = p[p[x as usize] as usize];
-                        p[x as usize] = g;
-                        x = g;
+            let (mut t, root, bk, nl, nroot) = {
+                // unique-id estimate by linear counting over the parsed keys (bitmap of 1-4 MB)
+                let est = {
+                    let m = (occ * 2).next_power_of_two().clamp(1 << 16, 1 << 25);
+                    let mut bits = vec![0u64; m / 64];
+                    let sh = 64 - m.trailing_zeros();
+                    for v in &link_pairs {
+                        for e in v {
+                            for k in [e[0], e[2]] {
+                                let h = (mix(k) >> sh) as usize;
+                                bits[h >> 6] |= 1u64 << (h & 63);
+                            }
+                        }
                     }
-                    x
-                }
-                let mut edges: Vec<(u32, u32)> = Vec::with_capacity(occ / 2);
+                    let set: usize = bits.iter().map(|w| w.count_ones() as usize).sum();
+                    let z = (m - set).max(1) as f64;
+                    let e = -(m as f64) * (z / m as f64).ln();
+                    (e as usize).min(occ)
+                };
+                // slots for the estimate plus a margin, load at most about 0.7
+                let mut slots = ((est + est / 8) as f64 * 1.45) as usize;
+                slots = slots.max(16).next_power_of_two();
+                let mut t;
+                let mut idx_key: Vec<u64>;
+                let mut idx_ref: Vec<u64>;
+                let mut parent: Vec<u32>;
+                let mut edges: Vec<(u32, u32)>;
+                'retry: loop {
+                t = IdTab::with_slots(slots);
+                idx_key = vec![];
+                idx_ref = vec![];
+                parent = vec![];
+                let limit = slots / 8 * 7;
+                edges = Vec::with_capacity(occ / 2);
                 for v in &link_pairs {
                     for (n, e) in v.iter().enumerate() {
                         if n + PFD / 2 < v.len() {
@@ -4419,9 +4442,23 @@ fn main() {
                         let a = g(e[0], e[1]);
                         let b = g(e[2], e[3]);
                         edges.push((a, b));
+                        if idx_key.len() > limit {
+                            slots *= 2;
+                            continue 'retry;
+                        }
                     }
                 }
-                tick(&format!("links inserted {}", idx_key.len()));
+                break;
+                }
+                fn find(p: &mut [u32], mut x: u32) -> u32 {
+                    while p[x as usize] != x {
+                        let g = p[p[x as usize] as usize];
+                        p[x as usize] = g;
+                        x = g;
+                    }
+                    x
+                }
+                tick(&format!("links inserted {} est {} slots {}", idx_key.len(), est, slots));
                 // union by index: the larger root goes under the smaller one, so parent[g] <= g always
                 // holds (path halving keeps it too)
                 for (a, b) in edges {
@@ -4471,35 +4508,11 @@ fn main() {
                         }
                     }
                 }
-                // the insert table becomes the id table in place: a slot's index turns into its person key
-                {
-                    let (root, bk) = (&root[..], &bk[..]);
-                    t.s.par_chunks_mut(1 << 14).for_each(|c| {
-                        let n = c.len();
-                        for i in 0..n {
-                            if i + 2 * PFD < n {
-                                prefetch(root.as_ptr().wrapping_add(c[i + 2 * PFD][1] as usize));
-                            }
-                            if i + PFD < n {
-                                let e = c[i + PFD];
-                                if e[0] != 0 {
-                                    prefetch(bk.as_ptr().wrapping_add(root[e[1] as usize] as usize));
-                                }
-                            }
-                            let e = &mut c[i];
-                            if e[0] != 0 {
-                                e[1] = bk[root[e[1] as usize] as usize][0];
-                            }
-                        }
-                    });
-                }
-                t.mov = nl - nroot;
-                tick(&format!("links table movers {} pairs {}", t.mov, occ / 2));
-                t
+                (t, root, bk, nl, nroot)
             };
             drop(link_pairs);
             tick("links done");
-            (tab, names_map)
+            (t, root, bk, nl, nroot, names_map)
         },
         || {
             let ev_files = csv_files(&data.join("events"));
@@ -4611,6 +4624,32 @@ fn main() {
             ev_out
         },
     );
+
+    // the insert table becomes the id table in place (a slot's index turns into its person key), with the whole pool
+    {
+        let (root, bk) = (&root[..], &bk[..]);
+        tab.s.par_chunks_mut(1 << 14).for_each(|c| {
+            let n = c.len();
+            for i in 0..n {
+                if i + 2 * PFD < n {
+                    prefetch(root.as_ptr().wrapping_add(c[i + 2 * PFD][1] as usize));
+                }
+                if i + PFD < n {
+                    let e = c[i + PFD];
+                    if e[0] != 0 {
+                        prefetch(bk.as_ptr().wrapping_add(root[e[1] as usize] as usize));
+                    }
+                }
+                let e = &mut c[i];
+                if e[0] != 0 {
+                    e[1] = bk[root[e[1] as usize] as usize][0];
+                }
+            }
+        });
+    }
+    tab.mov = nl - nroot;
+    drop((root, bk));
+    tick(&format!("links table movers {}", tab.mov));
 
     // clicks
     let click_chunks = all_chunks(&csv_files(&data.join("clicks")), CHUNK);
