@@ -1097,20 +1097,45 @@ impl IdTab {
 struct MoverF {
     w: Vec<AtomicU64>,
     mask: usize,
+    /// movers of generator-form user IDs by generator person, when the user_id key is known
+    g: Option<GpTab>,
 }
 impl MoverF {
     fn build(tab: &IdTab) -> Self {
         let nw = (tab.s.len() / 16).max(1);
         let w: Vec<AtomicU64> = (0..nw).map(|_| AtomicU64::new(0)).collect();
-        tab.s.par_chunks(1 << 15).for_each(|c| {
-            for e in c {
-                if e[0] != 0 && e[0] != e[1] {
-                    let h = mix(e[0]);
-                    w[h as usize & (nw - 1)].fetch_or(Self::bits(h), Relaxed);
+        let ukey = UKEYC.get().copied().flatten();
+        let gn = if ukey.is_some() { 2 * tab.mov + (1 << 16) } else { 0 };
+        let mut ge = vec![0u64; 2 * gn];
+        {
+            // SAFETY: AtomicU64 has the same in-memory representation as u64
+            let ga = unsafe { &*(ge.as_mut_slice() as *mut [u64] as *const [AtomicU64]) };
+            tab.s.par_chunks(1 << 15).for_each(|c| {
+                for e in c {
+                    if e[0] != 0 && e[0] != e[1] {
+                        let h = mix(e[0]);
+                        w[h as usize & (nw - 1)].fetch_or(Self::bits(h), Relaxed);
+                        if let Some(key) = ukey {
+                            GpTab::add(ga, gn, key, e[0], e[1]);
+                        }
+                    }
                 }
-            }
-        });
-        MoverF { w, mask: nw - 1 }
+            });
+        }
+        let g = ukey.map(|key| GpTab { key, n: gn, e: ge });
+        MoverF { w, mask: nw - 1, g }
+    }
+    /// person key of user key k
+    #[inline(always)]
+    fn person(&self, k: u64, tab: &IdTab) -> u64 {
+        if let Some(p) = self.g.as_ref().and_then(|g| g.get(k)) {
+            return p;
+        }
+        if self.hit(k) {
+            tab.get(k)
+        } else {
+            k
+        }
     }
     #[inline(always)]
     fn bits(h: u64) -> u64 {
@@ -1127,6 +1152,57 @@ impl MoverF {
         unsafe { self.w.get_unchecked(h as usize & self.mask) }.load(Relaxed) & b == b
     }
 }
+
+/// Movers among generator-form user IDs ('u' + base36(scramble(person * 512 + alias, key))),
+/// indexed by generator person: two words per person, the person key of its movers and a mask of
+/// the aliases (below GPA) that are movers, bit 63 set when its movers do not share one person
+/// key. Lines in index order come person by person, so lookups walk it in order. Exact: canonical
+/// IDs and indices are in one-to-one correspondence for any key, so a set bit is that key's own
+/// mover entry and a clear bit means the key is not a mover; persons at or above n, aliases at or
+/// above GPA, mixed persons and other IDs take the filter and table.
+struct GpTab {
+    key: u64,
+    n: usize,
+    e: Vec<u64>,
+}
+const GPA: u64 = 16;
+/// pack6 code of 'u'
+const UPRE: u64 = 58;
+impl GpTab {
+    #[inline(always)]
+    fn add(ga: &[AtomicU64], n: usize, key: u64, k: u64, p: u64) {
+        let Some(v) = gen_val(k, UPRE) else { return };
+        let idx = gen_idx(v, key);
+        let (gp, a) = ((idx >> 9) as usize, idx & 511);
+        if a >= GPA || gp >= n {
+            return;
+        }
+        if let Err(o) = ga[2 * gp].compare_exchange(0, p, Relaxed, Relaxed) {
+            if o != p {
+                ga[2 * gp + 1].fetch_or(1 << 63, Relaxed);
+            }
+        }
+        ga[2 * gp + 1].fetch_or(1 << a, Relaxed);
+    }
+    /// person key of user key k, or None when the filter and table must answer
+    #[inline(always)]
+    fn get(&self, k: u64) -> Option<u64> {
+        let v = gen_val(k, UPRE)?;
+        let idx = gen_idx(v, self.key);
+        let (gp, a) = ((idx >> 9) as usize, idx & 511);
+        if a >= GPA || gp >= self.n {
+            return None;
+        }
+        // SAFETY: gp < n and e holds 2n words
+        let (p, m) = unsafe { (*self.e.get_unchecked(2 * gp), *self.e.get_unchecked(2 * gp + 1)) };
+        if m >> 63 != 0 {
+            return None;
+        }
+        Some(if (m >> a) & 1 != 0 { p } else { k })
+    }
+}
+
+static UKEYC: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
 
 const PFD: usize = 12;
 /// prefetch distance of the user -> person passes (mover filter, then table), sized for DRAM latency
@@ -3653,7 +3729,7 @@ fn pk_of(c: &mut PkCache, k: u64, tab: &IdTab, mf: &MoverF) -> u64 {
             return c.p[i];
         }
     }
-    let p = if mf.hit(k) { tab.get(k) } else { k };
+    let p = mf.person(k, tab);
     c.k[c.n & 3] = k;
     c.p[c.n & 3] = p;
     c.n += 1;
@@ -4247,6 +4323,61 @@ fn idx_find(ev_files: &[B], ev_chunks: &[B]) -> Option<IdxCfg> {
     Some(IdxCfg { key, lim, sh, ndb: (lim >> sh) as usize + 1, lpb: lines as f64 / pos as f64 })
 }
 
+/// Recovers the user_id key from the first lines of the first chunk whose event_id and user_id are
+/// both canonical: the sample with the smallest event index has a small generator person (event
+/// indices are given person by person), so a guess of its person and alias fixes the key, which
+/// must then give most samples a small alias. None when SHOP_NOGP is set or no key fits; the key
+/// only decides the speed (GpTab is exact for any key).
+fn ukey_find(ev_chunks: &[B], ekey: u64) -> Option<u64> {
+    if std::env::var_os("SHOP_NOGP").is_some() {
+        return None;
+    }
+    let c = *ev_chunks.first()?;
+    let mut xs: Vec<(u64, u64)> = vec![];
+    let (mut pos, mut lines) = (0usize, 0usize);
+    while xs.len() < 256 && lines < 4096 {
+        let Some(e) = memchr(b'\n', &c[pos..]) else { break };
+        let line = &c[pos..pos + e];
+        lines += 1;
+        pos += e + 1;
+        let mut it = line.splitn(3, |&b| b == b',');
+        let (Some(f0), Some(f1)) = (it.next(), it.next()) else { continue };
+        if let (Some(ve), Some(vu)) = (pack6(f0).and_then(|k| gen_val(k, 42)), pack6(f1).and_then(|k| gen_val(k, UPRE))) {
+            xs.push((gen_idx(ve, ekey), gen_unmix(vu)));
+        }
+    }
+    if xs.len() < 8 {
+        return None;
+    }
+    xs.sort_unstable();
+    // a plausible index: alias below 64 and person below 2^28 (1 in 64 for a wrong key)
+    let ok = |x: u64, k: u64| {
+        let i = (x ^ k).wrapping_mul(GC1I) & GM;
+        (i & 511) < 64 && (i >> 9) < (1 << 28)
+    };
+    let need = (xs.len() * 3).div_ceil(4);
+    let fits = |k: u64| xs.iter().filter(|&&(_, x)| ok(x, k)).count() >= need;
+    let (x1, x2) = (xs[xs.len() / 2].1, xs[xs.len() - 1].1);
+    (0..3).find_map(|p| {
+        let (e0, x0) = xs[p];
+        // persons hold about 30 events each, so the first sampled event's person is far below e0 / 4
+        let top = (e0 / 4 + 4096).min(1 << 28);
+        let blk = 1u64 << 12;
+        (0..top.div_ceil(blk)).into_par_iter().find_map_first(|b| {
+            (b * blk..((b + 1) * blk).min(top)).find_map(|gp| {
+                (0..GPA).find_map(|a| {
+                    let k = x0 ^ ((gp * 512 + a).wrapping_mul(GC1) & GM);
+                    if ok(x1, k) && ok(x2, k) && fits(k) {
+                        Some(k)
+                    } else {
+                        None
+                    }
+                })
+            })
+        })
+    })
+}
+
 /// Parses one chunk: dense records go straight to their buckets, the rest are grouped by event_id
 /// hash bucket.
 fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
@@ -4610,6 +4741,8 @@ fn main() {
                 Some(c) => tick(&format!("idx key found=1 lim={} sh={} ndb={}", c.lim, c.sh, c.ndb)),
                 None => tick("idx key found=0"),
             }
+            let _ = UKEYC.set(idx_cfg().and_then(|c| ukey_find(&ev_chunks, c.key)));
+            tick(&format!("user key found={}", UKEYC.get().copied().flatten().is_some() as u8));
             let cx = EvCtx { prod: &prod, unknown_cat, ws, we, ibase: ws.div_euclid(1000), rs: &rs };
             if std::env::var_os("SHOP_PARSE").is_some() {
                 if lean {
