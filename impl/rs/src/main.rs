@@ -931,6 +931,8 @@ impl MoverF {
 }
 
 const PFD: usize = 12;
+/// prefetch distance of the user -> person passes (mover filter, then table), sized for DRAM latency
+const RPD: usize = 32;
 
 // ---------- records ----------
 
@@ -1963,11 +1965,11 @@ fn pscatter<E: Ev>(mut m: Vec<E>, tab: &IdTab, mf: &MoverF, d: &mut [DRec], fb: 
     // user key -> person key while the chunk is warm (keys that miss the mover filter map to
     // themselves without a table lookup), counting each person bucket
     for i in 0..n {
-        if i + 2 * PFD < n {
-            mf.pf(m[i + 2 * PFD].key());
+        if i + 2 * RPD < n {
+            mf.pf(m[i + 2 * RPD].key());
         }
-        if i + PFD < n {
-            let k = m[i + PFD].key();
+        if i + RPD < n {
+            let k = m[i + RPD].key();
             if k != 0 && mf.hit(k) {
                 tab.pf(k);
             }
@@ -2464,11 +2466,11 @@ fn main() {
             let mut tm = now();
             let n = tmp.len();
             for i in 0..n {
-                if i + 2 * PFD < n {
-                    mf.pf(tmp[i + 2 * PFD].key);
+                if i + 2 * RPD < n {
+                    mf.pf(tmp[i + 2 * RPD].key);
                 }
-                if i + PFD < n {
-                    let k = tmp[i + PFD].key;
+                if i + RPD < n {
+                    let k = tmp[i + RPD].key;
                     if mf.hit(k) {
                         tab.pf(k);
                     }
