@@ -71,9 +71,9 @@ jobs:
             T0=$(sudo $P script -i $W/perf$n.data -F time 2>/dev/null | sed -n 1p | tr -d ' :')
             grep -E '^\[[0-9.]+s\]' $R/rec$n.ticks.txt > $R/phase$n.ticks.txt
             echo "T0=$T0" > $R/phase$n.t0.txt
-            ta=$(grep 'clicks parsed' $R/rec$n.ticks.txt | sed -E 's/^\[([0-9.]+)s\].*//'); tb=$(grep 'dedup done' $R/rec$n.ticks.txt | sed -E 's/^\[([0-9.]+)s\].*//')
-            tc=$(grep 'links table movers' $R/rec$n.ticks.txt | sed -E 's/^\[([0-9.]+)s\].*//')
-            td=$(grep 'events parsed' $R/rec$n.ticks.txt | sed -E 's/^\[([0-9.]+)s\].*//')
+            ta=$(grep 'clicks parsed' $R/rec$n.ticks.txt | sed -E 's/^\[([0-9.]+)s\].*/\1/'); tb=$(grep 'dedup done' $R/rec$n.ticks.txt | sed -E 's/^\[([0-9.]+)s\].*/\1/')
+            tc=$(grep 'links table movers' $R/rec$n.ticks.txt | sed -E 's/^\[([0-9.]+)s\].*/\1/')
+            td=$(grep 'events parsed' $R/rec$n.ticks.txt | sed -E 's/^\[([0-9.]+)s\].*/\1/')
             sudo $P script -i $W/perf$n.data --time $(echo "$T0 + $ta" | bc -l),$(echo "$T0 + $tb" | bc -l) -F tid,time,sym,srcline 2>/dev/null | gzip -6 > $R/dd-srcline$n.txt.gz
             sudo $P script -i $W/perf$n.data --time $(echo "$T0 + 0.3" | bc -l),$(echo "$T0 + $td" | bc -l) -F tid,time,sym,srcline 2>/dev/null | gzip -6 > $R/ev-srcline$n.txt.gz
             sudo $P script -i $W/perf$n.data --no-inline -F tid,time 2>/dev/null | gzip -6 > $R/tidscript$n.txt.gz
