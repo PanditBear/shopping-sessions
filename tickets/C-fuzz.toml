@@ -1,0 +1,4 @@
+id = "C-fuzz"
+files = ["scripts/fuzz_diff.py", "fixtures/F1/", "impl/py/pipeline.py"]
+why = "Differential fuzzer (12k cases, 0 in-spec divergences); F1 fixture: 5000-digit price/ts; pyref no longer crashes on huge ints"
+created = "2026-11-20 18:32:30"
