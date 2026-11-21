@@ -1163,26 +1163,22 @@ use parquet::data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
+use parquet::schema::types::ColumnPath;
 
 fn props() -> Arc<WriterProperties> {
-    let enc: u32 = std::env::var("SHOP_ENC").ok().and_then(|v| v.parse().ok()).unwrap_or(63);
-    let mut b = WriterProperties::builder()
-        .set_compression(Compression::UNCOMPRESSED)
-        .set_statistics_enabled(EnabledStatistics::None)
-        .set_write_batch_size(65536);
-    b = b.set_dictionary_enabled(false).set_dictionary_page_size_limit(64 << 20);
-    let cols = ["user_id", "day", "sessions", "events", "revenue_cents", "top_category"];
-    for (i, c) in cols.iter().enumerate() {
-        if enc & (1 << i) != 0 {
-            b = b.set_column_dictionary_enabled(parquet::schema::types::ColumnPath::from(*c), true);
-        }
-    }
-    if enc & 64 != 0 {
-        b = b.set_column_encoding(parquet::schema::types::ColumnPath::from("user_id"), parquet::basic::Encoding::DELTA_BYTE_ARRAY);
-    } else if enc & 128 != 0 {
-        b = b.set_column_encoding(parquet::schema::types::ColumnPath::from("user_id"), parquet::basic::Encoding::DELTA_LENGTH_BYTE_ARRAY);
-    }
-    Arc::new(b.build())
+    // Dictionary encoding on the low-cardinality columns makes the output about 2.5x smaller for no
+    // measurable write time, and fewer bytes means less writeback when the container exits. user_id stays
+    // plain: its dictionary (or a delta encoding) costs more write time than the smaller output saves.
+    // A dictionary that outgrows the default page limit falls back to plain on its own.
+    Arc::new(
+        WriterProperties::builder()
+            .set_compression(Compression::UNCOMPRESSED)
+            .set_dictionary_enabled(true)
+            .set_column_dictionary_enabled(ColumnPath::from("user_id"), false)
+            .set_statistics_enabled(EnabledStatistics::None)
+            .set_write_batch_size(65536)
+            .build(),
+    )
 }
 
 fn ba(b: &[u8]) -> ByteArray {
@@ -1222,7 +1218,18 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names)
         }
         *nrg += 1;
         let mut rg = w.next_row_group().unwrap();
-        let users: Vec<ByteArray> = buf.iter().map(|r| names.get(r.key)).collect();
+        // rows of one person are adjacent: share the name's bytes instead of decoding it again
+        let mut users: Vec<ByteArray> = Vec::with_capacity(buf.len());
+        let mut last: Option<u64> = None;
+        for r in buf.iter() {
+            if last == Some(r.key) {
+                let v = users[users.len() - 1].clone();
+                users.push(v);
+            } else {
+                users.push(names.get(r.key));
+                last = Some(r.key);
+            }
+        }
         let mut c = rg.next_column().unwrap().unwrap();
         c.typed::<ByteArrayType>().write_batch(&users, None, None).unwrap();
         c.close().unwrap();
