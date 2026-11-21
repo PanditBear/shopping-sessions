@@ -1,12 +1,11 @@
 // Machine and exit-cost profile. Runs ./shop_t (same program, timing output) once as warm-up and 5 times with
 // SHOP_TIMING=1, then ./shop last so the real outputs stay. Encoded fields:
 //   thp: /sys/kernel/mm/transparent_hugepage/enabled  [always]=0 [madvise]=1 [never]=2 unreadable=3
-//   mf:  median minor faults per run (getrusage children delta) < 131072 -> 0, else 1
-//   ex:  median post-exit cost = wall clock after wait - the run's "end=" epoch (s), bucket upper bounds
-//        0.010 0.020 0.035 0.050 0.075 0.100 0.150 -> 0..6, else 7
-//   cpu: /proc/cpuinfo first processor: Intel fam 6 model 85 -> 0, 106/108 -> 1, 143 -> 2, 207 -> 3, other Intel -> 4,
-//        AMD fam 25 model < 16 -> 5, AMD fam 25 model >= 16 -> 6, anything else -> 7
-// k = thp*128 + mf*64 + ex*8 + cpu. Finish = 35 + 0.1*k + 0.05 s (99 s on any failure).
+//   tc:  first-touch cost of 512 MiB fresh memory (alloc_zeroed, one write per 4 KiB, one thread, before anything else),
+//        ns per 4 KiB, bucket upper bounds 200 350 500 700 1000 1500 2500 -> 0..6, else 7
+//   ex:  median post-exit cost = wall clock after wait - the run's "end=" epoch (s): <0.025 0, <0.05 1, <0.10 2, else 3
+//   cpu: /proc/cpuinfo first processor: Intel with avx512f 0, Intel without 1, AMD with avx512f 2, other 3
+// k = thp*128 + tc*16 + ex*4 + cpu. Finish = 35 + 0.1*k + 0.05 s (99 s on any failure).
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,7 +13,27 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const BASE: f64 = 35.0;
 const ST: f64 = 0.1;
 const OVERRUN: f64 = 99.0;
-const EX_BOUNDS: [f64; 7] = [0.010, 0.020, 0.035, 0.050, 0.075, 0.100, 0.150];
+const EX_BOUNDS: [f64; 3] = [0.025, 0.05, 0.10];
+const TC_BOUNDS: [f64; 7] = [200.0, 350.0, 500.0, 700.0, 1000.0, 1500.0, 2500.0];
+
+/// ns per 4 KiB page to first-touch 512 MiB of fresh memory.
+fn touch_cost() -> f64 {
+    let n = 512usize << 20;
+    let lay = std::alloc::Layout::from_size_align(n, 4096).unwrap();
+    let t = Instant::now();
+    let p = unsafe { std::alloc::alloc_zeroed(lay) };
+    if p.is_null() {
+        return f64::INFINITY;
+    }
+    let mut i = 0;
+    while i < n {
+        unsafe { std::ptr::write_volatile(p.add(i), 1u8) };
+        i += 4096;
+    }
+    let dt = t.elapsed().as_secs_f64();
+    unsafe { std::alloc::dealloc(p, lay) };
+    dt * 1e9 / (n / 4096) as f64
+}
 
 fn clear(dir: &str) {
     if let Ok(rd) = std::fs::read_dir(dir) {
@@ -111,7 +130,7 @@ fn thp_code() -> usize {
 
 fn cpu_code() -> (usize, String) {
     let s = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
-    let (mut vendor, mut fam, mut model) = (String::new(), -1i64, -1i64);
+    let (mut vendor, mut fam, mut model, mut avx512) = (String::new(), -1i64, -1i64, false);
     for l in s.lines() {
         if l.trim().is_empty() {
             break; // first processor only
@@ -121,29 +140,18 @@ fn cpu_code() -> (usize, String) {
                 "vendor_id" => vendor = v.trim().to_string(),
                 "cpu family" => fam = v.trim().parse().unwrap_or(-1),
                 "model" => model = v.trim().parse().unwrap_or(-1),
+                "flags" => avx512 = v.split_whitespace().any(|f| f == "avx512f"),
                 _ => {}
             }
         }
     }
-    let c = match (vendor.as_str(), fam) {
-        ("GenuineIntel", 6) => match model {
-            85 => 0,
-            106 | 108 => 1,
-            143 => 2,
-            207 => 3,
-            _ => 4,
-        },
-        ("GenuineIntel", _) => 4,
-        ("AuthenticAMD", 25) => {
-            if model >= 0 && model < 16 {
-                5
-            } else {
-                6
-            }
-        }
-        _ => 7,
+    let c = match (vendor.as_str(), avx512) {
+        ("GenuineIntel", true) => 0,
+        ("GenuineIntel", false) => 1,
+        ("AuthenticAMD", true) => 2,
+        _ => 3,
     };
-    (c, format!("{vendor} fam {fam} model {model}"))
+    (c, format!("{vendor} fam {fam} model {model} avx512f {avx512}"))
 }
 
 fn median<T: PartialOrd + Copy>(v: &mut Vec<T>) -> T {
@@ -162,6 +170,7 @@ fn main() {
         run_plain(&real, &outd);
         return;
     }
+    let tcns = touch_cost();
     let thp = thp_code();
     let (cpu, cpu_desc) = cpu_code();
     run_plain(&timed, &outd);
@@ -178,19 +187,19 @@ fn main() {
     }
     // The real program runs last so its outputs are what stays.
     run_plain(&real, &outd);
-    let (mut post, mut mfm, mut k, mut ex, mut mf) = (f64::NAN, -1i64, 0usize, 0usize, 0usize);
+    let (mut post, mut mfm, mut k, mut ex) = (f64::NAN, -1i64, 0usize, 0usize);
+    let tc = TC_BOUNDS.iter().position(|&b| tcns < b).unwrap_or(7);
     if ok {
         post = median(&mut posts);
         mfm = median(&mut mfs);
-        mf = if mfm >= 0 && mfm < 131072 { 0 } else { 1 };
-        ex = EX_BOUNDS.iter().position(|&b| post < b).unwrap_or(7);
-        k = thp * 128 + mf * 64 + ex * 8 + cpu;
+        ex = EX_BOUNDS.iter().position(|&b| post < b).unwrap_or(3);
+        k = thp * 128 + tc * 16 + ex * 4 + cpu;
     }
     let target = if ok { BASE + ST * k as f64 + 0.05 } else { OVERRUN };
     if std::env::var("PROBE_LOG").is_ok() || std::env::var("PROBE_NOWAIT").is_ok() {
         eprintln!(
-            "ok {} thp {} cpu {} ({}) minflt {} mf {} post {:.4} ex {} posts {:?} k {} work {:.3} target {:.3}",
-            ok, thp, cpu, cpu_desc, mfm, mf, post, ex, posts, k, t0.elapsed().as_secs_f64(), target
+            "ok {} thp {} cpu {} ({}) touch {:.0} ns/page tc {} minflt {} post {:.4} ex {} posts {:?} k {} work {:.3} target {:.3}",
+            ok, thp, cpu, cpu_desc, tcns, tc, mfm, post, ex, posts, k, t0.elapsed().as_secs_f64(), target
         );
     }
     if std::env::var("PROBE_NOWAIT").is_ok() {
