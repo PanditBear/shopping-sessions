@@ -3472,7 +3472,7 @@ struct EvChunk<E> {
 
 #[allow(clippy::too_many_arguments)]
 fn ev_after<E: Ev>(
-    mut ev_out: Vec<EvChunk<E>>,
+    ev_out: Vec<EvChunk<E>>,
     tab: &IdTab,
     mf: &MoverF,
     click_out: &[(Vec<ClickRec>, Vec<u32>)],
@@ -3482,9 +3482,10 @@ fn ev_after<E: Ev>(
     d0: i64,
     nd: usize,
     tick: &dyn Fn(&str),
+    own: Option<&Own>,
 ) -> Vec<(Vec<Vec<UD>>, CampAcc)> {
-    if let Some(cfg) = idx_cfg() {
-        return ev_after_idx(ev_out, tab, mf, click_out, ws, we, ncamp, d0, nd, tick, cfg);
+    if let (Some(cfg), Some(own)) = (idx_cfg(), own) {
+        return ev_after_idx(ev_out, tab, mf, click_out, ws, we, ncamp, d0, nd, tick, cfg, own);
     }
     // dedup on event_id: every line has a global index (chunk base + its index in the chunk);
     // each event_id's losers are marked in the dead bitmap. Each task takes DDG consecutive
@@ -3759,24 +3760,96 @@ fn pk_of(c: &mut PkCache, k: u64, tab: &IdTab, mf: &MoverF) -> u64 {
     p
 }
 
-/// Groups kept lines (person keys set) by person bucket, keeping their order inside a bucket.
-fn pb_scatter<E: Ev>(em: &[E]) -> (Vec<E>, Vec<u32>) {
-    let mut cnt = vec![0u32; PB + 1];
-    for e in em {
-        cnt[pbk(e.key()) + 1] += 1;
+/// dedup task width in dense buckets (shared by Own and the dense dedup)
+const DG: usize = 4;
+
+/// Owner partitions aligned to the dedup tasks: a person key belongs to task `owner(pk)`. The
+/// generator's person index runs in step with the dense event index, so a person's events mostly
+/// sit in the dedup task that owns the person. Pure function of the final person key.
+struct Own {
+    b: Vec<u64>,
+    tbl: Vec<u32>,
+    gs: u32,
+    ukey: Option<u64>,
+    nt: usize,
+}
+
+impl Own {
+    #[inline(always)]
+    fn owner(&self, pk: u64) -> usize {
+        if let Some(uk) = self.ukey {
+            if let Some(v) = gen_val(pk, UPRE) {
+                let gp = gen_idx(v, uk) >> 9;
+                let j = ((gp >> self.gs) as usize).min(self.tbl.len() - 1);
+                let mut t = self.tbl[j] as usize;
+                while t + 1 < self.nt && gp >= self.b[t + 1] {
+                    t += 1;
+                }
+                return t;
+            }
+        }
+        ((mix(pk) >> 7) as usize) % self.nt
     }
-    for p in 0..PB {
+}
+
+fn build_own<E: Ev>(ev: &[EvChunk<E>], cfg: IdxCfg, ukey: Option<u64>) -> Own {
+    let nt = cfg.ndb.div_ceil(DG).max(1);
+    let mut b = vec![0u64; nt + 1];
+    for t in 1..nt {
+        let bk = t * DG;
+        let mut best: Option<(u32, u64)> = None;
+        let mut n = 0usize;
+        'o: for c in ev {
+            let (sa, _, oa, _) = c.dz.seg(bk);
+            for x in sa.iter().chain(oa.iter()) {
+                if best.is_none_or(|bb| x.i < bb.0) {
+                    best = Some((x.i, x.e.key()));
+                }
+                n += 1;
+                if n >= 64 {
+                    break 'o;
+                }
+            }
+        }
+        let gp = ukey.and_then(|uk| best.and_then(|(_, k)| gen_val(k, UPRE).map(|v| gen_idx(v, uk) >> 9)));
+        b[t] = gp.unwrap_or(b[t - 1]).max(b[t - 1]);
+    }
+    b[nt] = u64::MAX;
+    let top = b[nt - 1];
+    let mut gs = 0u32;
+    while (top >> gs) >= 65536 {
+        gs += 1;
+    }
+    let len = ((top >> gs) + 1) as usize;
+    let mut tbl = vec![0u32; len];
+    let mut t = 0usize;
+    for (j, e) in tbl.iter_mut().enumerate() {
+        let lo = (j as u64) << gs;
+        while t + 1 < nt && b[t + 1] <= lo {
+            t += 1;
+        }
+        *e = t as u32;
+    }
+    Own { b, tbl, gs, ukey, nt }
+}
+
+/// Groups events by owner (`ow[i]` = owner of em[i]) into nt ranges, keeping their order.
+fn own_scatter<E: Ev>(em: &[E], ow: &[u32], nt: usize) -> (Vec<E>, Vec<u32>) {
+    let mut cnt = vec![0u32; nt + 1];
+    for &o in ow {
+        cnt[o as usize + 1] += 1;
+    }
+    for p in 0..nt {
         cnt[p + 1] += cnt[p];
     }
-    let tot = cnt[PB] as usize;
+    let tot = cnt[nt] as usize;
     let mut out: Vec<E> = Vec::with_capacity(tot);
     {
         let mut w = cnt.clone();
         let sp = out.spare_capacity_mut();
-        for e in em {
-            let p = pbk(e.key());
-            sp[w[p] as usize].write(*e);
-            w[p] += 1;
+        for (e, &o) in em.iter().zip(ow) {
+            sp[w[o as usize] as usize].write(*e);
+            w[o as usize] += 1;
         }
     }
     unsafe { out.set_len(tot) };
@@ -3796,6 +3869,7 @@ fn ev_after_idx<E: Ev>(
     nd: usize,
     tick: &dyn Fn(&str),
     cfg: IdxCfg,
+    own: &Own,
 ) -> Vec<(Vec<Vec<UD>>, CampAcc)> {
     let _ = we;
     let ndb = cfg.ndb;
@@ -3814,7 +3888,10 @@ fn ev_after_idx<E: Ev>(
         let all: usize = dense + ev_out.iter().map(|c| c.d.len() + c.fb.len()).sum::<usize>();
         tick(&format!("idx dense records {dense} of {all} ({:.5}) overflow {ov} slots {slots}", dense as f64 / all.max(1) as f64));
     }
-    let parts: Vec<(Vec<E>, Vec<u32>)> = {
+    let nt = own.nt;
+    let spilled = AtomicU64::new(0);
+    let kept_n = AtomicU64::new(0);
+    let parts: Vec<(Vec<E>, Vec<E>, Vec<u32>)> = {
         let side_any = ev_out.iter().any(|c| !c.side.is_empty());
         let dside_any = ev_out.iter().any(|c| !c.dz.dside.is_empty());
         let ibase = ws.div_euclid(1000);
@@ -3844,7 +3921,7 @@ fn ev_after_idx<E: Ev>(
             || {
                 // dense buckets: one slot per index; the slot keeps the winning copy (smallest
                 // ingest), then the slots are read in index order
-                const G: usize = 4;
+                const G: usize = DG;
                 let span = 1usize << cfg.sh;
                 let mask = span as u64 - 1;
                 (0..ndb.div_ceil(G))
@@ -3855,6 +3932,9 @@ fn ev_after_idx<E: Ev>(
                         let mut lb: Vec<E> = Vec::new();
                         let mut lg: Vec<u64> = Vec::new();
                         let mut em: Vec<E> = Vec::new();
+                        let mut sp: Vec<E> = Vec::new();
+                        let mut so: Vec<u32> = Vec::new();
+                        let (mut lastp, mut lasto) = (u64::MAX, 0u32);
                         let mut pc = PkCache { k: [0; 4], p: [0; 4], n: 0 };
                         for b in g * G..((g + 1) * G).min(ndb) {
                             lb.clear();
@@ -3910,17 +3990,30 @@ fn ev_after_idx<E: Ev>(
                                         *o = u64::MAX;
                                         let k = e.key();
                                         if k != 0 {
-                                            e.set_key(pk_of(&mut pc, k, tab, mf));
-                                            em.push(e);
+                                            let pk = pk_of(&mut pc, k, tab, mf);
+                                            e.set_key(pk);
+                                            if pk != lastp {
+                                                lastp = pk;
+                                                lasto = own.owner(pk) as u32;
+                                            }
+                                            if lasto as usize == g {
+                                                em.push(e);
+                                            } else {
+                                                sp.push(e);
+                                                so.push(lasto);
+                                            }
                                         }
                                     }
                                 }
                             }
                             pt(4, &mut tm);
                         }
-                        let r = pb_scatter(&em);
+                        let mut tm = now();
+                        spilled.fetch_add(sp.len() as u64, Relaxed);
+                        kept_n.fetch_add((sp.len() + em.len()) as u64, Relaxed);
+                        let (sv, so) = own_scatter(&sp, &so, nt);
                         pt(5, &mut tm);
-                        r
+                        (em, sv, so)
                     })
                     .collect::<Vec<_>>()
             },
@@ -4015,9 +4108,12 @@ fn ev_after_idx<E: Ev>(
                     e.set_key(pk_of(&mut pc, k, tab, mf));
                     true
                 });
-                let r = pb_scatter(&em);
+                let ow: Vec<u32> = em.iter().map(|e| own.owner(e.key()) as u32).collect();
+                spilled.fetch_add(em.len() as u64, Relaxed);
+                kept_n.fetch_add(em.len() as u64, Relaxed);
+                let (sv, so) = own_scatter(&em, &ow, nt);
                 pt(5, &mut tm);
-                r
+                (Vec::new(), sv, so)
             },
         );
         parts.push(rest);
@@ -4025,29 +4121,82 @@ fn ev_after_idx<E: Ev>(
     };
     drop(ev_out);
     tick("dedup done");
+    if TIMING.load(Relaxed) {
+        let (s, k) = (spilled.load(Relaxed), kept_n.load(Relaxed));
+        tick(&format!("owner spill {s} of {k} ({:.4}) nt {nt}", s as f64 / k.max(1) as f64));
+    }
 
-    let ngroups = (rayon::current_num_threads() * 4).clamp(1, PB);
-    let per = PB.div_ceil(ngroups);
-    (0..ngroups)
+    let mut parts = parts;
+    let rest = parts.pop().unwrap();
+    let mut ems: Vec<Vec<E>> = parts.iter_mut().map(|p| std::mem::take(&mut p.0)).collect();
+    parts.push(rest);
+    assert_eq!(ems.len(), nt);
+    // groups of consecutive tasks with about equal work (events, spills, clicks), dispatched
+    // largest first
+    let work: Vec<usize> = (0..nt)
+        .map(|t| {
+            ems[t].len()
+                + parts.iter().map(|(_, _, o)| (o[t + 1] - o[t]) as usize).sum::<usize>()
+                + click_out.iter().map(|(_, o)| (o[t + 1] - o[t]) as usize).sum::<usize>()
+        })
+        .collect();
+    let total: usize = work.iter().sum();
+    let target = (total / (rayon::current_num_threads() * 8).max(1)).max(1);
+    let mut bounds: Vec<(usize, usize, usize)> = vec![];
+    {
+        let (mut st, mut w) = (0usize, 0usize);
+        for t in 0..nt {
+            if w > 0 && w + work[t] > target && (w >= target || work[t] >= target) {
+                bounds.push((st, t, w));
+                st = t;
+                w = 0;
+            }
+            w += work[t];
+            if w >= target {
+                bounds.push((st, t + 1, w));
+                st = t + 1;
+                w = 0;
+            }
+        }
+        if st < nt {
+            bounds.push((st, nt, w));
+        }
+    }
+    bounds.sort_by_key(|b| std::cmp::Reverse(b.2));
+    if TIMING.load(Relaxed) {
+        let mut ws_: Vec<usize> = bounds.iter().map(|b| b.2).collect();
+        ws_.sort_unstable();
+        tick(&format!("groups {} work max {} median {} (x{:.2}) target {target}", ws_.len(), ws_[ws_.len() - 1], ws_[ws_.len() / 2], ws_[ws_.len() - 1] as f64 / ws_[ws_.len() / 2].max(1) as f64));
+    }
+    let slots: Vec<std::sync::Mutex<Vec<Vec<E>>>> = bounds
+        .iter()
+        .map(|&(a, b, _)| std::sync::Mutex::new(ems[a..b].iter_mut().map(std::mem::take).collect()))
+        .collect();
+    let ticket = std::sync::atomic::AtomicUsize::new(0);
+    (0..bounds.len())
         .into_par_iter()
-        .map(|g| {
+        .map(|_| {
+            let g = ticket.fetch_add(1, Relaxed);
+            let (a, _, _) = bounds[g];
+            let ch = std::mem::take(&mut *slots[g].lock().unwrap());
             let mut cm = CampAcc::new(ncamp + 1, d0, nd);
             let mut win = Win { cnt: vec![0; ncamp + 1], pos: vec![0; ncamp + 1], active: vec![] };
             let mut out = vec![];
-            let mut evs: Vec<E> = vec![];
+            let mut evs: Vec<E>;
             let mut tmp: Vec<E> = vec![];
             let mut runs: Vec<Run> = vec![];
             let mut cnt: Vec<u32> = vec![];
             let mut cl: Vec<ClickRec> = vec![];
             let mut ctmp: Vec<ClickRec> = vec![];
-            for p in g * per..((g + 1) * per).min(PB) {
+            for (i, slot) in ch.into_iter().enumerate() {
+                let p = a + i;
                 let mut tm = now();
                 cl.clear();
                 for (v, o) in click_out.iter() {
                     cl.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
                 }
-                evs.clear();
-                for (v, o) in parts.iter() {
+                evs = slot;
+                for (_, v, o) in parts.iter() {
                     evs.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
                 }
                 pt(6, &mut tm);
@@ -4120,10 +4269,17 @@ fn process_runs<E: Ev>(
             &evs[runs[a].s as usize..(runs[a].s + runs[a].l) as usize]
         } else {
             tmp.clear();
+            let mut sorted = true;
+            let mut last = 0u64;
             for r in &runs[a..b] {
-                tmp.extend_from_slice(&evs[r.s as usize..(r.s + r.l) as usize]);
+                let sl = &evs[r.s as usize..(r.s + r.l) as usize];
+                sorted &= r.ok && sl[0].rts() >= last;
+                last = sl[sl.len() - 1].rts();
+                tmp.extend_from_slice(sl);
             }
-            tmp.sort_unstable_by_key(|e| e.rts());
+            if !sorted {
+                tmp.sort_unstable_by_key(|e| e.rts());
+            }
             &tmp[..]
         };
         while ci < clicks.len() && (dg(clicks[ci].key), clicks[ci].key) < (pd, pid) {
@@ -4959,6 +5115,13 @@ fn main() {
     let mut tm = now();
     let mf = MoverF::build(&tab);
     pt(4, &mut tm);
+    let own: Option<Own> = idx_cfg().map(|c| match &ev_out {
+        Evs::L(v) => build_own(v, c, UKEYC.get().copied().flatten()),
+        Evs::W(v) => build_own(v, c, UKEYC.get().copied().flatten()),
+    });
+    let nown = own.as_ref().map_or(PB, |o| o.nt);
+    let own_ref = own.as_ref();
+    let bkt = |k: u64| -> usize { own_ref.map_or_else(|| pbk(k), |o| o.owner(k)) };
     let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_chunks
         .par_iter()
         .map(|&c| {
@@ -4971,7 +5134,7 @@ fn main() {
             // those, and both count the person buckets of the final keys on the way.
             let n = tmp.len();
             let mut hit = vec![0u32; n + 1];
-            let mut cnt = vec![0u32; PB + 1];
+            let mut cnt = vec![0u32; nown + 1];
             let mut m = 0usize;
             for i in 0..n {
                 if i + RPD < n {
@@ -4981,7 +5144,7 @@ fn main() {
                 let h = mf.hit(k);
                 hit[m] = i as u32;
                 m += h as usize;
-                cnt[pbk(k) + 1] += (!h) as u32;
+                cnt[bkt(k) + 1] += (!h) as u32;
             }
             for j in 0..m {
                 if j + RPD < m {
@@ -4990,10 +5153,10 @@ fn main() {
                 let i = hit[j] as usize;
                 let k = tab.get(tmp[i].key);
                 tmp[i].key = k;
-                cnt[pbk(k) + 1] += 1;
+                cnt[bkt(k) + 1] += 1;
             }
             drop(hit);
-            let r = scatter_counted(&tmp, cnt, |x| pbk(x.key));
+            let r = scatter_counted(&tmp, cnt, |x| bkt(x.key));
             pt(10, &mut tm);
             r
         })
@@ -5008,8 +5171,8 @@ fn main() {
     let d0 = ws.div_euclid(DAY);
     let nd = if we > ws { ((we - 1).div_euclid(DAY) - d0 + 1) as usize } else { 0 };
     let results = match ev_out {
-        Evs::L(v) => ev_after(v, &tab, &mf, &click_out, ws, we, ncamp, d0, nd, &tick),
-        Evs::W(v) => ev_after(v, &tab, &mf, &click_out, ws, we, ncamp, d0, nd, &tick),
+        Evs::L(v) => ev_after(v, &tab, &mf, &click_out, ws, we, ncamp, d0, nd, &tick, own_ref),
+        Evs::W(v) => ev_after(v, &tab, &mf, &click_out, ws, we, ncamp, d0, nd, &tick, own_ref),
     };
     tick("sessionized");
 
