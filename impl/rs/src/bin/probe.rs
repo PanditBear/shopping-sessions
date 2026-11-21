@@ -1,188 +1,80 @@
-// Input read-speed profile. Runs ./shop (the real program) once, then re-reads every input file three ways:
-//   g1: fresh mmap of every file, 8 threads, each sums every u64 of its chunks (first touch of the new mapping)
-//   g2: the same mappings read again (already faulted in)
-//   g3: pread into a per-thread reused 2 MiB buffer with a fresh fd per chunk, 8 threads, sums every u64
-// Each is GB/s = total bytes / wall, level: <1 0, <2 1, <4 2, <6 3, <9 4, <13 5, <18 6, else 7.
-// k = g1*64 + g2*8 + g3. Finish = 35 + 0.1*k + 0.05 s (99 s on any failure).
-use std::fs::File;
-use std::hint::black_box;
-use std::path::{Path, PathBuf};
+// Kernel-side cost profile of the real program. Runs ./shop three times; after each run reads this process's
+// /proc/self/stat children totals (cminflt, cutime, cstime; USER_HZ = 100) and takes the deltas. Uses the run
+// with the median wall time:
+//   s: stime / (utime + stime)      levels <0.03 0, <0.06 1, <0.10 2, <0.15 3, <0.20 4, <0.30 5, <0.45 6, else 7
+//   f: minor faults of the run      levels <20k 0, <50k 1, <100k 2, <200k 3, <350k 4, <500k 5, <800k 6, else 7
+//   u: (utime + stime) / wall       levels <3 0, <4 1, <5 2, <5.5 3, <6 4, <6.5 5, <7 6, else 7
+// k = s*64 + f*8 + u. Finish = 35 + 0.1*k + 0.05 s; 99 s if shop fails or /proc/self/stat is unreadable.
+use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const BASE: f64 = 35.0;
 const ST: f64 = 0.1;
 const OVERRUN: f64 = 99.0;
-const NT: usize = 8;
-const CHUNK: usize = 2 << 20;
-const BOUNDS: [f64; 7] = [1.0, 2.0, 4.0, 6.0, 9.0, 13.0, 18.0];
+const SB: [f64; 7] = [0.03, 0.06, 0.10, 0.15, 0.20, 0.30, 0.45];
+const FB: [f64; 7] = [20e3, 50e3, 100e3, 200e3, 350e3, 500e3, 800e3];
+const UB: [f64; 7] = [3.0, 4.0, 5.0, 5.5, 6.0, 6.5, 7.0];
 
-fn level(gbs: f64) -> usize {
-    BOUNDS.iter().position(|&b| gbs < b).unwrap_or(7)
+fn level(x: f64, b: &[f64; 7]) -> usize {
+    b.iter().position(|&v| x < v).unwrap_or(7)
 }
 
-fn sum_bytes(b: &[u8]) -> u64 {
-    let (h, m, t) = unsafe { b.align_to::<u64>() };
-    let mut s = 0u64;
-    for &x in h {
-        s = s.wrapping_add(x as u64);
-    }
-    let (mut a0, mut a1, mut a2, mut a3) = (0u64, 0u64, 0u64, 0u64);
-    let mut c = m.chunks_exact(4);
-    for q in &mut c {
-        a0 = a0.wrapping_add(q[0]);
-        a1 = a1.wrapping_add(q[1]);
-        a2 = a2.wrapping_add(q[2]);
-        a3 = a3.wrapping_add(q[3]);
-    }
-    for &x in c.remainder() {
-        a0 = a0.wrapping_add(x);
-    }
-    for &x in t {
-        s = s.wrapping_add(x as u64);
-    }
-    s.wrapping_add(a0).wrapping_add(a1).wrapping_add(a2).wrapping_add(a3)
+/// (cminflt, cutime, cstime) from a /proc/<pid>/stat line: fields 11, 16 and 17, counted after the
+/// parenthesised comm (which may hold spaces or parentheses).
+fn parse_stat(s: &str) -> Option<(u64, u64, u64)> {
+    let rest = &s[s.rfind(')')? + 1..];
+    let t: Vec<&str> = rest.split_whitespace().collect();
+    // t[0] is field 3 (state), so field n is t[n - 3]
+    let g = |n: usize| t.get(n - 3).and_then(|x| x.parse::<u64>().ok());
+    Some((g(11)?, g(16)?, g(17)?))
 }
 
-fn list_files(p: &Path, depth: u32, out: &mut Vec<(PathBuf, u64)>) {
-    if let Ok(rd) = std::fs::read_dir(p) {
-        let mut v: Vec<_> = rd.flatten().collect();
-        v.sort_by_key(|e| e.path());
-        for e in v {
-            if let Ok(m) = std::fs::metadata(e.path()) {
-                if m.is_dir() {
-                    if depth < 4 {
-                        list_files(&e.path(), depth + 1, out);
-                    }
-                } else if m.len() > 0 {
-                    out.push((e.path(), m.len()));
-                }
-            }
-        }
-    }
-}
-
-/// Chunk list over all files: (file index, start, end).
-fn chunks(files: &[(PathBuf, u64)]) -> Vec<(usize, usize, usize)> {
-    let mut v = vec![];
-    for (i, (_, len)) in files.iter().enumerate() {
-        let len = *len as usize;
-        let mut s = 0;
-        while s < len {
-            let e = (s + CHUNK).min(len);
-            v.push((i, s, e));
-            s = e;
-        }
-    }
-    v
-}
-
-fn run_threads<F: Fn() -> u64 + Sync>(f: F) -> (f64, u64) {
-    let t = Instant::now();
-    let tot = std::thread::scope(|sc| {
-        let hs: Vec<_> = (0..NT).map(|_| sc.spawn(&f)).collect();
-        hs.into_iter().fold(0u64, |a, h| a.wrapping_add(h.join().unwrap_or(0)))
-    });
-    (t.elapsed().as_secs_f64(), tot)
-}
-
-#[cfg(unix)]
-fn pread(f: &File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
-    std::os::unix::fs::FileExt::read_at(f, buf, off)
-}
-#[cfg(not(unix))]
-fn pread(f: &File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
-    std::os::windows::fs::FileExt::seek_read(f, buf, off)
+fn read_stat() -> Option<(u64, u64, u64)> {
+    parse_stat(&std::fs::read_to_string("/proc/self/stat").ok()?)
 }
 
 fn main() {
     let t0 = Instant::now();
+    // the format check runs everywhere, so a parse bug shows up in the local run too
+    let sample = "4242 (a b) c) S 1 4242 4242 0 -1 4194560 120 7700 0 3 11 5 433 61 20 0 9 0 99 1 2";
+    let ok_parse = parse_stat(sample) == Some((7700, 433, 61));
     let dir: PathBuf = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_else(|| "/app".into());
     let real = dir.join(format!("shop{}", std::env::consts::EXE_SUFFIX));
-    let data = std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into());
-    let mut files = vec![];
-    list_files(Path::new(&data), 0, &mut files);
-    let total: u64 = files.iter().map(|f| f.1).sum();
-    match Command::new(&real).status() {
-        Ok(s) if s.success() => {}
-        _ => std::process::exit(1),
+    let mut runs: Vec<(f64, u64, u64, u64)> = vec![];
+    let mut ok = ok_parse;
+    for _ in 0..3 {
+        let a = read_stat();
+        let t = Instant::now();
+        match Command::new(&real).status() {
+            Ok(s) if s.success() => {}
+            _ => std::process::exit(1),
+        }
+        let w = t.elapsed().as_secs_f64();
+        let b = read_stat();
+        match (a, b) {
+            (Some(a), Some(b)) => runs.push((w, b.0 - a.0, b.1 - a.1, b.2 - a.2)),
+            _ => ok = false,
+        }
     }
-    if total < 300_000_000 {
-        return;
-    }
-    let ch = chunks(&files);
-    let mut ok = true;
-    let maps: Vec<Option<memmap2::Mmap>> =
-        files.iter().map(|(p, _)| File::open(p).ok().and_then(|f| unsafe { memmap2::Mmap::map(&f).ok() })).collect();
-    if maps.iter().any(|m| m.is_none()) {
+    let (mut s, mut f, mut u, mut k) = (0.0, 0.0, 0.0, 0usize);
+    if ok && runs.len() == 3 {
+        let mut r = runs.clone();
+        r.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+        let (w, mf, ut, stt) = r[1];
+        let cpu = (ut + stt) as f64 / 100.0;
+        s = if ut + stt > 0 { stt as f64 / (ut + stt) as f64 } else { 0.0 };
+        f = mf as f64;
+        u = if w > 0.0 { cpu / w } else { 0.0 };
+        k = level(s, &SB) * 64 + level(f, &FB) * 8 + level(u, &UB);
+    } else {
         ok = false;
     }
-    let gb = total as f64 / 1e9;
-    let next = AtomicUsize::new(0);
-    let map_pass = || {
-        let mut s = 0u64;
-        loop {
-            let i = next.fetch_add(1, Ordering::Relaxed);
-            if i >= ch.len() {
-                break;
-            }
-            let (f, a, b) = ch[i];
-            if let Some(m) = &maps[f] {
-                s = s.wrapping_add(sum_bytes(&m[a..b]));
-            }
-        }
-        s
-    };
-    let (w1, s1) = run_threads(&map_pass);
-    next.store(0, Ordering::Relaxed);
-    let (w2, s2) = run_threads(&map_pass);
-    next.store(0, Ordering::Relaxed);
-    let bad = AtomicUsize::new(0);
-    let read_pass = || {
-        let mut buf = vec![0u64; CHUNK / 8];
-        let bytes: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, CHUNK) };
-        let mut s = 0u64;
-        loop {
-            let i = next.fetch_add(1, Ordering::Relaxed);
-            if i >= ch.len() {
-                break;
-            }
-            let (f, a, b) = ch[i];
-            let fd = match File::open(&files[f].0) {
-                Ok(x) => x,
-                Err(_) => {
-                    bad.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-            };
-            let mut got = 0;
-            while got < b - a {
-                match pread(&fd, &mut bytes[got..b - a], (a + got) as u64) {
-                    Ok(0) | Err(_) => {
-                        bad.fetch_add(1, Ordering::Relaxed);
-                        break;
-                    }
-                    Ok(n) => got += n,
-                }
-            }
-            s = s.wrapping_add(sum_bytes(&bytes[..got]));
-        }
-        s
-    };
-    let (w3, s3) = run_threads(&read_pass);
-    if bad.load(Ordering::Relaxed) > 0 {
-        ok = false;
-    }
-    black_box((s1, s2, s3));
-    let (r1, r2, r3) = (gb / w1, gb / w2, gb / w3);
-    let (g1, g2, g3) = (level(r1), level(r2), level(r3));
-    let k = g1 * 64 + g2 * 8 + g3;
     let target = if ok { BASE + ST * k as f64 + 0.05 } else { OVERRUN };
     if std::env::var("PROBE_LOG").is_ok() || std::env::var("PROBE_NOWAIT").is_ok() {
         eprintln!(
-            "ok {} bytes {} files {} g1 {:.2} GB/s ({}) g2 {:.2} ({}) g3 {:.2} ({}) sums {:x} {:x} {:x} k {} work {:.3} target {:.3}",
-            ok, total, files.len(), r1, g1, r2, g2, r3, g3, s1, s2, s3, k, t0.elapsed().as_secs_f64(), target
+            "ok {} parse {} runs {:?} s {:.3} ({}) f {:.0} ({}) u {:.2} ({}) k {} work {:.3} target {:.3}",
+            ok, ok_parse, runs, s, level(s, &SB), f, level(f, &FB), u, level(u, &UB), k, t0.elapsed().as_secs_f64(), target
         );
     }
     if std::env::var("PROBE_NOWAIT").is_ok() {
