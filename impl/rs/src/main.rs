@@ -907,18 +907,16 @@ struct MoverF {
     mask: usize,
 }
 impl MoverF {
-    fn build(tab: &IdTab) -> Self {
-        let nw = (tab.s.len() / 16).max(1);
+    /// empty filter for `mov` movers, about `d` movers per word
+    fn new(mov: usize, d: usize) -> Self {
+        let nw = (mov / d.max(1)).max(1).next_power_of_two();
         let w: Vec<AtomicU64> = (0..nw).map(|_| AtomicU64::new(0)).collect();
-        tab.s.par_chunks(1 << 15).for_each(|c| {
-            for e in c {
-                if e[0] != 0 && e[0] != e[1] {
-                    let h = mix(e[0]);
-                    w[h as usize & (nw - 1)].fetch_or(Self::bits(h), Relaxed);
-                }
-            }
-        });
         MoverF { w, mask: nw - 1 }
+    }
+    #[inline(always)]
+    fn add(&self, k: u64) {
+        let h = mix(k);
+        unsafe { self.w.get_unchecked(h as usize & self.mask) }.fetch_or(Self::bits(h), Relaxed);
     }
     #[inline(always)]
     fn bits(h: u64) -> u64 {
@@ -939,6 +937,8 @@ impl MoverF {
 const PFD: usize = 12;
 /// prefetch distance of the user -> person passes (mover filter, then table), sized for DRAM latency
 const RPD: usize = 32;
+/// prefetch distance of the links insert, in pairs (two keys each)
+const LPF: usize = 16;
 
 // ---------- records ----------
 
@@ -2658,31 +2658,9 @@ fn main() {
     let mut idx_ref: Vec<u64> = Vec::with_capacity(occ);
     let mut parent: Vec<u32> = Vec::with_capacity(occ);
     let mut edges: Vec<(u32, u32)> = Vec::with_capacity(occ / 2);
-    let lpf: usize = std::env::var("SHOP_LPF").ok().and_then(|s| s.parse().ok()).unwrap_or(PFD / 2);
-    if std::env::var_os("SHOP_PREFAULT").is_some() {
-        fn touch<T: Send>(v: &mut [MaybeUninit<T>], z: T)
-        where
-            T: Copy + Sync,
-        {
-            let step = (4096 / std::mem::size_of::<T>()).max(1);
-            v.par_chunks_mut(step * 64).for_each(|c| {
-                let mut i = 0;
-                while i < c.len() {
-                    c[i] = MaybeUninit::new(z);
-                    i += step;
-                }
-            });
-        }
-        let s = unsafe { std::slice::from_raw_parts_mut(t.s.as_mut_ptr() as *mut MaybeUninit<[u64; 2]>, t.s.len()) };
-        touch(s, [0u64; 2]);
-        touch(idx_key.spare_capacity_mut(), 0u64);
-        touch(idx_ref.spare_capacity_mut(), 0u64);
-        touch(parent.spare_capacity_mut(), 0u32);
-        touch(edges.spare_capacity_mut(), (0u32, 0u32));
-    }
     tick("links parsed");
     // links (serial union-find) overlaps the parallel event parse; events do not need the id table
-    let ((tab, mut names_map), ev_out) = rayon::join(
+    let ((tab, mut names_map, mf), ev_out) = rayon::join(
         || {
             let mut names_map: AHashMap<u64, u64> = AHashMap::new();
             let tab = {
@@ -2696,9 +2674,9 @@ fn main() {
                 }
                 for v in &link_pairs {
                     for (n, e) in v.iter().enumerate() {
-                        if n + lpf < v.len() {
-                            t.pf(v[n + lpf][0]);
-                            t.pf(v[n + lpf][2]);
+                        if n + LPF < v.len() {
+                            t.pf(v[n + LPF][0]);
+                            t.pf(v[n + LPF][2]);
                         }
                         let mut g = |k: u64, r: u64| -> u32 {
                             let (id, new) = t.get_or_insert(k, idx_key.len() as u64);
@@ -2761,9 +2739,13 @@ fn main() {
                         }
                     }
                 }
-                // the insert table becomes the id table in place: a slot's index turns into its person key
+                // the insert table becomes the id table in place: a slot's index turns into its person key;
+                // the same pass fills the mover filter (a component of s ids has s - 1 movers)
+                let mov = nl - nroot;
+                let mfd: usize = std::env::var("SHOP_MFD").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+                let mf = MoverF::new(mov, mfd);
                 {
-                    let (root, bk) = (&root[..], &idx_key[..]);
+                    let (root, bk, mf) = (&root[..], &idx_key[..], &mf);
                     t.s.par_chunks_mut(1 << 14).for_each(|c| {
                         let n = c.len();
                         for i in 0..n {
@@ -2779,17 +2761,20 @@ fn main() {
                             let e = &mut c[i];
                             if e[0] != 0 {
                                 e[1] = bk[root[e[1] as usize] as usize];
+                                if e[1] != e[0] {
+                                    mf.add(e[0]);
+                                }
                             }
                         }
                     });
                 }
-                t.mov = nl - nroot;
-                tick(&format!("links table movers {} pairs {}", t.mov, occ / 2));
-                t
+                t.mov = mov;
+                tick(&format!("links table movers {} pairs {} filter words {}", t.mov, occ / 2, mf.w.len()));
+                (t, mf)
             };
             drop(link_pairs);
             tick("links done");
-            (tab, names_map)
+            (tab.0, names_map, tab.1)
         },
         || {
             let ev_files = csv_files(&data.join("events"));
@@ -2899,9 +2884,6 @@ fn main() {
 
     // clicks
     let click_chunks = all_chunks(&csv_files(&data.join("clicks")), CHUNK);
-    let mut tm = now();
-    let mf = MoverF::build(&tab);
-    pt(4, &mut tm);
     let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_chunks
         .par_iter()
         .map(|&c| {
