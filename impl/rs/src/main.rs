@@ -1154,13 +1154,34 @@ struct DR<E> {
     e: E,
 }
 
+/// A dense dedup record as it sits in its bucket's slots: 16 bytes. Bits 0-14 of `b` hold the
+/// index below the bucket (sh <= 15), bits 15-16 the kind:
+/// - 0, the common line: user key `u` + up to 8 more ID bytes (a bits 0-47 = key >> 6), ts + the
+///   window start's ms as whole seconds (b 27-47) and ms (b 17-26), ingest key minus those
+///   seconds minus IOFF plus 8 (a 48-57, below 1024), price (b 48-63, below 2^16) and category
+///   (a 58-63, below 64);
+/// - 1, a dropped line (E::nil): ingest key in b 32-63;
+/// - 2, any other line: its full record is `xs[b >> 32]`.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct DC {
+    a: u64,
+    b: u64,
+}
+
+/// low 15 bits: the index below the bucket
+const DSLM: u64 = (1 << 15) - 1;
+const DM48: u64 = (1 << 48) - 1;
+/// the 6-bit code of the user key's first byte `u`
+const DCU: u64 = mk_code()[b'u' as usize] as u64;
+
 /// One 64-byte cache line.
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 struct Line([u64; 8]);
 
-/// records staged per bucket before they go to the slots as whole cache lines (WK records of 24 or
-/// 32 bytes are 3 or 4 lines)
+/// records staged per bucket before they go to the slots as whole cache lines (WK slot records of
+/// 16 bytes are 2 lines)
 const WK: usize = 8;
 
 thread_local! {
@@ -1191,12 +1212,16 @@ struct Dz<E> {
     ovb: Vec<u32>,
     ovoff: Vec<u32>,
     dside: Vec<(u32, i64)>,
+    /// full records of the kind-2 slots
+    xs: Vec<DR<E>>,
+    /// the window start's ms within its second
+    wsm: u64,
 }
 
 impl<E: Ev> Dz<E> {
     /// takes no record: every line keeps the event_id hash path
     fn off() -> Self {
-        Dz { on: false, key: 0, lim: 0, sh: 0, ndb: 0, cap: 0, r: vec![], wc: vec![], _e: std::marker::PhantomData, dn: vec![], ov: vec![], ovb: vec![], ovoff: vec![], dside: vec![] }
+        Dz { on: false, key: 0, lim: 0, sh: 0, ndb: 0, cap: 0, r: vec![], wc: vec![], _e: std::marker::PhantomData, dn: vec![], ov: vec![], ovb: vec![], ovoff: vec![], dside: vec![], xs: vec![], wsm: 0 }
     }
     /// for a chunk of `len` bytes: room for the expected bucket size plus a margin (the rest
     /// overflows)
@@ -1205,7 +1230,7 @@ impl<E: Ev> Dz<E> {
         let lines = len as f64 * c.lpb;
         let mean = lines * (1u64 << c.sh) as f64 / ((c.lim - 64) as f64 / 1.3).max(1.0) * 1.04;
         let cap = ((mean + 1.5 * mean.sqrt() + 1.0) as usize).min(lines as usize + 16).next_multiple_of(WK);
-        let sz = std::mem::size_of::<DR<E>>();
+        let sz = std::mem::size_of::<DC>();
         let nl = (c.ndb * cap * sz).div_ceil(64);
         let mut r = Vec::with_capacity(nl);
         // SAFETY: MaybeUninit needs no initialization
@@ -1217,7 +1242,7 @@ impl<E: Ev> Dz<E> {
             // SAFETY: as above
             unsafe { wc.set_len(wl) };
         }
-        Dz { on: true, key: c.key, lim: c.lim, sh: c.sh, ndb: c.ndb, cap, r, wc, _e: std::marker::PhantomData, dn: vec![0; c.ndb], ov: vec![], ovb: vec![], ovoff: vec![], dside: vec![] }
+        Dz { on: true, key: c.key, lim: c.lim, sh: c.sh, ndb: c.ndb, cap, r, wc, _e: std::marker::PhantomData, dn: vec![0; c.ndb], ov: vec![], ovb: vec![], ovoff: vec![], dside: vec![], xs: vec![], wsm: 0 }
     }
     /// the dense index of a packed event_id, if it has one
     #[inline(always)]
@@ -1256,27 +1281,73 @@ impl<E: Ev> Dz<E> {
             None => None,
         }
     }
+    /// the slot form of record (i, ing, e)
+    #[inline(always)]
+    fn enc(&mut self, i: u64, ing: u32, e: E) -> DC {
+        let s = i & DSLM;
+        let (key, rts, meta) = (e.key(), e.rts(), e.meta());
+        let tw = rts.wrapping_add(self.wsm);
+        let sec = tw / 1000;
+        let ms = tw - sec * 1000;
+        let d8 = (ing as u64).wrapping_sub(sec).wrapping_sub(IOFF as u64 - 8);
+        let (price, cat) = (meta & 0xFF_FFFF, meta >> 24);
+        if (key >> 54 == DCU) & (key & 63 == 0) & (sec < 1 << 21) & (d8 < 1024) & (price < 1 << 16) & (cat < 64) {
+            DC { a: ((key >> 6) & DM48) | (d8 << 48) | (cat << 58), b: s | (ms << 17) | (sec << 27) | (price << 48) }
+        } else {
+            self.enc_rare(i, ing, e)
+        }
+    }
+    #[cold]
+    #[inline(never)]
+    fn enc_rare(&mut self, i: u64, ing: u32, e: E) -> DC {
+        let s = i & DSLM;
+        if e.key() == 0 && e.rts() == 0 && e.meta() == 0 {
+            DC { a: 0, b: s | (1 << 15) | ((ing as u64) << 32) }
+        } else {
+            self.xs.push(DR { i: i as u32, ing, e });
+            DC { a: 0, b: s | (2 << 15) | (((self.xs.len() - 1) as u64) << 32) }
+        }
+    }
+    /// (index below the bucket, ingest key, record) of a slot record
+    #[inline(always)]
+    fn dec(&self, c: &DC) -> (u64, u32, E) {
+        let s = c.b & DSLM;
+        match (c.b >> 15) & 3 {
+            0 => {
+                let sec = (c.b >> 27) & ((1 << 21) - 1);
+                let ms = (c.b >> 17) & 1023;
+                let ing = (sec + ((c.a >> 48) & 1023) + (IOFF as u64 - 8)) as u32;
+                let key = (DCU << 54) | ((c.a & DM48) << 6);
+                (s, ing, E::mk(key, sec * 1000 + ms - self.wsm, (c.b >> 48) as u32, (c.a >> 58) as u32))
+            }
+            1 => (s, (c.b >> 32) as u32, E::nil()),
+            _ => {
+                let x = self.xs[(c.b >> 32) as usize];
+                (s, x.ing, x.e)
+            }
+        }
+    }
     #[inline(always)]
     fn put(&mut self, i: u64, ing: u32, e: E, exact: bool, ingest: i64) {
         let b = (i >> self.sh) as usize;
-        let x = DR { i: i as u32, ing, e };
         // SAFETY: i < lim, so b < ndb; a slot below cap lies in b's stretch of r
         let n = unsafe { *self.dn.get_unchecked(b) } as usize;
         let pos = if n < self.cap {
+            let x = self.enc(i, ing, e);
             // SAFETY: b < ndb, so b's WK staging records lie in wc; n + 1 - WK is a multiple of
             // WK below cap, so the copied slots lie in b's stretch of r
             unsafe {
-                let w = (self.wc.as_mut_ptr() as *mut DR<E>).add(b * WK);
+                let w = (self.wc.as_mut_ptr() as *mut DC).add(b * WK);
                 w.add(n % WK).write(x);
                 *self.dn.get_unchecked_mut(b) = n as u32 + 1;
                 if (n + 1) % WK == 0 {
-                    let d = (self.r.as_mut_ptr() as *mut DR<E>).add(b * self.cap + n + 1 - WK);
-                    stream_lines(w as *const Line, d as *mut Line, WK * std::mem::size_of::<DR<E>>() / 64);
+                    let d = (self.r.as_mut_ptr() as *mut DC).add(b * self.cap + n + 1 - WK);
+                    stream_lines(w as *const Line, d as *mut Line, WK * std::mem::size_of::<DC>() / 64);
                 }
             }
             b * self.cap + n
         } else {
-            self.ov_put(b, x)
+            self.ov_put(b, DR { i: i as u32, ing, e })
         };
         if !exact {
             self.dside.push((pos as u32, ingest));
@@ -1298,8 +1369,8 @@ impl<E: Ev> Dz<E> {
                 let t = n % WK;
                 // SAFETY: the t records staged last for b are its slots n - t .. n
                 unsafe {
-                    let w = (self.wc.as_ptr() as *const DR<E>).add(b * WK);
-                    let d = (self.r.as_mut_ptr() as *mut DR<E>).add(b * self.cap + n - t);
+                    let w = (self.wc.as_ptr() as *const DC).add(b * WK);
+                    let d = (self.r.as_mut_ptr() as *mut DC).add(b * self.cap + n - t);
                     std::ptr::copy_nonoverlapping(w, d, t);
                 }
             }
@@ -1341,12 +1412,12 @@ impl<E: Ev> Dz<E> {
     /// bucket b's records: its slots and the position of the first, then its overflow records and
     /// the position of the first
     #[inline]
-    fn seg(&self, b: usize) -> (&[DR<E>], usize, &[DR<E>], usize) {
+    fn seg(&self, b: usize) -> (&[DC], usize, &[DR<E>], usize) {
         if b >= self.dn.len() {
             return (&[], 0, &[], 0);
         }
         // SAFETY: put wrote the first dn[b] slots of b's stretch
-        let s = unsafe { std::slice::from_raw_parts((self.r.as_ptr() as *const DR<E>).add(b * self.cap), self.dn[b] as usize) };
+        let s = unsafe { std::slice::from_raw_parts((self.r.as_ptr() as *const DC).add(b * self.cap), self.dn[b] as usize) };
         let (o, p) = if self.ovoff.is_empty() {
             (&self.ov[..0], 0)
         } else {
@@ -1418,6 +1489,8 @@ trait Ev: Copy + Send + Sync {
     fn key(&self) -> u64;
     fn set_key(&mut self, k: u64);
     fn rts(&self) -> u64;
+    /// price | category << 24 (0 for a view)
+    fn meta(&self) -> u64;
     /// (price, category) of a purchase
     fn pc(&self) -> Option<(u64, u32)>;
 }
@@ -1450,6 +1523,10 @@ impl Ev for EvL {
     #[inline(always)]
     fn rts(&self) -> u64 {
         self.ts as u64
+    }
+    #[inline(always)]
+    fn meta(&self) -> u64 {
+        self.meta as u64
     }
     #[inline(always)]
     fn pc(&self) -> Option<(u64, u32)> {
@@ -1486,6 +1563,10 @@ impl Ev for EvW {
     #[inline(always)]
     fn rts(&self) -> u64 {
         self.ts
+    }
+    #[inline(always)]
+    fn meta(&self) -> u64 {
+        self.meta
     }
     #[inline(always)]
     fn pc(&self) -> Option<(u64, u32)> {
@@ -3639,37 +3720,42 @@ fn ev_after_idx<E: Ev>(
                                 }
                                 if let Some(n) = ev_out.get(ci + 2) {
                                     if b < n.dz.dn.len() {
-                                        let p = (n.dz.r.as_ptr() as *const DR<E>).wrapping_add(b * n.dz.cap) as *const u8;
-                                        let len = n.dz.dn[b] as usize * std::mem::size_of::<DR<E>>();
+                                        let p = (n.dz.r.as_ptr() as *const DC).wrapping_add(b * n.dz.cap) as *const u8;
+                                        let len = n.dz.dn[b] as usize * std::mem::size_of::<DC>();
                                         for o in (0..len.min(1024)).step_by(64) {
                                             prefetch(p.wrapping_add(o));
                                         }
                                     }
                                 }
                                 let (sa, sp, oa, op) = c.dz.seg(b);
-                                for (part, p0) in [(sa, sp), (oa, op)] {
-                                    for (j, x) in part.iter().enumerate() {
-                                        let q = lb.len() as u32;
-                                        lb.push(x.e);
-                                        if dside_any {
-                                            lg.push(((ci as u64) << 32) | (p0 + j) as u64);
-                                        }
-                                        let pk = ((x.ing as u64) << 32) | q as u64;
-                                        // SAFETY: the slot index is masked to span
-                                        let o = unsafe { t.get_unchecked_mut((x.i as u64 & mask) as usize) };
-                                        if *o == u64::MAX {
-                                            *o = pk;
-                                            continue;
-                                        }
-                                        let ok = (*o >> 32) as u32;
-                                        if x.ing < ok
-                                            || (x.ing == ok
-                                                && dside_any
-                                                && dexact(lg[q as usize], x.ing) < dexact(lg[*o as u32 as usize], ok))
-                                        {
-                                            *o = pk;
-                                        }
+                                let mut one = |i: u64, ing: u32, e: E, pos: usize| {
+                                    let q = lb.len() as u32;
+                                    lb.push(e);
+                                    if dside_any {
+                                        lg.push(((ci as u64) << 32) | pos as u64);
                                     }
+                                    let pk = ((ing as u64) << 32) | q as u64;
+                                    // SAFETY: the slot index is masked to span
+                                    let o = unsafe { t.get_unchecked_mut((i & mask) as usize) };
+                                    if *o == u64::MAX {
+                                        *o = pk;
+                                        return;
+                                    }
+                                    let ok = (*o >> 32) as u32;
+                                    if ing < ok
+                                        || (ing == ok
+                                            && dside_any
+                                            && dexact(lg[q as usize], ing) < dexact(lg[*o as u32 as usize], ok))
+                                    {
+                                        *o = pk;
+                                    }
+                                };
+                                for (j, x) in sa.iter().enumerate() {
+                                    let (i, ing, e) = c.dz.dec(x);
+                                    one(i, ing, e, sp + j);
+                                }
+                                for (j, x) in oa.iter().enumerate() {
+                                    one(x.i as u64, x.ing, x.e, op + j);
                                 }
                             }
                             pt(2, &mut tm);
@@ -4169,6 +4255,7 @@ fn idx_find(ev_files: &[B], ev_chunks: &[B]) -> Option<IdxCfg> {
 /// hash bucket.
 fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
     let mut dz = Dz::new(idx_cfg(), c.len());
+    dz.wsm = cx.ws.rem_euclid(1000) as u64;
     let cap = if dz.on { c.len() / 4096 } else { c.len() / 64 };
     let mut m: Vec<E> = Vec::with_capacity(cap);
     let mut d: Vec<DRec> = Vec::with_capacity(cap);
@@ -4218,15 +4305,21 @@ fn hash_chunk<E: Ev>(mut h: u64, r: &EvChunk<E>) -> u64 {
     }
     for b in 0..r.dz.dn.len() {
         let (sa, sp, oa, op) = r.dz.seg(b);
-        for (part, p0) in [(sa, sp), (oa, op)] {
-            add(part.len() as u64 ^ ((p0 as u64) << 32));
-            for x in part {
-                add(x.i as u64 ^ ((x.ing as u64) << 32));
-                add(x.e.key() ^ (x.e.rts() << 1));
-                if let Some((p, cat)) = x.e.pc() {
-                    add(p ^ ((cat as u64) << 32));
-                }
+        let one = |add: &mut dyn FnMut(u64), i: u64, ing: u32, e: E| {
+            add(i ^ ((ing as u64) << 32));
+            add(e.key() ^ (e.rts() << 1));
+            if let Some((p, cat)) = e.pc() {
+                add(p ^ ((cat as u64) << 32));
             }
+        };
+        add(sa.len() as u64 ^ ((sp as u64) << 32));
+        for x in sa {
+            let (s, ing, e) = r.dz.dec(x);
+            one(&mut add, ((b as u64) << r.dz.sh) | s, ing, e);
+        }
+        add(oa.len() as u64 ^ ((op as u64) << 32));
+        for x in oa {
+            one(&mut add, x.i as u64, x.ing, x.e);
         }
     }
     for x in &r.dz.dside {
