@@ -2652,17 +2652,40 @@ fn main() {
             v
         })
         .collect();
+    let occ: usize = link_pairs.iter().map(|v| v.len()).sum::<usize>() * 2;
+    let mut t = IdTab::with_cap(occ);
+    let mut idx_key: Vec<u64> = Vec::with_capacity(occ);
+    let mut idx_ref: Vec<u64> = Vec::with_capacity(occ);
+    let mut parent: Vec<u32> = Vec::with_capacity(occ);
+    let mut edges: Vec<(u32, u32)> = Vec::with_capacity(occ / 2);
+    let lpf: usize = std::env::var("SHOP_LPF").ok().and_then(|s| s.parse().ok()).unwrap_or(PFD / 2);
+    if std::env::var_os("SHOP_PREFAULT").is_some() {
+        fn touch<T: Send>(v: &mut [MaybeUninit<T>], z: T)
+        where
+            T: Copy + Sync,
+        {
+            let step = (4096 / std::mem::size_of::<T>()).max(1);
+            v.par_chunks_mut(step * 64).for_each(|c| {
+                let mut i = 0;
+                while i < c.len() {
+                    c[i] = MaybeUninit::new(z);
+                    i += step;
+                }
+            });
+        }
+        let s = unsafe { std::slice::from_raw_parts_mut(t.s.as_mut_ptr() as *mut MaybeUninit<[u64; 2]>, t.s.len()) };
+        touch(s, [0u64; 2]);
+        touch(idx_key.spare_capacity_mut(), 0u64);
+        touch(idx_ref.spare_capacity_mut(), 0u64);
+        touch(parent.spare_capacity_mut(), 0u32);
+        touch(edges.spare_capacity_mut(), (0u32, 0u32));
+    }
     tick("links parsed");
     // links (serial union-find) overlaps the parallel event parse; events do not need the id table
     let ((tab, mut names_map), ev_out) = rayon::join(
         || {
-            let occ: usize = link_pairs.iter().map(|v| v.len()).sum::<usize>() * 2;
             let mut names_map: AHashMap<u64, u64> = AHashMap::new();
             let tab = {
-                let mut t = IdTab::with_cap(occ);
-                let mut idx_key: Vec<u64> = vec![];
-                let mut idx_ref: Vec<u64> = vec![];
-                let mut parent: Vec<u32> = vec![];
                 fn find(p: &mut [u32], mut x: u32) -> u32 {
                     while p[x as usize] != x {
                         let g = p[p[x as usize] as usize];
@@ -2671,12 +2694,11 @@ fn main() {
                     }
                     x
                 }
-                let mut edges: Vec<(u32, u32)> = Vec::with_capacity(occ / 2);
                 for v in &link_pairs {
                     for (n, e) in v.iter().enumerate() {
-                        if n + PFD / 2 < v.len() {
-                            t.pf(v[n + PFD / 2][0]);
-                            t.pf(v[n + PFD / 2][2]);
+                        if n + lpf < v.len() {
+                            t.pf(v[n + lpf][0]);
+                            t.pf(v[n + lpf][2]);
                         }
                         let mut g = |k: u64, r: u64| -> u32 {
                             let (id, new) = t.get_or_insert(k, idx_key.len() as u64);
@@ -2712,22 +2734,20 @@ fn main() {
                     let p = root[g] as usize;
                     root[g] = root[p];
                 }
-                // smallest id of each component as [key, index] at its root; the root is the component's
-                // lowest index, so it comes before every other member
-                let mut bk: Vec<[u64; 2]> = vec![[0u64; 2]; nl];
+                // smallest id of each component: its key and ref replace the root's own (the root is
+                // the component's lowest index, so it comes before every other member)
                 for g in 0..nl {
                     if g + RPD < nl {
-                        prefetch(bk.as_ptr().wrapping_add(root[g + RPD] as usize));
+                        let r = root[g + RPD] as usize;
+                        prefetch(idx_key.as_ptr().wrapping_add(r));
                     }
                     let r = root[g] as usize;
-                    let kg = idx_key[g];
-                    if r == g {
-                        bk[g] = [kg, g as u64];
-                    } else {
-                        let [kb, b] = bk[r];
-                        let less = if kg & HBIT == 0 && kb & HBIT == 0 { kg < kb } else { unpack(idx_ref[g]) < unpack(idx_ref[b as usize]) };
+                    if r != g {
+                        let (kg, kb) = (idx_key[g], idx_key[r]);
+                        let less = if kg & HBIT == 0 && kb & HBIT == 0 { kg < kb } else { unpack(idx_ref[g]) < unpack(idx_ref[r]) };
                         if less {
-                            bk[r] = [kg, g as u64];
+                            idx_key[r] = kg;
+                            idx_ref[r] = idx_ref[g];
                         }
                     }
                 }
@@ -2736,15 +2756,14 @@ fn main() {
                 for r in 0..nl {
                     if root[r] as usize == r {
                         nroot += 1;
-                        let [pk, b] = bk[r];
-                        if pk & HBIT != 0 {
-                            names_map.insert(pk, idx_ref[b as usize]);
+                        if idx_key[r] & HBIT != 0 {
+                            names_map.insert(idx_key[r], idx_ref[r]);
                         }
                     }
                 }
                 // the insert table becomes the id table in place: a slot's index turns into its person key
                 {
-                    let (root, bk) = (&root[..], &bk[..]);
+                    let (root, bk) = (&root[..], &idx_key[..]);
                     t.s.par_chunks_mut(1 << 14).for_each(|c| {
                         let n = c.len();
                         for i in 0..n {
@@ -2759,7 +2778,7 @@ fn main() {
                             }
                             let e = &mut c[i];
                             if e[0] != 0 {
-                                e[1] = bk[root[e[1] as usize] as usize][0];
+                                e[1] = bk[root[e[1] as usize] as usize];
                             }
                         }
                     });
