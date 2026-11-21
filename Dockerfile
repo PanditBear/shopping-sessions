@@ -1,4 +1,5 @@
 # Shopping Sessions: Rust implementation. Static musl binary in a scratch image.
+# The scorer runs CMD with no arguments, as uid 1000, read-only root, no network.
 FROM rust:1-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends musl-tools \
  && rustup target add x86_64-unknown-linux-musl
@@ -12,4 +13,4 @@ RUN CC_x86_64_unknown_linux_musl=musl-gcc \
 FROM scratch
 COPY --from=build /shop /app/shop
 ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch
-ENTRYPOINT ["/app/shop"]
+CMD ["/app/shop"]
