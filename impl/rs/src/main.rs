@@ -310,148 +310,103 @@ fn scan<const N: usize>(chunk: B, mut f: impl FnMut(&[B; N])) {
     }
 }
 
-/// Bytes per block of `scan_batch` (a multiple of 64): small enough that a block stays in L1
-/// between the mask pass and the field pass.
-const SB: usize = 8192;
-
-/// Same lines and fields as `scan` (same dialect, same order), handed to `f` one block at a time.
-/// One pass writes separator and newline positions into arrays, a second walks the lines. A line
-/// is well formed when its N-th separator is its newline and its quote count equals twice its
-/// quoted fields. Lines longer than a block, and a last line with no newline, go to `scan`.
+/// Same lines and fields as `scan::<7>` (same dialect, same order). Each line is classified from
+/// two 64-byte windows: one at the line start (fields 0-2) and one just after the third comma
+/// (fields 3-6). A line takes the fast path when the first window holds three commas with no
+/// newline before the third, the second holds a newline with exactly three commas before it, and
+/// every quote opens or closes a whole field of two or more bytes (checked on the masks: with X
+/// the quotes at field starts and Y those at field ends, Y - X must touch no separator and no Y
+/// bit). Every other line, and the last 128 bytes of the chunk, go to `scan` one line at a time.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
 #[inline(always)]
-fn scan_batch<const N: usize>(chunk: B, mut f: impl FnMut(&[[B; N]])) {
+fn scan7(chunk: B, mut f: impl FnMut(&[B; 7])) {
+    use core::arch::x86_64::_bzhi_u64;
+    // SAFETY (bzhi): BMI2 is enabled for this build
+    let bzhi = |x: u64, n: u32| unsafe { _bzhi_u64(x, n) };
+    let blsr = |x: u64| x & x.wrapping_sub(1);
     let len = chunk.len();
     let base = chunk.as_ptr();
-    let mut pp: Vec<u32> = vec![0; SB + 64 + N];
-    let mut ll: Vec<u32> = vec![0; SB + 64];
-    let mut bat: Vec<[B; N]> = vec![[&[][..]; N]; SB / 2 + 1];
-    let mut qmv = [0u64; SB / 64];
-    let mut qcv = [0u32; SB / 64];
-    let mut tmp = [0u8; 64];
     let mut pos = 0usize;
-    while pos < len {
-        let last = pos + SB >= len;
-        let end = if last { len } else { pos + SB };
-        let ng = (end - pos + 63) / 64;
-        let (mut np, mut nl, mut qacc) = (0usize, 0usize, 0u32);
-        for g in 0..ng {
-            let gp = pos + 64 * g;
-            let p = if gp + 64 <= len {
-                unsafe { base.add(gp) }
-            } else {
-                tmp = [0u8; 64];
-                tmp[..len - gp].copy_from_slice(&chunk[gp..]);
-                tmp.as_ptr()
-            };
-            let (cm, qm, nm) = masks64(p);
-            qmv[g] = qm;
-            qcv[g] = qacc;
-            qacc += qm.count_ones();
-            let off = (64 * g) as u32;
-            let mut s = cm | nm;
-            let cnt = s.count_ones() as usize;
-            // SAFETY: pp has SB + 64 + N slots and np + cnt <= 64 * (g + 1) <= SB
-            unsafe {
-                let d = pp.as_mut_ptr().add(np);
-                for i in 0..8 {
-                    *d.add(i) = off + s.trailing_zeros();
-                    s &= s.wrapping_sub(1);
-                }
-                if cnt > 8 {
-                    let mut i = 8;
-                    while s != 0 {
-                        *d.add(i) = off + s.trailing_zeros();
-                        s &= s - 1;
-                        i += 1;
-                    }
-                }
+    while pos + 128 <= len {
+        // SAFETY: pos + 128 <= len, and the second window starts at most 64 bytes in
+        let p = unsafe { base.add(pos) };
+        let (ca, qa, na) = masks64(p);
+        let e0 = ca.trailing_zeros();
+        let c1 = blsr(ca);
+        let e1 = c1.trailing_zeros();
+        let c2 = blsr(c1);
+        let e2 = c2.trailing_zeros();
+        if (c2 != 0) & (bzhi(na, e2) == 0) {
+            let pb = unsafe { p.add(e2 as usize + 1) };
+            let (cb, qb, nb) = masks64(pb);
+            let l = nb.trailing_zeros();
+            let e3 = cb.trailing_zeros();
+            let d1 = blsr(cb);
+            let e4 = d1.trailing_zeros();
+            let d2 = blsr(d1);
+            let e5 = d2.trailing_zeros();
+            let d3 = blsr(d2);
+            let qa1 = bzhi(qa, e2);
+            let xa = qa1 & ((ca << 1) | 1);
+            let ya = qa1 & (ca >> 1);
+            let ra = ya.wrapping_sub(xa);
+            let bad_a = (qa1 & !(xa | ya)) | (xa & ya) | (ra & (bzhi(ca, e2 + 1) | ya));
+            let sb = cb | nb;
+            let qb1 = bzhi(qb, l);
+            let xb = qb1 & ((cb << 1) | 1);
+            let yb = qb1 & (sb >> 1);
+            let rb = yb.wrapping_sub(xb);
+            let bad_b = (qb1 & !(xb | yb)) | (xb & yb) | (rb & (bzhi(sb, l + 1) | yb));
+            if (nb != 0) & (e5 < l) & (bzhi(d3, l) == 0) & ((bad_a | bad_b) == 0) {
+                let fld = |p: *const u8, x: u64, s: u32, e: u32| {
+                    let q = ((x >> s) & 1) as u32;
+                    // SAFETY: s <= e <= 63 inside a window; a quoted field has e - s >= 2
+                    unsafe { std::slice::from_raw_parts(p.add((s + q) as usize), (e - s - 2 * q) as usize) }
+                };
+                let out: [B; 7] = [
+                    fld(p, xa, 0, e0),
+                    fld(p, xa, e0 + 1, e1),
+                    fld(p, xa, e1 + 1, e2),
+                    fld(pb, xb, 0, e3),
+                    fld(pb, xb, e3 + 1, e4),
+                    fld(pb, xb, e4 + 1, e5),
+                    fld(pb, xb, e5 + 1, l),
+                ];
+                f(&out);
+                #[cfg(test)]
+                SCAN7_FAST.with(|c| c.set(c.get() + 1));
+                pos += (e2 + l + 2) as usize;
+                continue;
             }
-            np += cnt;
-            let mut t = nm;
-            let c2 = t.count_ones() as usize;
-            // SAFETY: ll has SB + 64 slots and nl + c2 <= 64 * (g + 1) <= SB
-            unsafe {
-                let d = ll.as_mut_ptr().add(nl);
-                *d = off + t.trailing_zeros();
-                t &= t.wrapping_sub(1);
-                *d.add(1) = off + t.trailing_zeros();
-                t &= t.wrapping_sub(1);
-                if c2 > 2 {
-                    let mut i = 2;
-                    while t != 0 {
-                        *d.add(i) = off + t.trailing_zeros();
-                        t &= t - 1;
-                        i += 1;
-                    }
-                }
-            }
-            nl += c2;
         }
-        for i in 0..N {
-            pp[np + i] = u32::MAX;
-        }
-        let blk = unsafe { base.add(pos) };
-        let mut c = 0usize;
-        let mut ls = 0u32;
-        let mut qprev = 0u32;
-        let mut nb = 0usize;
-        for j in 0..nl {
-            let le = ll[j];
-            let g = (le >> 6) as usize;
-            let qle = qcv[g] + (qmv[g] & ((1u64 << (le & 63)) - 1)).count_ones();
-            if pp[c + N - 1] == le {
-                let mut out: [B; N] = [&[]; N];
-                let mut start = ls;
-                let mut expect = 0u32;
-                for k in 0..N {
-                    let e = pp[c + k];
-                    let flen = e - start;
-                    // SAFETY: start <= e < end; for an empty field both reads hit the separator
-                    let lb = e - (flen != 0) as u32;
-                    let q = (flen >= 2) & unsafe { (*blk.add(start as usize) == b'"') & (*blk.add(lb as usize) == b'"') };
-                    let q = q as u32;
-                    out[k] = unsafe { std::slice::from_raw_parts(blk.add((start + q) as usize), (flen - 2 * q) as usize) };
-                    expect += 2 * q;
-                    start = e + 1;
-                }
-                // SAFETY: a well-formed line takes at least N bytes (N >= 2), so nb <= SB / 2
-                unsafe { *bat.as_mut_ptr().add(nb) = out };
-                nb += (expect == qle - qprev) as usize;
-                c += N;
-            } else {
-                while pp[c] != le {
-                    c += 1;
-                }
-                c += 1;
-            }
-            qprev = qle;
-            ls = le + 1;
-        }
-        if nb > 0 {
-            f(&bat[..nb]);
-        }
-        if last {
-            if pos + (ls as usize) < len {
-                scan::<N>(&chunk[pos + ls as usize..], |l| f(std::slice::from_ref(l)));
-            }
-            break;
-        }
-        if nl == 0 {
-            // a line longer than a block
-            match memchr(b'\n', &chunk[end..]) {
-                Some(i) => {
-                    scan::<N>(&chunk[pos..end + i + 1], |l| f(std::slice::from_ref(l)));
-                    pos = end + i + 1;
-                }
-                None => {
-                    scan::<N>(&chunk[pos..], |l| f(std::slice::from_ref(l)));
-                    break;
-                }
-            }
-            continue;
-        }
-        pos += ls as usize;
+        pos = scan7_line(chunk, pos, &mut f);
     }
+    if pos < len {
+        scan::<7>(&chunk[pos..], f);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCAN7_FAST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The slow path of `scan7`: the one line at `pos` through `scan`; returns the next line start.
+#[cold]
+#[inline(never)]
+fn scan7_line<F: FnMut(&[B; 7])>(chunk: B, pos: usize, f: &mut F) -> usize {
+    let end = match memchr(b'\n', &chunk[pos..]) {
+        Some(i) => pos + i + 1,
+        None => chunk.len(),
+    };
+    scan::<7>(&chunk[pos..end], |l| f(l));
+    end
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
+#[inline(always)]
+fn scan7(chunk: B, f: impl FnMut(&[B; 7])) {
+    scan::<7>(chunk, f)
 }
 
 #[inline]
@@ -1661,10 +1616,10 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
     let c0 = c.as_ptr() as usize;
-    scan_batch::<7>(c, |lines| {
-        for &[eid, uid, ts, ing, et, pr, price] in lines {
+    scan7(c, |&[eid, uid, ts, ing, et, pr, price]| {
+        {
             if eid.is_empty() {
-                continue;
+                return;
             }
             let ingest = ts_fast(ing, &mut tci).unwrap_or(i64::MAX);
             let mut r = E::nil();
@@ -2343,4 +2298,134 @@ fn main() {
     }
     // all output files are written and closed; skip freeing the large tables
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn chance(&mut self, pct: u64) -> bool {
+            self.below(100) < pct
+        }
+    }
+
+    fn field(r: &mut Rng, out: &mut Vec<u8>, maxlen: u64) {
+        const AL: &[u8] = b"0123456789abZT:-+.";
+        let n = if r.chance(10) { 0 } else { 1 + r.below(maxlen) };
+        let quoted = r.chance(25);
+        if quoted {
+            out.push(b'"');
+        }
+        for _ in 0..n {
+            out.push(match r.below(100) {
+                0..=1 => b'"',
+                2 => b'\r',
+                _ => AL[r.below(AL.len() as u64) as usize],
+            });
+        }
+        if quoted {
+            out.push(b'"');
+        }
+    }
+
+    fn line(r: &mut Rng, out: &mut Vec<u8>) {
+        let start = out.len();
+        match r.below(10) {
+            0..=3 => {
+                // event-shaped: eid, uid, ts, ingest_ts, event_type, product, price
+                let lens = [12u64, 9, 25, 20, 8, 10, 7];
+                for (k, &ml) in lens.iter().enumerate() {
+                    if k > 0 {
+                        out.push(b',');
+                    }
+                    field(r, out, ml);
+                }
+            }
+            4..=7 => {
+                let nf = if r.chance(70) { 7 } else { 1 + r.below(10) };
+                let ml = [3u64, 20, 60, 130][r.below(4) as usize];
+                for k in 0..nf {
+                    if k > 0 {
+                        out.push(b',');
+                    }
+                    field(r, out, ml);
+                }
+            }
+            _ => {
+                const AL: &[u8] = b"a0,,\"\r";
+                for _ in 0..r.below(160) {
+                    out.push(AL[r.below(AL.len() as u64) as usize]);
+                }
+            }
+        }
+        for _ in 0..r.below(3) {
+            if r.chance(30) && out.len() > start {
+                let at = start + r.below((out.len() - start) as u64) as usize;
+                match r.below(4) {
+                    0 => out.insert(at, b'"'),
+                    1 => out.insert(at, b','),
+                    2 => out.insert(at, b'\r'),
+                    _ => {
+                        out.remove(at);
+                    }
+                }
+            }
+        }
+        if r.chance(10) {
+            out.push(b'\r');
+        }
+    }
+
+    fn lines_of(chunk: B, f: impl Fn(B, &mut dyn FnMut(&[B; 7]))) -> Vec<[(usize, usize); 7]> {
+        let mut v = vec![];
+        let b0 = chunk.as_ptr() as usize;
+        f(chunk, &mut |l: &[B; 7]| v.push(l.map(|x| (x.as_ptr() as usize - b0, x.len()))));
+        v
+    }
+
+    /// scan7 (vector windows, mask quote rule) yields exactly the lines and fields of scan::<7>
+    #[test]
+    fn scan7_matches_scan() {
+        assert!(cfg!(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), "build with -C target-cpu=x86-64-v3");
+        let buf: &'static mut [u8] = Box::leak(vec![0u8; 1 << 16].into_boxed_slice());
+        let mut r = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut text = Vec::new();
+        let (mut cases, mut total, mut fast_lines) = (0u64, 0u64, 0u64);
+        for _ in 0..400_000 {
+            text.clear();
+            for _ in 0..r.below(40) {
+                line(&mut r, &mut text);
+                text.push(b'\n');
+            }
+            if r.chance(50) && !text.is_empty() {
+                text.pop();
+            }
+            if text.len() + 64 > buf.len() {
+                continue;
+            }
+            let off = r.below(64) as usize;
+            buf[off..off + text.len()].copy_from_slice(&text);
+            // SAFETY: buf is leaked (lives forever) and not written while `chunk` is in use
+            let chunk: B = unsafe { std::slice::from_raw_parts(buf.as_ptr().add(off), text.len()) };
+            let want = lines_of(chunk, |c, f| scan::<7>(c, f));
+            let got = lines_of(chunk, |c, f| scan7(c, f));
+            assert_eq!(got, want, "case {cases}: {:?}", String::from_utf8_lossy(chunk));
+            cases += 1;
+            total += want.len() as u64;
+            fast_lines += SCAN7_FAST.with(|c| c.replace(0));
+        }
+        eprintln!("scan7 test: {cases} chunks, {total} accepted lines, {fast_lines} via the vector path");
+        assert!(total > 1_000_000 && fast_lines > total / 4);
+    }
 }
