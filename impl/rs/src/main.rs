@@ -1635,18 +1635,20 @@ struct CaCell {
 
 /// (campaign, day) accumulator: dense when the window is small, a map otherwise. The touch count
 /// lives in its own u32 array (`tch`, same index as `dense`): it is bumped for every active campaign
-/// at every session start, so its array is kept small enough to stay in L2.
+/// at every session start, so its array is kept small enough to stay in L2. Both are day-major
+/// (index day * nc + campaign): the touches of one session then fall in one short row.
 struct CampAcc {
     dense: Vec<CaCell>,
     tch: Vec<u32>,
     d0: i64,
     nd: usize,
+    nc: usize,
     map: CampMap,
 }
 impl CampAcc {
     fn new(ncamp1: usize, d0: i64, nd: usize) -> Self {
         let n = if nd > 0 && nd * ncamp1 <= (1 << 22) { nd * ncamp1 } else { 0 };
-        CampAcc { dense: vec![CaCell::default(); n], tch: vec![0; n], d0, nd, map: CampMap::new() }
+        CampAcc { dense: vec![CaCell::default(); n], tch: vec![0; n], d0, nd, nc: ncamp1, map: CampMap::new() }
     }
     /// Dense index of (c, d), if the cell is dense.
     #[inline(always)]
@@ -1663,7 +1665,7 @@ impl CampAcc {
     fn sess(&mut self, c: u32, d: i64, purch: bool, rev: u64) {
         match self.di(d) {
             Some(di) => {
-                let e = &mut self.dense[c as usize * self.nd + di];
+                let e = &mut self.dense[di * self.nc + c as usize];
                 e.s += 1;
                 e.p += purch as u32;
                 e.r += rev;
@@ -1681,10 +1683,10 @@ impl CampAcc {
     fn touch(&mut self, act: &[u32], d: i64) {
         match self.di(d) {
             Some(di) => {
-                let nd = self.nd;
-                let t = &mut self.tch[..];
+                let nc = self.nc;
+                let t = &mut self.tch[di * nc..di * nc + nc];
                 for &c in act {
-                    t[c as usize * nd + di] += 1;
+                    t[c as usize] += 1;
                 }
             }
             None => {
@@ -1714,7 +1716,7 @@ impl CampAcc {
         let mut rows: Vec<(u32, i32, [u64; 4])> = vec![];
         for (i, (v, &t)) in self.dense.iter().zip(self.tch.iter()).enumerate() {
             if v.s != 0 || t != 0 {
-                rows.push(((i / self.nd) as u32, (self.d0 + (i % self.nd) as i64) as i32, [v.s as u64, v.p as u64, v.r, t as u64]));
+                rows.push(((i % self.nc) as u32, (self.d0 + (i / self.nc) as i64) as i32, [v.s as u64, v.p as u64, v.r, t as u64]));
             }
         }
         for (&k, &v) in &self.map {
