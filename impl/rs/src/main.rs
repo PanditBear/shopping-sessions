@@ -1820,7 +1820,10 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
 }
 
 struct EvChunk<E> {
+    /// kept-candidate records grouped by person bucket (bucket p is cnt[p]..cnt[p+1]); dropped lines
+    /// take positions cnt[PB]..cnt[PB + 1] that are not stored
     m: Vec<E>,
+    cnt: Vec<u32>,
     d: Vec<DRec>,
     doff: Vec<u32>,
     fb: Vec<(u64, i64, u32)>,
@@ -1846,7 +1849,7 @@ fn ev_after<E: Ev>(
     let mut acc = 0usize;
     for c in &ev_out {
         mbase.push(acc as u32);
-        acc += c.m.len();
+        acc += c.cnt[PB + 1] as usize;
     }
     assert!(acc < u32::MAX as usize);
     mbase.push(acc as u32);
@@ -1942,51 +1945,9 @@ fn ev_after<E: Ev>(
             },
         );
     }
-    // kept lines (records already carry the person key; 0 marks a dropped line): each chunk's kept lines
-    // are grouped by person bucket inside the chunk (a cache-sized scatter; the order within a
-    // bucket stays the line order). The sessionizer gathers a bucket from every chunk in chunk order.
-    let parts: Vec<(Vec<E>, Vec<u32>)> = ev_out
-        .into_par_iter()
-        .enumerate()
-        .map(|(ci, c)| {
-            let mut tm = now();
-            let mut cnt = vec![0u32; PB + 1];
-            let mb = mbase[ci] as usize;
-            let mut m = c.m;
-            let n = m.len();
-            for i in 0..n {
-                let g = mb + i;
-                let k = m[i].key();
-                if k != 0 && dead[g >> 6].load(Relaxed) & (1u64 << (g & 63)) == 0 {
-                    cnt[pbk(k) + 1] += 1;
-                } else {
-                    m[i].set_key(0);
-                }
-            }
-            pt(4, &mut tm);
-            for p in 0..PB {
-                cnt[p + 1] += cnt[p];
-            }
-            let tot = cnt[PB] as usize;
-            let mut out: Vec<E> = Vec::with_capacity(tot);
-            {
-                let mut w = cnt.clone();
-                let sp = out.spare_capacity_mut();
-                for e in &m {
-                    let k = e.key();
-                    if k != 0 {
-                        let p = pbk(k);
-                        sp[w[p] as usize].write(*e);
-                        w[p] += 1;
-                    }
-                }
-            }
-            unsafe { out.set_len(tot) };
-            pt(5, &mut tm);
-            (out, cnt)
-        })
-        .collect();
-    drop(dead);
+    // records were grouped by person bucket inside each chunk at parse time (order within a bucket
+    // stays the line order); the sessionizer gathers a bucket from every chunk in chunk order,
+    // skipping lines marked dead
     tick("dedup done");
 
     let ngroups = (rayon::current_num_threads() * 4).clamp(1, PB);
@@ -2009,8 +1970,9 @@ fn ev_after<E: Ev>(
                     cl.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
                 }
                 evs.clear();
-                for (v, o) in parts.iter() {
-                    evs.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
+                for (ci, c) in ev_out.iter().enumerate() {
+                    let (lo, hi) = (c.cnt[p] as usize, c.cnt[p + 1] as usize);
+                    gather_live(&c.m[lo..hi], mbase[ci] as usize + lo, &dead, &mut evs);
                 }
                 pt(6, &mut tm);
                 let mut uds = Vec::new();
@@ -2020,6 +1982,80 @@ fn ev_after<E: Ev>(
             (out, cm)
         })
         .collect()
+}
+
+/// Groups one chunk's records by person bucket (line order kept within a bucket) and moves the
+/// dedup and side entries to the records' new positions. Dropped lines (key 0) get the positions
+/// after all kept ones and are not stored.
+fn pscatter<E: Ev>(m: Vec<E>, d: &mut [DRec], fb: &mut [(u64, i64, u32)], side: &mut [(u32, i64)]) -> (Vec<E>, Vec<u32>) {
+    let n = m.len();
+    let mut cnt = vec![0u32; PB + 2];
+    for e in &m {
+        let k = e.key();
+        cnt[if k != 0 { pbk(k) } else { PB } + 1] += 1;
+    }
+    for p in 0..=PB {
+        cnt[p + 1] += cnt[p];
+    }
+    let tot = cnt[PB] as usize;
+    let mut out: Vec<E> = Vec::with_capacity(tot);
+    let mut pos: Vec<u32> = Vec::with_capacity(n);
+    {
+        let mut w = cnt.clone();
+        let sp = out.spare_capacity_mut();
+        for e in &m {
+            let k = e.key();
+            if k != 0 {
+                let p = pbk(k);
+                let i = w[p];
+                sp[i as usize].write(*e);
+                pos.push(i);
+                w[p] = i + 1;
+            } else {
+                pos.push(w[PB]);
+                w[PB] += 1;
+            }
+        }
+    }
+    unsafe { out.set_len(tot) };
+    for r in d.iter_mut() {
+        r.loc = pos[r.loc as usize];
+    }
+    for f in fb.iter_mut() {
+        f.2 = pos[f.2 as usize];
+    }
+    if !side.is_empty() {
+        for x in side.iter_mut() {
+            x.0 = pos[x.0 as usize];
+        }
+        side.sort_unstable_by_key(|x| x.0);
+    }
+    (out, cnt)
+}
+
+/// Appends the records of `v` (global line indices g0..) whose dead bit is clear.
+#[inline]
+fn gather_live<E: Copy>(v: &[E], g0: usize, dead: &[AtomicU64], out: &mut Vec<E>) {
+    let mut i = 0;
+    while i < v.len() {
+        let g = g0 + i;
+        let sh = g & 63;
+        let take = (64 - sh).min(v.len() - i);
+        let mut dw = dead[g >> 6].load(Relaxed) >> sh;
+        if take < 64 {
+            dw &= (1u64 << take) - 1;
+        }
+        if dw == 0 {
+            out.extend_from_slice(&v[i..i + take]);
+        } else {
+            for j in 0..take {
+                if dw >> j & 1 == 0 {
+                    out.push(v[i + j]);
+                }
+            }
+        }
+        i += take;
+    }
 }
 
 fn ev_parse<E: Ev>(ev_chunks: &[B], cx: &EvCtx) -> Vec<EvChunk<E>> {
@@ -2032,9 +2068,11 @@ fn ev_parse<E: Ev>(ev_chunks: &[B], cx: &EvCtx) -> Vec<EvChunk<E>> {
             let mut tm = now();
             parse_events(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
             pt(0, &mut tm);
+            let (m, cnt) = pscatter(m, &mut d, &mut fb, &mut side);
+            pt(5, &mut tm);
             let (d, doff) = bucketize(&d, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize);
             pt(1, &mut tm);
-            EvChunk { m, d, doff, fb, fbn, side }
+            EvChunk { m, cnt, d, doff, fb, fbn, side }
         })
         .collect()
 }
