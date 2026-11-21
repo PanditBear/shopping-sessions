@@ -80,6 +80,9 @@ jobs:
           sx sx1 resource_stalls.sb exe_activity.bound_on_stores mem_inst_retired.all_stores
           sx sx2 l1d_pend_miss.fb_full l1d_pend_miss.fb_full_periods
           sx sx3 dtlb_store_misses.walk_completed dtlb_store_misses.walk_active
+          sx tdA topdown.slots_p topdown.backend_bound_slots topdown.bad_spec_slots topdown.br_mispredict_slots topdown.memory_bound_slots
+          sx tdB topdown.slots_p uops_retired.slots idq_bubbles.core idq_uops_not_delivered.core uops_issued.any
+          $P list > $R/perflist.full.txt 2>&1
           cp $R/topdown.txt $R/topdown.keep
           rec() { nm=$1; EVT=$2; c=$(grep -E "$EVT" $R/st.$3.txt | grep -vE 'not supported|not counted' | awk '{gsub(",","",$1); print $1}' | head -1)
             case "$c" in ''|*[!0-9]*) echo "rec $nm: no count for $EVT" | tee -a $R/machine.txt; return;; esac
@@ -91,8 +94,23 @@ jobs:
             head -1 $W/r$nm.txt | tee $R/t0.$nm.txt; wc -l < $W/r$nm.txt | tee -a $R/machine.txt
             grep -E 'parse_events_sol' $W/r$nm.txt | awk '{print $1, $2}' | gzip -6 > $R/pe.$nm.gz
             grep -E '^\[[0-9.]+s\]' $R/rec.$nm.ticks.txt > $R/ticks.$nm.txt
+            sudo $P script -i $W/r$nm.data --show-mmap-events -F time,ip 2>/dev/null | grep -E 'MMAP.*shop-prof' | head -6 > $R/mmap.$nm.txt
             grep -E 'parse_events_sol' $W/r$nm.txt | awk '{print $2}' | sort -u > $W/ips.$nm.txt
-            addr2line -i -f -a -e $W/shop-prof < $W/ips.$nm.txt 2>/dev/null | gzip -6 > $R/a2l.$nm.gz
+            python3 - $R/mmap.$nm.txt $W/ips.$nm.txt $W/off.$nm.txt <<'PY'
+import re,sys
+b=None
+for l in open(sys.argv[1]):
+    m=re.search(r'\[0x([0-9a-f]+)\(0x[0-9a-f]+\) @ (?:0x)?([0-9a-f]+)',l)
+    if m: b=int(m.group(1),16)-int(m.group(2),16); break
+with open(sys.argv[3],'w') as o:
+    for l in open(sys.argv[2]):
+        l=l.strip()
+        if l: o.write(hex(int(l,16)-(b or 0))+'
+')
+print('base',hex(b or 0))
+PY
+            addr2line -i -f -a -e $W/shop-prof < $W/off.$nm.txt 2>/dev/null | gzip -6 > $R/a2l.$nm.gz
+            paste -d' ' $W/ips.$nm.txt $W/off.$nm.txt | gzip -6 > $R/ipmap.$nm.gz
             sudo $P report -i $W/r$nm.data --stdio -n --no-children -g none --sort symbol 2>/dev/null | grep -v '^#' | grep -v '^$' | cut -c1-150 | head -25 > $R/top.$nm.txt
           }
           rec cyc cycles core
