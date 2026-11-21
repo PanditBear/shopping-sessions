@@ -1509,15 +1509,10 @@ fn parse_clicks(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: 
             };
             let Some(ci) = cf.unwrap_or_else(|| camp.get(sl(pm, nm))) else { continue };
             let (pt, nt) = fld(e2 + 1, l);
-            // SAFETY (ts3): the time is the fourth field and both ids are not empty, so pt - 3
-            // lies inside the window, and pt + 25 is checked against the chunk end
-            let (tq, okq) = if pt as usize + 25 <= lo + len { unsafe { ts3(pt, nt, &dc) } } else { (0, false) };
             // SAFETY (ldp, day_get, hms, ts25): a 20- or 25-byte field lies inside the window.
             // ts13: the time is the fourth field and both ids are not empty, so the 3 bytes
             // before it and the 16 bytes from pt - 3 lie inside the window.
-            let f = if okq {
-                Some(tq)
-            } else if nt == 20 && unsafe { *pt.add(19) } == b'Z' {
+            let f = if nt == 20 && unsafe { *pt.add(19) } == b'Z' {
                 let (ta, tb) = unsafe { (ldp(pt), ldp(pt.add(3))) };
                 match unsafe { (day_get(ta, tb, pt, &mut dc), hms(pt.add(11))) } {
                     (Some(d), Some(h)) => Some((d + h) * 1000),
@@ -3031,60 +3026,6 @@ unsafe fn ts25(p: *const u8, ra: u64, rb: u64, rd: i64, c: &mut DayCache) -> Opt
     let h = hms(p.add(11))?;
     let off = (oh * 60 + om) * 60_000;
     Some((d + h) * 1000 - if sg == b'-' { -off } else { off })
-}
-
-/// Time of the field at `p` (length `n`) without a branch on its form: "YYYY-MM-DDTHH:MM:SSZ"
-/// (n = 20, day start from the cache + `hms` rules), "YYYY-MM-DDTHH:MM:SS+HH:MM" (n = 25, `ts25`
-/// rules) and 13 digits (`ts13` rules) are all computed and the one matching `n` is picked.
-/// Returns (ms, ok); ok is clear for any other form and for a date not in the cache, and when
-/// it is set the value equals what `day_get` + `hms`, `ts25` or `ts13` give. Reads [p - 3, p + 25).
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
-#[inline(always)]
-unsafe fn ts3(p: *const u8, n: usize, c: &DayCache) -> (i64, bool) {
-    use core::arch::x86_64::*;
-    // day start of bytes 0..11, cache hit only
-    let (a, b) = (ldp(p), ldp(p.add(3)));
-    let e = &c.ents[(b.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize];
-    let hit = (e.a == a) & (e.b == b);
-    // "HH:MM:SS" at 11, as in `hms`
-    const LO: u64 = u64::from_le_bytes(*b"00:00:00");
-    const HI: u64 = u64::from_le_bytes([0x7F - b'2', 0x7F - b'9', 0x7F - b':', 0x7F - b'5', 0x7F - b'9', 0x7F - b':', 0x7F - b'5', 0x7F - b'9']);
-    let t = ldp(p.add(11));
-    let v = t.wrapping_sub(LO);
-    let hb = ((v | t.wrapping_add(HI)) & h8(0x80)) == 0;
-    let v = v.wrapping_mul(10).wrapping_add(v >> 8);
-    let h = (v & 0xFF) as i64;
-    let hok = hb & (h <= 23);
-    let secs = (h * 60 + ((v >> 24) & 0xFF) as i64) * 60 + ((v >> 48) & 0xFF) as i64;
-    // "SS+HH:MM" at 17, as in `ts25`
-    const LO2: u64 = u64::from_le_bytes(*b"00+00:00");
-    const HI2: u64 = u64::from_le_bytes([0x7F - b'5', 0x7F - b'9', 0x7F - b'-', 0x7F - b'9', 0x7F - b'9', 0x7F - b':', 0x7F - b'5', 0x7F - b'9']);
-    let w = ldp(p.add(17));
-    let v2 = w.wrapping_sub(LO2);
-    let sg = ((w >> 16) & 0xFF) as u8;
-    let ob = (((v2 | w.wrapping_add(HI2)) & h8(0x80)) == 0) & (sg != b',');
-    let u = v2.wrapping_mul(10).wrapping_add(v2 >> 8);
-    let (oh, om) = (((u >> 24) & 0xFF) as i64, ((u >> 48) & 0xFF) as i64);
-    let ook = ob & (oh <= 23);
-    let off = (oh * 60 + om) * 60_000;
-    let off = if sg == b'-' { -off } else { off };
-    let z = *p.add(19) == b'Z';
-    let okz = hit & hok & (((n == 20) & z) | ((n == 25) & ook));
-    let tz = (e.ds + secs) * 1000 - if n == 25 { off } else { 0 };
-    // 13 digits read from p - 3, as in `ts13`
-    let keep = _mm_setr_epi8(0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
-    let raw = _mm_loadu_si128(p.sub(3) as *const __m128i);
-    let dv = _mm_and_si128(_mm_add_epi8(raw, _mm_set1_epi8(-(b'0' as i8))), keep);
-    let over = _mm_subs_epu8(dv, _mm_set1_epi8(9));
-    let dig = _mm_testz_si128(over, over) != 0;
-    let m1 = _mm_maddubs_epi16(dv, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1));
-    let m2 = _mm_madd_epi16(m1, _mm_setr_epi16(100, 1, 100, 1, 100, 1, 100, 1));
-    let m3 = _mm_packus_epi32(m2, m2);
-    let m4 = _mm_madd_epi16(m3, _mm_setr_epi16(10000, 1, 10000, 1, 10000, 1, 10000, 1));
-    let x = _mm_cvtsi128_si64(m4) as u64;
-    let t13 = ((x & 0xFFFF_FFFF).wrapping_mul(100_000_000).wrapping_add(x >> 32)) as i64;
-    let ok13 = (n == 13) & dig;
-    (if okz { tz } else { t13 }, okz | ok13)
 }
 
 /// Same records, dedup entries and side lists, in the same order, as `parse_events`, except
@@ -5133,59 +5074,6 @@ mod tests {
 
     /// parse_clicks (one-window kernel, fixed-offset times) gives exactly the records of
     /// parse_clicks_old (scan4 + click_line + ts_fast), in the same order
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
-    #[test]
-    fn ts3_matches_chain() {
-        let mut dc = DayCache::new();
-        let mut tc = TsCache::new();
-        let cases: &[&[u8]] = &[
-            b"2028-01-31T08:06:00Z",
-            b"2028-01-31T23:59:59Z",
-            b"2028-01-31T24:00:00Z",
-            b"2028-02-29T00:00:00Z",
-            b"2028-01-31T08:06:00+05:30",
-            b"2028-01-31T08:06:00-11:45",
-            b"2028-01-31T08:06:00,05:30",
-            b"2028-01-31T08:06:00+24:00",
-            b"1832112000000",
-            b"183211200000x",
-            b"2028-01-31 08:06:00Z",
-            b"2028-01-31T08:06:00z",
-        ];
-        let (mut oks, mut hits) = (0, 0);
-        for round in 0..2 {
-            for s in cases {
-                let mut buf = [b','; 40];
-                buf[3..3 + s.len()].copy_from_slice(s);
-                let p = unsafe { buf.as_ptr().add(3) };
-                let n = s.len();
-                let (t, ok) = unsafe { ts3(p, n, &dc) };
-                let want = if n == 20 && s[19] == b'Z' {
-                    match unsafe { (day_get(ldp(p), ldp(p.add(3)), p, &mut dc), hms(p.add(11))) } {
-                        (Some(d), Some(h)) => Some((d + h) * 1000),
-                        _ => None,
-                    }
-                } else if n == 13 {
-                    unsafe { ts13(p) }
-                } else if n == 25 {
-                    unsafe { ts25(p, D0_A, D0_B, D0_S, &mut dc) }
-                } else {
-                    None
-                };
-                if ok {
-                    oks += 1;
-                    assert_eq!(Some(t), want, "{:?}", String::from_utf8_lossy(s));
-                    assert_eq!(Some(t), parse_ts_c(s, &mut tc), "{:?}", String::from_utf8_lossy(s));
-                }
-                if round == 1 && want.is_some() {
-                    hits += 1;
-                    assert!(ok, "second pass misses {:?}", String::from_utf8_lossy(s));
-                }
-            }
-        }
-        assert!(oks >= 7 && hits >= 6, "oks {oks} hits {hits}");
-    }
-
     #[test]
     fn parse_clicks_matches_old() {
         assert!(cfg!(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), "build with -C target-cpu=x86-64-v3");
