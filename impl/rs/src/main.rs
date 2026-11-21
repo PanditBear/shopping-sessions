@@ -1961,6 +1961,61 @@ fn sort_clicks(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Vec<u3
     }
 }
 
+/// Bucket `p` of every click part, sorted as `sort_clicks` sorts, into `cl`. The gather counts the
+/// digits on the way (the parts are read once), the scatter puts the clicks in digit order and each
+/// digit range is then sorted in place: no separate counting pass and no copy back. `tmp` and
+/// `cnt` are scratch.
+fn gather_sort_clicks(parts: &[(Vec<ClickRec>, Vec<u32>)], p: usize, cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Vec<u32>) {
+    let nb = 1usize << NBK;
+    cnt.clear();
+    cnt.resize(nb + 1, 0);
+    cl.clear();
+    for (v, o) in parts {
+        let s = &v[o[p] as usize..o[p + 1] as usize];
+        cl.extend_from_slice(s);
+        for c in s {
+            cnt[dg(c.key) + 1] += 1;
+        }
+    }
+    let n = cl.len();
+    if n < 256 {
+        sort_clicks(cl, tmp, cnt);
+        return;
+    }
+    for i in 0..nb {
+        cnt[i + 1] += cnt[i];
+    }
+    tmp.clear();
+    tmp.reserve(n);
+    {
+        let sp = tmp.spare_capacity_mut();
+        for c in cl.iter() {
+            let d = dg(c.key);
+            sp[cnt[d] as usize].write(*c);
+            cnt[d] += 1;
+        }
+    }
+    unsafe { tmp.set_len(n) };
+    let mut pk: Vec<u64> = vec![];
+    let mut st = 0usize;
+    while st < n {
+        let en = cnt[dg(tmp[st].key)] as usize;
+        let m = en - st;
+        if m > 32 {
+            // `cl` is free until the swap below: the source copy of a long range
+            cl.clear();
+            cl.extend_from_slice(&tmp[st..en]);
+            if !sort_one_clicker(cl, &mut tmp[st..en], &mut pk) {
+                tmp[st..en].sort_unstable_by(|a, b| (a.key, a.ts).cmp(&(b.key, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid))));
+            }
+        } else if m > 1 {
+            isort_by(&mut tmp[st..en], click_less);
+        }
+        st = en;
+    }
+    std::mem::swap(cl, tmp);
+}
+
 /// A long digit range is nearly always one heavy clicker. When every click in `src` has the same key,
 /// sort (ts, index) pairs packed into u64s, gather into `out`, then order each run of equal ts by
 /// click_id bytes. Returns false (and leaves `out` alone) for a range with several keys.
@@ -2004,7 +2059,6 @@ fn process_bucket<E: Ev>(
     tmp: &mut Vec<E>,
     cnt: &mut Vec<u32>,
     clicks: &mut Vec<ClickRec>,
-    ctmp: &mut Vec<ClickRec>,
     win: &mut Win,
     organic: u32,
     uds: &mut Vec<UD>,
@@ -2015,8 +2069,6 @@ fn process_bucket<E: Ev>(
     let mut tm = now();
     sort_evs(evs, tmp, cnt, span);
     pt(7, &mut tm);
-    sort_clicks(clicks, ctmp, cnt);
-    pt(11, &mut tm);
     let mut ci = 0;
     let mut i = 0;
     let mut day = DayAcc { key: 0, day: 0, sessions: 0, events: 0, rev: 0, cats: vec![] };
@@ -3481,17 +3533,15 @@ fn ev_after<E: Ev>(
             let mut ctmp: Vec<ClickRec> = vec![];
             for p in g * per..((g + 1) * per).min(PB) {
                 let mut tm = now();
-                cl.clear();
-                for (v, o) in click_out.iter() {
-                    cl.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
-                }
+                gather_sort_clicks(click_out, p, &mut cl, &mut ctmp, &mut cnt);
+                pt(11, &mut tm);
                 evs.clear();
                 for (v, o) in parts.iter() {
                     evs.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
                 }
                 pt(6, &mut tm);
                 let mut uds = Vec::new();
-                process_bucket(&mut evs, &mut tmp, &mut cnt, &mut cl, &mut ctmp, &mut win, ncamp as u32, &mut uds, &mut cm, ws, we.wrapping_sub(ws));
+                process_bucket(&mut evs, &mut tmp, &mut cnt, &mut cl, &mut win, ncamp as u32, &mut uds, &mut cm, ws, we.wrapping_sub(ws));
                 out.push(uds);
             }
             (out, cm)
@@ -3793,17 +3843,15 @@ fn ev_after_idx<E: Ev>(
             let mut ctmp: Vec<ClickRec> = vec![];
             for p in g * per..((g + 1) * per).min(PB) {
                 let mut tm = now();
-                cl.clear();
-                for (v, o) in click_out.iter() {
-                    cl.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
-                }
+                gather_sort_clicks(click_out, p, &mut cl, &mut ctmp, &mut cnt);
+                pt(11, &mut tm);
                 evs.clear();
                 for (v, o) in parts.iter() {
                     evs.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
                 }
                 pt(6, &mut tm);
                 let mut uds = Vec::new();
-                process_runs(&evs, &mut tmp, &mut runs, &mut cnt, &mut cl, &mut ctmp, &mut win, ncamp as u32, &mut uds, &mut cm, ws);
+                process_runs(&evs, &mut tmp, &mut runs, &mut cl, &mut win, ncamp as u32, &mut uds, &mut cm, ws);
                 out.push(uds);
             }
             (out, cm)
@@ -3829,9 +3877,7 @@ fn process_runs<E: Ev>(
     evs: &[E],
     tmp: &mut Vec<E>,
     runs: &mut Vec<Run>,
-    cnt: &mut Vec<u32>,
     clicks: &mut Vec<ClickRec>,
-    ctmp: &mut Vec<ClickRec>,
     win: &mut Win,
     organic: u32,
     uds: &mut Vec<UD>,
@@ -3855,8 +3901,6 @@ fn process_runs<E: Ev>(
     }
     runs.sort_unstable_by_key(|r| (r.d, r.k, r.s));
     pt(7, &mut tm);
-    sort_clicks(clicks, ctmp, cnt);
-    pt(11, &mut tm);
     let mut ci = 0;
     let mut day = DayAcc { key: 0, day: 0, sessions: 0, events: 0, rev: 0, cats: vec![] };
     let mut a = 0;
@@ -5186,6 +5230,42 @@ mod tests {
             let (b, bo) = scatter_counted(&v, cnt, bk);
             assert_eq!(ao, bo);
             assert!(a.iter().zip(&b).all(|(x, y)| x == y), "nb={nb} n={n}");
+        }
+    }
+    #[test]
+    fn gather_sort_clicks_matches_sort_clicks() {
+        let mut r = Rng(0xc11c_5eed_0123_4567);
+        for case in 0..120 {
+            let n = r.below(if case % 3 == 0 { 40_000 } else { 600 }) as usize;
+            let nkeys = 1 + r.below(if case % 2 == 0 { 20 } else { 5000 });
+            let span = 1 + r.below(if case % 5 == 0 { 4 } else { 1 << 40 }) as i64;
+            let mut v: Vec<ClickRec> = Vec::with_capacity(n);
+            for i in 0..n {
+                if i > 0 && r.below(20) == 0 {
+                    let c = v[r.below(i as u64) as usize];
+                    v.push(c);
+                    continue;
+                }
+                // a few heavy keys, many light ones
+                let k = if r.below(4) == 0 { r.below(3) } else { r.below(nkeys) };
+                let id: &'static [u8] = Box::leak(format!("c{}{}", r.below(1000), i).into_bytes().into_boxed_slice());
+                v.push(ClickRec { key: k.wrapping_mul(0x9e37_79b9_7f4a_7c15), ts: r.below(span as u64) as i64 - 7, cid: pack(id), camp: r.below(50) as u32 });
+            }
+            // split into parts of random sizes, all in bucket 0
+            let mut parts: Vec<(Vec<ClickRec>, Vec<u32>)> = vec![];
+            let mut a = 0;
+            while a < n || parts.is_empty() {
+                let b = (a + 1 + r.below(3000) as usize).min(n);
+                parts.push((v[a..b].to_vec(), vec![0, (b - a) as u32]));
+                a = b;
+            }
+            let (mut want, mut tmp, mut cnt) = (v.clone(), vec![], vec![]);
+            sort_clicks(&mut want, &mut tmp, &mut cnt);
+            let mut got = vec![ClickRec { key: 1, ts: 2, cid: 0, camp: 3 }];
+            gather_sort_clicks(&parts, 0, &mut got, &mut tmp, &mut cnt);
+            assert_eq!(got.len(), n);
+            let sig = |c: &ClickRec| (c.key, c.ts, unpack(c.cid).to_vec(), c.camp);
+            assert!(want.iter().zip(&got).all(|(x, y)| sig(x) == sig(y)), "case={case} n={n}");
         }
     }
 }
