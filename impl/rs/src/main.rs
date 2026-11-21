@@ -255,6 +255,16 @@ fn scan<const N: usize>(chunk: B, mut f: impl FnMut(&[B; N])) {
         }
         let mut out: [B; N] = [&[]; N];
         let mut start = ls;
+        if qcnt == 0 {
+            let base = chunk.as_ptr();
+            for k in 0..N {
+                let end = if k < N - 1 { commas[k] } else { le };
+                out[k] = unsafe { std::slice::from_raw_parts(base.add(start), end - start) };
+                start = end + 1;
+            }
+            f(&out);
+            return;
+        }
         let mut expect = 0u32;
         let base = chunk.as_ptr();
         for k in 0..N {
