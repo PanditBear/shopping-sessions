@@ -3656,35 +3656,40 @@ fn ev_after_idx<E: Ev>(
                             lg.clear();
                             for (ci, c) in ev_out.iter().enumerate() {
                                 let (sa, sp, oa, op) = c.dz.seg(b);
-                                let mut one = |xi: u64, xing: u32, xe: E, p: usize| {
-                                    let q = lb.len() as u32;
-                                    lb.push(xe);
-                                    if dside_any {
-                                        lg.push(((ci as u64) << 32) | p as u64);
-                                    }
-                                    let pk = ((xing as u64) << 32) | q as u64;
-                                    // SAFETY: the slot index is masked to span
-                                    let o = unsafe { t.get_unchecked_mut((xi & mask) as usize) };
-                                    if *o == u64::MAX {
-                                        *o = pk;
-                                        return;
-                                    }
-                                    let ok = (*o >> 32) as u32;
-                                    if xing < ok
-                                        || (xing == ok
-                                            && dside_any
-                                            && dexact(lg[q as usize], xing) < dexact(lg[*o as u32 as usize], ok))
-                                    {
-                                        *o = pk;
-                                    }
-                                };
+                                // one record into the slot table (a macro, so both loops get it inline)
+                                macro_rules! one {
+                                    ($xi:expr, $xing:expr, $xe:expr, $p:expr) => {{
+                                        let (xi, xing, xe, p): (u64, u32, E, usize) = ($xi, $xing, $xe, $p);
+                                        let q = lb.len() as u32;
+                                        lb.push(xe);
+                                        if dside_any {
+                                            lg.push(((ci as u64) << 32) | p as u64);
+                                        }
+                                        let pk = ((xing as u64) << 32) | q as u64;
+                                        // SAFETY: the slot index is masked to span
+                                        let o = unsafe { t.get_unchecked_mut((xi & mask) as usize) };
+                                        if *o == u64::MAX {
+                                            *o = pk;
+                                        } else {
+                                            let ok = (*o >> 32) as u32;
+                                            if xing < ok
+                                                || (xing == ok
+                                                    && dside_any
+                                                    && dexact(lg[q as usize], xing) < dexact(lg[*o as u32 as usize], ok))
+                                            {
+                                                *o = pk;
+                                            }
+                                        }
+                                    }};
+                                }
                                 let sh = c.dz.sh;
+                                lb.reserve(sa.len() + oa.len());
                                 for (j, x) in sa.iter().enumerate() {
                                     let (lo, xing, xe) = x.unpack::<E>(sh);
-                                    one(lo as u64, xing, xe, sp + j);
+                                    one!(lo as u64, xing, xe, sp + j);
                                 }
                                 for (j, x) in oa.iter().enumerate() {
-                                    one(x.i as u64, x.ing, x.e, op + j);
+                                    one!(x.i as u64, x.ing, x.e, op + j);
                                 }
                             }
                             pt(2, &mut tm);
