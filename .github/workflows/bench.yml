@@ -96,9 +96,8 @@ jobs:
             grep -E '^\[[0-9.]+s\]' $R/rec.$nm.ticks.txt > $R/ticks.$nm.txt
             sudo $P script -i $W/r$nm.data --show-mmap-events -F time,ip 2>/dev/null | grep -E 'MMAP.*shop-prof' | head -6 > $R/mmap.$nm.txt
             grep -E 'parse_events_sol' $W/r$nm.txt | awk '{print $2}' | sort -u > $W/ips.$nm.txt
-            read S PG < <(sed -nE 's/.*\[0x([0-9a-f]+)\(0x[0-9a-f]+\) @ (0x)?([0-9a-f]+).*/ /p' $R/mmap.$nm.txt | head -1); BASE=$(( 0x${S:-0} - 0x${PG:-0} )); echo "base $BASE" | tee -a $R/machine.txt
-            while read ip; do printf '0x%x
-' $(( 0x$ip - BASE )); done < $W/ips.$nm.txt > $W/off.$nm.txt
+            read S PG < <(sed -nE 's/.*\[0x([0-9a-f]+)\(0x[0-9a-f]+\) @ (0x)?([0-9a-f]+).*/\1 \3/p' $R/mmap.$nm.txt | head -1); BASE=$(( 0x${S:-0} - 0x${PG:-0} )); echo "base $BASE" | tee -a $R/machine.txt
+            while read ip; do printf '0x%x\n' $(( 0x$ip - BASE )); done < $W/ips.$nm.txt > $W/off.$nm.txt
             addr2line -i -f -a -e $W/shop-prof < $W/off.$nm.txt 2>/dev/null | gzip -6 > $R/a2l.$nm.gz
             paste -d' ' $W/ips.$nm.txt $W/off.$nm.txt | gzip -6 > $R/ipmap.$nm.gz
             sudo $P report -i $W/r$nm.data --stdio -n --no-children -g none --sort symbol 2>/dev/null | grep -v '^#' | grep -v '^$' | cut -c1-150 | head -25 > $R/top.$nm.txt
