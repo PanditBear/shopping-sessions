@@ -4,6 +4,7 @@
 # A ref may carry image ENV lines: REF@VAR=val@VAR2=val (same binary, different environment).
 # Env: RUNS (timed runs per ref), CPUS, MEM, EVENTS, CLICKS, SEED, PROBE=1 (one SHOP_PROBE run per image),
 #      PERF=1 (profile the first image's binary on the host with perf),
+#      EXITPROBE=3 (time after the container exits, 60M run vs empty dataset, with docker events),
 #      EXITPROBE=2 (exit time of the first image under different docker cpu and memory limits),
 #      EXITPROBE=1 (split the time after the binary's last tick: process teardown vs docker, plus a native run).
 set -euo pipefail
@@ -190,6 +191,37 @@ if [ "${EXITPROBE:-}" = 2 ]; then
       docker rm $nm >/dev/null
       em=$(grep -o 'main=[0-9.]*' $W/xerr.txt | cut -d= -f2); ee=$(grep -o 'end=[0-9.]*' $W/xerr.txt | cut -d= -f2)
       printf 'xq %s internal %.3f exit %.3f\n' $v "$(echo "$ee - $em" | bc)" "$(echo "$fa - $ee" | bc)"
+      sudo rm -rf $out $scr
+    done
+  done
+  set -e
+fi
+
+if [ "${EXITPROBE:-}" = 3 ]; then
+  echo "== exit probe 3 (s): variant end>finished finished>die finished>return rm"
+  set +e
+  ep() { date -d "$1" +%s.%N; }
+  for v in base60 empty plain60 base60 empty; do
+    case $v in
+      base60) lim="--cpus $CPUS --memory $MEM --memory-swap $MEM"; d=$W/data;;
+      plain60) lim=""; d=$W/data;;
+      empty) lim="--cpus $CPUS --memory $MEM --memory-swap $MEM"; d=$W/empty;;
+    esac
+    for k in 1 2 3; do
+      out=$(mktemp -d); scr=$(mktemp -d); chmod 777 $out $scr; nm=xr-$v-$k-$RANDOM
+      t0=$(date +%s)
+      docker run --name $nm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 \
+        --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 $lim --user 1000:1000 \
+        -v $d:/data:ro -v $out:/output -v $scr:/scratch \
+        -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
+        -e NCPU=$CPUS -e SHOP_TIMING=1 ${IMGS[0]} 2>$W/xerr.txt
+      t1=$(date +%s.%N)
+      fa=$(ep "$(docker inspect -f '{{.State.FinishedAt}}' $nm)")
+      die=$(docker events --since $t0 --until $(date +%s) --filter container=$nm --filter event=die --format '{{.TimeNano}}' | head -1)
+      t2=$(date +%s.%N); docker rm $nm >/dev/null; t3=$(date +%s.%N)
+      ee=$(grep -o 'end=[0-9.]*' $W/xerr.txt | cut -d= -f2); [ -z "$ee" ] && ee=$fa
+      printf 'xr %s %.3f %.3f %.3f %.3f\n' $v "$(echo "$fa - $ee" | bc)" "$(echo "${die:-0}/1000000000 - $fa" | bc -l)" \
+        "$(echo "$t1 - $fa" | bc)" "$(echo "$t3 - $t2" | bc)"
       sudo rm -rf $out $scr
     done
   done
