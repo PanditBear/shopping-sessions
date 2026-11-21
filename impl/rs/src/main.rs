@@ -2008,12 +2008,77 @@ fn gather_sort_clicks(parts: &[(Vec<ClickRec>, Vec<u32>)], p: usize, cl: &mut Ve
             if !sort_one_clicker(cl, &mut tmp[st..en], &mut pk) {
                 tmp[st..en].sort_unstable_by(|a, b| (a.key, a.ts).cmp(&(b.key, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid))));
             }
-        } else if m > 1 {
+        } else if m > 1 && !rank_sort_clicks(&mut tmp[st..en]) {
             isort_by(&mut tmp[st..en], click_less);
         }
         st = en;
     }
     std::mem::swap(cl, tmp);
+}
+
+/// Order a one-key range of 2..=32 clicks by (ts, click_id bytes) in place. Each click's place is
+/// the number of smaller (ts - min ts, index) keys, counted without branches over a padded key
+/// array; runs of equal ts are then ordered by click_id. Returns false (range untouched) when the
+/// range holds several keys or its ts span is too wide to pack.
+#[inline]
+fn rank_sort_clicks(v: &mut [ClickRec]) -> bool {
+    let m = v.len();
+    debug_assert!((2..=32).contains(&m));
+    let k0 = v[0].key;
+    let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+    let mut same = true;
+    for c in v.iter() {
+        same &= c.key == k0;
+        lo = lo.min(c.ts);
+        hi = hi.max(c.ts);
+    }
+    if !same || hi.wrapping_sub(lo) as u64 >= 1 << 57 {
+        return false;
+    }
+    let mut k = [i64::MAX; 32];
+    let mut buf = [MaybeUninit::<ClickRec>::uninit(); 32];
+    for (j, c) in v.iter().enumerate() {
+        k[j] = ((c.ts.wrapping_sub(lo) as u64) << 5 | j as u64) as i64;
+        buf[j].write(*c);
+    }
+    let mut rk = [0u8; 32];
+    if m <= 8 {
+        rank_keys::<8>(&k, &mut rk[..m]);
+    } else if m <= 16 {
+        rank_keys::<16>(&k, &mut rk[..m]);
+    } else {
+        rank_keys::<32>(&k, &mut rk[..m]);
+    }
+    for (j, &r) in rk[..m].iter().enumerate() {
+        v[r as usize] = unsafe { buf[j].assume_init() };
+    }
+    let mut a = 0;
+    while a + 1 < m {
+        if v[a + 1].ts != v[a].ts {
+            a += 1;
+            continue;
+        }
+        let mut b = a + 2;
+        while b < m && v[b].ts == v[a].ts {
+            b += 1;
+        }
+        v[a..b].sort_unstable_by(|x, y| unpack(x.cid).cmp(unpack(y.cid)));
+        a = b;
+    }
+    true
+}
+
+/// rk[i] = the number of keys in k[..P] smaller than k[i] (k is padded with i64::MAX, keys are unique).
+#[inline(always)]
+fn rank_keys<const P: usize>(k: &[i64; 32], rk: &mut [u8]) {
+    for (i, r) in rk.iter_mut().enumerate() {
+        let ki = k[i];
+        let mut c = 0u32;
+        for &kj in &k[..P] {
+            c += (kj < ki) as u32;
+        }
+        *r = c as u8;
+    }
 }
 
 /// A long digit range is nearly always one heavy clicker. When every click in `src` has the same key,
@@ -5238,7 +5303,13 @@ mod tests {
         for case in 0..120 {
             let n = r.below(if case % 3 == 0 { 40_000 } else { 600 }) as usize;
             let nkeys = 1 + r.below(if case % 2 == 0 { 20 } else { 5000 });
-            let span = 1 + r.below(if case % 5 == 0 { 4 } else { 1 << 40 }) as i64;
+            let span = 1 + r.below(if case % 5 == 0 {
+                4
+            } else if case % 7 == 1 {
+                1 << 60
+            } else {
+                1 << 40
+            }) as i64;
             let mut v: Vec<ClickRec> = Vec::with_capacity(n);
             for i in 0..n {
                 if i > 0 && r.below(20) == 0 {
@@ -5248,7 +5319,7 @@ mod tests {
                 }
                 // a few heavy keys, many light ones
                 let k = if r.below(4) == 0 { r.below(3) } else { r.below(nkeys) };
-                let id: &'static [u8] = Box::leak(format!("c{}{}", r.below(1000), i).into_bytes().into_boxed_slice());
+                let id: &'static [u8] = Box::leak(format!("c{}_{}", r.below(1000), i).into_bytes().into_boxed_slice());
                 v.push(ClickRec { key: k.wrapping_mul(0x9e37_79b9_7f4a_7c15), ts: r.below(span as u64) as i64 - 7, cid: pack(id), camp: r.below(50) as u32 });
             }
             // split into parts of random sizes, all in bucket 0
