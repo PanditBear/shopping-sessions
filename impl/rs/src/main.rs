@@ -44,9 +44,9 @@ const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 1_800_000;
 const CHUNK: usize = 4 << 20;
-const EBB: u32 = 11;
+const EBB: u32 = 12;
 const EB: usize = 1 << EBB; // event dedup buckets (by event_id)
-const DDG: usize = 4; // event_id buckets per dedup task
+const DDG: usize = 8; // event_id buckets per dedup task
 const PBB: u32 = 10;
 const PB: usize = 1 << PBB; // person buckets
 
