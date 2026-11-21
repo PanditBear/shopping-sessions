@@ -267,6 +267,18 @@ fn masks64(p: *const u8) -> (u64, u64, u64) {
     (cm, qm, nm)
 }
 
+/// Quote check for the first fields of a line inside one 64-byte window. `q1`: the quote bits
+/// before the field end `end`; `c`: the separator bits, with bit `end` set. Returns the quotes
+/// that open a field and a mask that is nonzero unless every field before `end` is either free
+/// of quotes or is '"', at least one byte, '"' with no other quote.
+/// The borrow of `c - x` from each opening quote clears the separator that ends its field.
+#[inline(always)]
+fn quote_bad(q1: u64, c: u64) -> (u64, u64) {
+    let x = q1 & ((c << 1) | 1);
+    let e = !c.wrapping_sub(x) & c;
+    (x, q1 ^ x ^ (e >> 1))
+}
+
 /// Calls `f` with the unquoted fields of every well-formed line of `chunk` (N fields).
 /// Same dialect as rules.md: only \n ends a line; quotes allowed only around a whole field.
 #[inline(always)]
@@ -467,6 +479,106 @@ fn scan7_line(chunk: B, pos: usize, buf: &mut Vec<[B; 7]>) -> usize {
 #[inline(always)]
 fn scan7(chunk: B, f: impl FnMut(&[B; 7])) {
     scan::<7>(chunk, f)
+}
+
+/// Same lines and fields as `scan::<4>` (same dialect, same order). A line takes the fast path
+/// when one 64-byte window at its start holds its newline with exactly three commas before it and
+/// every quote opens or closes a whole field of two or more bytes (the mask rule of `line7`).
+/// Every other line, and the last 64 bytes of the chunk, go to `scan` one line at a time.
+/// The fast path of `scan4`: the fields of the line at `p` and its length with the newline, or
+/// None if the line needs `scan`. The caller guarantees 64 readable bytes at `p`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+fn line4(p: *const u8) -> Option<([B; 4], usize)> {
+    use core::arch::x86_64::_bzhi_u64;
+    // SAFETY (bzhi): BMI2 is enabled for this build
+    let bzhi = |x: u64, n: u32| unsafe { _bzhi_u64(x, n) };
+    let blsr = |x: u64| x & x.wrapping_sub(1);
+    let (ca, qa, na) = masks64(p);
+    let l = na.trailing_zeros();
+    let cl = bzhi(ca, l);
+    let e0 = cl.trailing_zeros();
+    let c1 = blsr(cl);
+    let e1 = c1.trailing_zeros();
+    let c2 = blsr(c1);
+    let e2 = c2.trailing_zeros();
+    let c3 = blsr(c2);
+    let sb = ca | na;
+    let q1 = bzhi(qa, l);
+    let x = q1 & ((ca << 1) | 1);
+    let y = q1 & (sb >> 1);
+    let r = y.wrapping_sub(x);
+    let bad = (q1 & !(x | y)) | (x & y) | (r & (bzhi(sb, l + 1) | y));
+    if (na != 0) & (c2 != 0) & (c3 == 0) & (bad == 0) {
+        let fld = |s: u32, e: u32| {
+            let q = ((x >> s) & 1) as u32;
+            // SAFETY: s <= e <= 63 inside the window; a quoted field has e - s >= 2
+            unsafe { std::slice::from_raw_parts(p.add((s + q) as usize), (e - s - 2 * q) as usize) }
+        };
+        let out: [B; 4] = [fld(0, e0), fld(e0 + 1, e1), fld(e1 + 1, e2), fld(e2 + 1, l)];
+        return Some((out, (l + 1) as usize));
+    }
+    None
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+fn scan4(chunk: B, mut f: impl FnMut(&[B; 4])) {
+    let len = chunk.len();
+    let base = chunk.as_ptr();
+    let mut pos = 0usize;
+    // lines from the slow path wait in buf, so f has one call site
+    let mut buf: Vec<[B; 4]> = Vec::new();
+    let mut bi = 0usize;
+    loop {
+        let line: [B; 4] = if bi < buf.len() {
+            bi += 1;
+            buf[bi - 1]
+        } else if pos + 64 <= len {
+            // SAFETY: pos + 64 <= len
+            match line4(unsafe { base.add(pos) }) {
+                Some((l, n)) => {
+                    #[cfg(test)]
+                    SCAN7_FAST.with(|c| c.set(c.get() + 1));
+                    pos += n;
+                    l
+                }
+                None => {
+                    buf.clear();
+                    bi = 0;
+                    pos = scan4_line(chunk, pos, &mut buf);
+                    continue;
+                }
+            }
+        } else if pos < len {
+            buf.clear();
+            bi = 0;
+            scan::<4>(&chunk[pos..], |l| buf.push(*l));
+            pos = len;
+            continue;
+        } else {
+            break;
+        };
+        f(&line);
+    }
+}
+
+/// The slow path of `scan4`: the one line at `pos` through `scan`; returns the next line start.
+#[cold]
+#[inline(never)]
+fn scan4_line(chunk: B, pos: usize, buf: &mut Vec<[B; 4]>) -> usize {
+    let end = match memchr(b'\n', &chunk[pos..]) {
+        Some(i) => pos + i + 1,
+        None => chunk.len(),
+    };
+    scan::<4>(&chunk[pos..end], |l| buf.push(*l));
+    end
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
+#[inline(always)]
+fn scan4(chunk: B, f: impl FnMut(&[B; 4])) {
+    scan::<4>(chunk, f)
 }
 
 #[inline]
@@ -902,6 +1014,27 @@ impl IdLookup {
         }
         self.get(b)
     }
+    /// `get_fast` for a two-byte prefix: same result as `get`; `lo` is the lowest readable address
+    /// at or before `b` (up to 8 digits are read as one word ending at the end of `b`).
+    #[inline(always)]
+    fn get_fast2(&self, b: B, lo: usize) -> Option<u32> {
+        let n = b.len();
+        let p = b.as_ptr() as usize;
+        if self.prefix.len() == 2 && (3..=10).contains(&n) && p + n >= lo + 8 && b[0] == self.prefix[0] && b[1] == self.prefix[1] && b[2] != b'0' {
+            // SAFETY: [p + n - 8, p + n) lies inside the chunk that starts at lo
+            let w = unsafe { std::ptr::read_unaligned((p + n - 8) as *const u64) };
+            let d = (n - 2) as u32;
+            let low = (u64::MAX >> (8 * d - 1)) >> 1;
+            let w2 = (w & !low) | (h8(b'0') & low);
+            if dig8(w2) {
+                let v = parse8(w2) as usize;
+                if v < (1 << 24) {
+                    return self.arr.get(v).copied().filter(|&x| x != u32::MAX);
+                }
+            }
+        }
+        self.get(b)
+    }
 }
 
 // ---------- identity table: id key -> person key ----------
@@ -1153,6 +1286,29 @@ fn bucketize<T: Copy>(v: &[T], nb: usize, bk: impl Fn(&T) -> usize) -> (Vec<T>, 
             w[b] += 1;
         }
     }
+    unsafe { out.set_len(v.len()) };
+    (out, cnt)
+}
+
+/// `bucketize` when the bucket counts are already known: `cnt[b + 1]` = the number of items in
+/// bucket `b` (`cnt[0]` = 0); returns (vec ordered by bucket, offsets[nb+1]).
+fn scatter_counted<T: Copy>(v: &[T], mut cnt: Vec<u32>, bk: impl Fn(&T) -> usize) -> (Vec<T>, Vec<u32>) {
+    let nb = cnt.len() - 1;
+    for i in 0..nb {
+        cnt[i + 1] += cnt[i];
+    }
+    debug_assert_eq!(cnt[nb] as usize, v.len());
+    let mut w = cnt.clone();
+    let mut out: Vec<T> = Vec::with_capacity(v.len());
+    {
+        let sp: &mut [MaybeUninit<T>] = out.spare_capacity_mut();
+        for x in v {
+            let b = bk(x);
+            sp[w[b] as usize].write(*x);
+            w[b] += 1;
+        }
+    }
+    assert_eq!(cnt[nb] as usize, v.len());
     unsafe { out.set_len(v.len()) };
     (out, cnt)
 }
@@ -2593,17 +2749,8 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
             let d2 = blsr(d1);
             let e5 = d2.trailing_zeros();
             let d3 = blsr(d2);
-            let qa1 = bzhi(qa, e2);
-            let xa = qa1 & ((ca << 1) | 1);
-            let ya = qa1 & (ca >> 1);
-            let ra = ya.wrapping_sub(xa);
-            let bad_a = (qa1 & !(xa | ya)) | (xa & ya) | (ra & (bzhi(ca, e2 + 1) | ya));
-            let sb = cb | nb;
-            let qb1 = bzhi(qb, l);
-            let xb = qb1 & ((cb << 1) | 1);
-            let yb = qb1 & (sb >> 1);
-            let rb = yb.wrapping_sub(xb);
-            let bad_b = (qb1 & !(xb | yb)) | (xb & yb) | (rb & (bzhi(sb, l + 1) | yb));
+            let (xa, bad_a) = quote_bad(bzhi(qa, e2), ca);
+            let (xb, bad_b) = quote_bad(bzhi(qb, l), cb | nb);
             if !((nb != 0) & (e5 < l) & (bzhi(d3, l) == 0) & ((bad_a | bad_b) == 0)) {
                 break 'slow;
             }
@@ -3498,36 +3645,47 @@ fn main() {
             let mut tmp: Vec<ClickRec> = Vec::with_capacity(c.len() / 40);
             let mut tc = TsCache::new();
             let mut tm = now();
-            scan::<4>(c, |&[cid, uid, cmp, ts]| {
+            let lo = c.as_ptr() as usize;
+            scan4(c, |&[cid, uid, cmp, ts]| {
                 if cid.is_empty() || uid.is_empty() {
                     return;
                 }
-                let Some(ci) = camp.get(cmp) else { return };
-                let Some(t) = parse_ts_c(ts, &mut tc) else { return };
+                let Some(ci) = camp.get_fast2(cmp, lo) else { return };
+                let Some(t) = ts_fast(ts, &mut tc) else { return };
                 if t < ws - WEEK || t >= we {
                     return;
                 }
                 tmp.push(ClickRec { key: ukey(&rs, uid), ts: t, cid: pack(cid), camp: ci });
             });
             pt(9, &mut tm);
-            // keys that miss the mover filter map to themselves without a table lookup
+            // keys that miss the mover filter map to themselves without a table lookup. The
+            // filter pass lists the hits without branching on them, the table pass resolves only
+            // those, and both count the person buckets of the final keys on the way.
             let n = tmp.len();
+            let mut hit = vec![0u32; n + 1];
+            let mut cnt = vec![0u32; PB + 1];
+            let mut m = 0usize;
             for i in 0..n {
-                if i + 2 * RPD < n {
-                    mf.pf(tmp[i + 2 * RPD].key);
-                }
                 if i + RPD < n {
-                    let k = tmp[i + RPD].key;
-                    if mf.hit(k) {
-                        tab.pf(k);
-                    }
+                    mf.pf(tmp[i + RPD].key);
                 }
                 let k = tmp[i].key;
-                if mf.hit(k) {
-                    tmp[i].key = tab.get(k);
-                }
+                let h = mf.hit(k);
+                hit[m] = i as u32;
+                m += h as usize;
+                cnt[pbk(k) + 1] += (!h) as u32;
             }
-            let r = bucketize(&tmp, PB, |x| pbk(x.key));
+            for j in 0..m {
+                if j + RPD < m {
+                    tab.pf(tmp[hit[j + RPD] as usize].key);
+                }
+                let i = hit[j] as usize;
+                let k = tab.get(tmp[i].key);
+                tmp[i].key = k;
+                cnt[pbk(k) + 1] += 1;
+            }
+            drop(hit);
+            let r = scatter_counted(&tmp, cnt, |x| pbk(x.key));
             pt(10, &mut tm);
             r
         })
@@ -3726,6 +3884,129 @@ mod tests {
         assert!(total > 1_000_000 && fast_lines > total / 4);
     }
 
+    /// one click-shaped line (four fields) or a random one, with the mutations of `line`
+    fn line4t(r: &mut Rng, out: &mut Vec<u8>) {
+        let start = out.len();
+        match r.below(10) {
+            0..=5 => {
+                let lens = [10u64, 10, 7, 27];
+                for (k, &ml) in lens.iter().enumerate() {
+                    if k > 0 {
+                        out.push(b',');
+                    }
+                    field(r, out, ml);
+                }
+            }
+            6..=8 => {
+                let nf = if r.chance(60) { 4 } else { 1 + r.below(6) };
+                let ml = [3u64, 20, 40, 90][r.below(4) as usize];
+                for k in 0..nf {
+                    if k > 0 {
+                        out.push(b',');
+                    }
+                    field(r, out, ml);
+                }
+            }
+            _ => {
+                const AL: &[u8] = b"a0,,\"\r";
+                for _ in 0..r.below(90) {
+                    out.push(AL[r.below(AL.len() as u64) as usize]);
+                }
+            }
+        }
+        for _ in 0..r.below(3) {
+            if r.chance(30) && out.len() > start {
+                let at = start + r.below((out.len() - start) as u64) as usize;
+                match r.below(4) {
+                    0 => out.insert(at, b'"'),
+                    1 => out.insert(at, b','),
+                    2 => out.insert(at, b'\r'),
+                    _ => {
+                        out.remove(at);
+                    }
+                }
+            }
+        }
+        if r.chance(10) {
+            out.push(b'\r');
+        }
+    }
+
+    fn lines_of4(chunk: B, f: impl Fn(B, &mut dyn FnMut(&[B; 4]))) -> Vec<[(usize, usize); 4]> {
+        let mut v = vec![];
+        let b0 = chunk.as_ptr() as usize;
+        f(chunk, &mut |l: &[B; 4]| v.push(l.map(|x| (x.as_ptr() as usize - b0, x.len()))));
+        v
+    }
+
+    /// scan4 (one vector window, mask quote rule) yields exactly the lines and fields of scan::<4>
+    #[test]
+    fn scan4_matches_scan() {
+        assert!(cfg!(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")), "build with -C target-cpu=x86-64-v3");
+        let buf: &'static mut [u8] = Box::leak(vec![0u8; 1 << 16].into_boxed_slice());
+        let mut r = Rng(0x2545_f491_4f6c_dd1d);
+        let mut text = Vec::new();
+        let (mut cases, mut total, mut fast_lines) = (0u64, 0u64, 0u64);
+        for _ in 0..400_000 {
+            text.clear();
+            for _ in 0..r.below(40) {
+                line4t(&mut r, &mut text);
+                text.push(b'\n');
+            }
+            if r.chance(50) && !text.is_empty() {
+                text.pop();
+            }
+            if text.len() + 64 > buf.len() {
+                continue;
+            }
+            let off = r.below(64) as usize;
+            buf[off..off + text.len()].copy_from_slice(&text);
+            // SAFETY: buf is leaked (lives forever) and not written while `chunk` is in use
+            let chunk: B = unsafe { std::slice::from_raw_parts(buf.as_ptr().add(off), text.len()) };
+            let want = lines_of4(chunk, |c, f| scan::<4>(c, f));
+            let got = lines_of4(chunk, |c, f| scan4(c, f));
+            assert_eq!(got, want, "case {cases}: {:?}", String::from_utf8_lossy(chunk));
+            cases += 1;
+            total += want.len() as u64;
+            fast_lines += SCAN7_FAST.with(|c| c.replace(0));
+        }
+        eprintln!("scan4 test: {cases} chunks, {total} accepted lines, {fast_lines} via the vector path");
+        assert!(total > 1_000_000 && fast_lines > total / 4);
+    }
+
+    /// IdLookup::get_fast2 returns exactly what get returns, for ids near and far from canonical
+    #[test]
+    fn get_fast2_matches_get() {
+        let mut r = Rng(0x6a09_e667_f3bc_c908);
+        let mut items: Vec<(B, u32)> = vec![];
+        for i in 0..3000u32 {
+            let s = match r.below(4) {
+                0 => format!("c_{}", r.below(5000)),
+                1 => format!("c_{}", r.below(1 << 26)),
+                2 => format!("c_0{}", r.below(100)),
+                _ => format!("x{}", r.below(1000)),
+            };
+            items.push((leak_str(s), i));
+        }
+        let lk = IdLookup::new(b"c_", &items);
+        let buf: &'static mut [u8] = Box::leak(vec![b'#'; 64].into_boxed_slice());
+        const AL: &[u8] = b"0123456789c_x/:";
+        for _ in 0..2_000_000 {
+            let n = r.below(14) as usize;
+            let mut id: Vec<u8> = if r.chance(70) { b"c_".to_vec() } else { vec![] };
+            while id.len() < n {
+                id.push(if r.chance(85) { b'0' + r.below(10) as u8 } else { AL[r.below(AL.len() as u64) as usize] });
+            }
+            id.truncate(n);
+            let off = 8 + r.below(30) as usize;
+            buf[off..off + n].copy_from_slice(&id);
+            let lo = buf.as_ptr() as usize + r.below(off as u64 + 1) as usize;
+            // SAFETY: buf is leaked and not written while b is in use
+            let b: B = unsafe { std::slice::from_raw_parts(buf.as_ptr().add(off), n) };
+            assert_eq!(lk.get_fast2(b, lo), lk.get(b), "{:?}", String::from_utf8_lossy(b));
+        }
+    }
+
     /// old and new parse of one chunk; the record count, or the first difference
     fn sol_cmp<E: Ev>(c: B, cx: &EvCtx) -> Result<(usize, usize), String> {
         let (mut a, mut b) = (EvBufs::<E>::new(), EvBufs::<E>::new());
@@ -3910,6 +4191,24 @@ mod tests {
         }
         eprintln!("sol test random: {recs} records, {purch} priced");
         assert!(recs > 1_000_000 && purch > 10_000);
+    }
+    #[test]
+    fn scatter_counted_matches_bucketize() {
+        let mut r = Rng(0x5eed_0bad_cafe_f00d);
+        for case in 0..200 {
+            let nb = 1usize << (r.below(11) as u32);
+            let n = r.below(if case % 4 == 0 { 50_000 } else { 300 }) as usize;
+            let v: Vec<(u64, u32)> = (0..n).map(|i| (r.next(), i as u32)).collect();
+            let bk = |x: &(u64, u32)| (mix(x.0) >> 20) as usize & (nb - 1);
+            let mut cnt = vec![0u32; nb + 1];
+            for x in &v {
+                cnt[bk(x) + 1] += 1;
+            }
+            let (a, ao) = bucketize(&v, nb, bk);
+            let (b, bo) = scatter_counted(&v, cnt, bk);
+            assert_eq!(ao, bo);
+            assert!(a.iter().zip(&b).all(|(x, y)| x == y), "nb={nb} n={n}");
+        }
     }
 }
 
@@ -4102,5 +4401,148 @@ mod pack_simd_tests {
             ok += want.is_some() as u32;
         }
         assert!(ok > 100_000, "{ok}");
+    }
+
+    fn bz(x: u64, n: u32) -> u64 {
+        if n >= 64 { x } else { x & ((1u64 << n) - 1) }
+    }
+
+    /// The earlier quote rule (open/close pairs by a subtraction), kept as the reference
+    fn quote_bad_old(q: u64, c: u64, end: u32) -> u64 {
+        let q1 = bz(q, end);
+        let x = q1 & ((c << 1) | 1);
+        let y = q1 & (c >> 1);
+        let r = y.wrapping_sub(x);
+        (q1 & !(x | y)) | (x & y) | (r & (bz(c, end + 1) | y))
+    }
+
+    /// Byte-level rule: every field before `end` is free of quotes or is "..." with no other quote
+    fn quote_ok_ref(q: u64, c: u64, end: u32) -> bool {
+        let mut s = 0u32;
+        for i in 0..=end {
+            if (c >> i) & 1 == 1 {
+                let n = i - s;
+                let fq = bz(q >> s, n);
+                let ok = fq == 0 || (n >= 2 && fq == (1 | (1u64 << (n - 1))));
+                if !ok {
+                    return false;
+                }
+                s = i + 1;
+            }
+        }
+        true
+    }
+
+    fn quote_case(q: u64, c: u64, end: u32) {
+        let c = c | (1u64 << end);
+        let q = q & !c;
+        let (x, bad) = quote_bad(bz(q, end), c);
+        let old = quote_bad_old(q, c, end);
+        assert_eq!(x, bz(q, end) & ((c << 1) | 1));
+        assert_eq!(bad == 0, old == 0, "q={q:#x} c={c:#x} end={end}");
+        assert_eq!(bad == 0, quote_ok_ref(q, c, end), "q={q:#x} c={c:#x} end={end}");
+    }
+
+    /// The quote check equals the earlier rule and the byte-level rule: every class string
+    /// (other, ',', '"') of up to 12 bytes at the start, one byte in, and against bit 63
+    #[test]
+    fn quote_bad_exhaustive() {
+        for n in 0..=12u32 {
+            let total = 3u64.pow(n);
+            for code in 0..total {
+                let (mut q, mut c, mut k) = (0u64, 0u64, code);
+                for i in 0..n {
+                    match k % 3 {
+                        1 => c |= 1 << i,
+                        2 => q |= 1 << i,
+                        _ => {}
+                    }
+                    k /= 3;
+                }
+                for o in [0u32, 1, 63 - n] {
+                    let above = !bz(!0, o + n + 1);
+                    for (qa, ca) in [(0, 0), (above, 0), (0, above), (above & 0x5555_5555_5555_5555, above & 0xaaaa_aaaa_aaaa_aaaa)] {
+                        quote_case((q << o) | qa, (c << o) | ca, o + n);
+                    }
+                }
+                if n <= 59 {
+                    // '"' 'a' '"' ',' prefix (a well-formed quoted field), then the string
+                    quote_case((q << 4) | 0b101, (c << 4) | 0b1000, 4 + n);
+                    // '"' 'a' ',' prefix (an unclosed quote), then the string
+                    quote_case((q << 3) | 0b1, (c << 3) | 0b100, 3 + n);
+                }
+            }
+        }
+    }
+
+    /// 3 * 10^7 random windows: random masks of several densities, and lines built from
+    /// well-formed and broken fields with the end at a random separator
+    #[test]
+    fn quote_bad_random() {
+        struct Xs(u64);
+        impl Xs {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+            fn chance(&mut self, pct: u64) -> bool {
+                self.below(100) < pct
+            }
+        }
+        let mut r = Xs(0x9e37_79b9_7f4a_7c15);
+        for i in 0..10_000_000u64 {
+            let (a, b) = ((i % 4) as u32, ((i / 4) % 5) as u32);
+            let mut c = r.next();
+            for _ in 0..a {
+                c &= r.next();
+            }
+            let mut q = r.next();
+            for _ in 0..b {
+                q &= r.next();
+            }
+            quote_case(q, c, (r.next() % 64) as u32);
+        }
+        let mut acc = 0u64;
+        for _ in 0..20_000_000u64 {
+            let (mut q, mut c, mut pos) = (0u64, 0u64, 0u32);
+            let mut seps: Vec<u32> = Vec::new();
+            while pos < 64 {
+                let n = r.below(9) as u32;
+                let kind = r.below(10);
+                for j in 0..n.min(64 - pos) {
+                    let quote = match kind {
+                        0..=4 => false,
+                        5 | 6 => j == 0 || j + 1 == n,
+                        7 => j == 0,
+                        8 => j + 1 == n,
+                        _ => r.chance(33),
+                    };
+                    if quote {
+                        q |= 1 << (pos + j);
+                    }
+                }
+                pos += n;
+                if pos < 64 {
+                    c |= 1 << pos;
+                    seps.push(pos);
+                    pos += 1;
+                }
+            }
+            if seps.is_empty() {
+                continue;
+            }
+            let end = seps[r.below(seps.len() as u64) as usize];
+            let junk = r.next() & !bz(!0, end + 1);
+            let (q, c) = if r.chance(50) { (q | (junk & 0x5555_5555_5555_5555), c) } else { (q, c | (junk & r.next())) };
+            let (_, bad) = quote_bad(bz(q & !c, end), c);
+            acc += (bad == 0) as u64;
+            quote_case(q, c, end);
+        }
+        assert!(acc > 1_000_000, "{acc}");
     }
 }
