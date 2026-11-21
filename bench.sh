@@ -50,7 +50,9 @@ run() { # image datadir -> "wall internal"
     -e NCPU=$CPUS -e SHOP_TIMING=1 ${EXTRA:-} $1 2>$W/err.txt
   t1=$(date +%s.%N)
   cp $W/err.txt $W/err-$1.txt
-  printf '%.3f %s\n' "$(echo "$t1 - $t0" | bc)" "$(grep written $W/err.txt | tr -d '[]s' | awk '{print $1}')"
+  local em ee; em=$(grep -o 'main=[0-9.]*' $W/err.txt | cut -d= -f2 || true); ee=$(grep -o 'end=[0-9.]*' $W/err.txt | cut -d= -f2 || true)
+  printf '%.3f %s %.3f %.3f\n' "$(echo "$t1 - $t0" | bc)" "$(grep written $W/err.txt | tr -d '[]s' | awk '{print $1}')" \
+    "$(echo "${em:-$t0} - $t0" | bc)" "$(echo "$t1 - ${ee:-$t1}" | bc)"
   if [ "${KEEP:-}" = "$1" ]; then rm -rf $W/keep-$1; cp -r $out $W/keep-$1; fi
   sudo rm -rf $out $scr
 }
@@ -59,7 +61,7 @@ echo "== warm-up and empty-input overhead"
 for im in "${IMGS[@]}"; do run $im $W/data >/dev/null; done
 for k in 1 2 3; do echo "empty ${IMGS[0]}: $(run ${IMGS[0]} $W/empty)"; done
 
-echo "== timed (wall internal), interleaved"
+echo "== timed (wall internal start exit), interleaved"
 for k in $(seq $RUNS); do
   for im in "${IMGS[@]}"; do echo "$im $(run $im $W/data)" | tee -a $W/times.txt; done
 done
@@ -68,7 +70,9 @@ echo "== medians"
 for im in "${IMGS[@]}"; do
   w=$(grep "^$im " $W/times.txt | awk '{print $2}' | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
   n=$(grep "^$im " $W/times.txt | awk '{print $3}' | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
-  echo "$im wall $w internal $n"
+  pr=$(grep "^$im " $W/times.txt | awk '{print $4}' | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
+  po=$(grep "^$im " $W/times.txt | awk '{print $5}' | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
+  echo "$im wall $w internal $n start $pr exit $po"
 done | tee -a ${GITHUB_STEP_SUMMARY:-/dev/null}
 
 echo "== last-run phase ticks"
