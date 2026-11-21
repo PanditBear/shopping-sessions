@@ -1219,6 +1219,28 @@ impl<E: Ev> Dz<E> {
         }
         Dz { on: true, key: c.key, lim: c.lim, sh: c.sh, ndb: c.ndb, cap, r, wc, _e: std::marker::PhantomData, dn: vec![0; c.ndb], ov: vec![], ovb: vec![], ovoff: vec![], dside: vec![] }
     }
+    /// `new` with PB person buckets in place of the index buckets (fused parse)
+    fn new_pb(cfg: Option<IdxCfg>, len: usize) -> Self {
+        let Some(c) = cfg else { return Self::off() };
+        let lines = len as f64 * c.lpb;
+        static CM: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+        let cm = *CM.get_or_init(|| std::env::var("SHOP_FZCAP").ok().and_then(|v| v.parse().ok()).unwrap_or(1.3));
+        let mean = lines / PB as f64 * 1.04;
+        let cap = ((mean * cm + 3.0 * mean.sqrt() + 8.0) as usize).min(lines as usize + 16).next_multiple_of(WK);
+        let sz = std::mem::size_of::<DR<E>>();
+        let nl = (PB * cap * sz).div_ceil(64);
+        let mut r = Vec::with_capacity(nl);
+        // SAFETY: MaybeUninit needs no initialization
+        unsafe { r.set_len(nl) };
+        let wl = (PB * WK * sz).div_ceil(64);
+        let mut wc = WCP.with(|p| p.take());
+        if wc.len() < wl {
+            wc = Vec::with_capacity(wl);
+            // SAFETY: as above
+            unsafe { wc.set_len(wl) };
+        }
+        Dz { on: true, key: c.key, lim: c.lim, sh: c.sh, ndb: PB, cap, r, wc, _e: std::marker::PhantomData, dn: vec![0; PB], ov: vec![], ovb: vec![], ovoff: vec![], dside: vec![] }
+    }
     /// the dense index of a packed event_id, if it has one
     #[inline(always)]
     fn idx(&self, k: u64) -> Option<u64> {
@@ -1258,7 +1280,11 @@ impl<E: Ev> Dz<E> {
     }
     #[inline(always)]
     fn put(&mut self, i: u64, ing: u32, e: E, exact: bool, ingest: i64) {
-        let b = (i >> self.sh) as usize;
+        self.put_b((i >> self.sh) as usize, i, ing, e, exact, ingest)
+    }
+    /// `put` into bucket b (b < ndb)
+    #[inline(always)]
+    fn put_b(&mut self, b: usize, i: u64, ing: u32, e: E, exact: bool, ingest: i64) {
         let x = DR { i: i as u32, ing, e };
         // SAFETY: i < lim, so b < ndb; a slot below cap lies in b's stretch of r
         let n = unsafe { *self.dn.get_unchecked(b) } as usize;
@@ -3132,6 +3158,269 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
     }
 }
 
+/// fused parse: user -> person table and mover filter, published by the links side (SHOP_FUSE=2)
+struct FTab {
+    tab: std::mem::ManuallyDrop<IdTab>,
+    mf: MoverF,
+}
+static FT: std::sync::atomic::AtomicPtr<FTab> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// SHOP_FUSE: 0 off, 1 person buckets by user key, 2 person buckets by person key (table lookup in the parse)
+fn fuse_mode() -> u8 {
+    static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *M.get_or_init(|| std::env::var("SHOP_FUSE").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// lines between a record's mover-filter prefetch and its person bucket write
+const RQ: usize = 32;
+
+#[derive(Clone, Copy)]
+struct RqE<E> {
+    e: E,
+    i: u32,
+    ing: u32,
+    ingest: i64,
+    ex: bool,
+    mv: bool,
+}
+
+struct Rq<E> {
+    a: [RqE<E>; RQ],
+    n: usize,
+}
+
+#[inline(always)]
+fn fz_out<E: Ev>(dz: &mut Dz<E>, f: &FTab, x: RqE<E>) {
+    let mut e = x.e;
+    let k = e.key();
+    let p = if x.mv { f.tab.get(k) } else { k };
+    e.set_key(p);
+    dz.put_b(pbk(p), x.i as u64, x.ing, e, x.ex, x.ingest);
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn fz_put<E: Ev>(dz: &mut Dz<E>, rq: &mut Rq<E>, ft: Option<&FTab>, i: u64, ing: u32, e: E, ex: bool, ingest: i64) {
+    let k = e.key();
+    if k == 0 {
+        dz.put_b(i as usize & (PB - 1), i, ing, e, ex, ingest);
+        return;
+    }
+    let Some(f) = ft else {
+        dz.put_b(pbk(k), i, ing, e, ex, ingest);
+        return;
+    };
+    let n = rq.n;
+    let s = n & (RQ - 1);
+    if n >= RQ {
+        let x = rq.a[s];
+        fz_out(dz, f, x);
+    }
+    if n >= RQ / 2 {
+        let y = &mut rq.a[(n - RQ / 2) & (RQ - 1)];
+        let yk = y.e.key();
+        y.mv = f.mf.hit(yk);
+        if y.mv {
+            f.tab.pf(yk);
+        }
+    }
+    rq.a[s] = RqE { e, i: i as u32, ing, ingest, ex, mv: false };
+    f.mf.pf(k);
+    rq.n = n + 1;
+}
+
+fn fz_drain<E: Ev>(dz: &mut Dz<E>, rq: &mut Rq<E>, ft: Option<&FTab>) {
+    let Some(f) = ft else { return };
+    let n = rq.n;
+    for j in n.saturating_sub(RQ)..n {
+        let mut x = rq.a[j & (RQ - 1)];
+        if j + RQ / 2 >= n {
+            x.mv = f.mf.hit(x.e.key());
+        }
+        fz_out(dz, f, x);
+    }
+    rq.n = 0;
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(never)]
+fn parse_events_fuse<E: Ev>(ft: Option<&FTab>, c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
+    use core::arch::x86_64::_bzhi_u64;
+    let mut tci = TsCache::new();
+    let mut tct = TsCache::new();
+    let mut dci = DayCache::new();
+    let mut dct = DayCache::new();
+    let c0 = c.as_ptr() as usize;
+    // SAFETY (bzhi): BMI2 is enabled for this build
+    let bzhi = |x: u64, n: u32| unsafe { _bzhi_u64(x, n) };
+    let blsr = |x: u64| x & x.wrapping_sub(1);
+    // SAFETY (sl): only called on fields found inside the chunk
+    let sl = |p: *const u8, n: usize| -> B { unsafe { std::slice::from_raw_parts(p, n) } };
+    let (ws, we, ibase) = (cx.ws, cx.we, cx.ibase);
+    let (imax_k, imax_x) = ing32(i64::MAX, ibase);
+    let len = c.len();
+    let base = c.as_ptr();
+    let mut pos = 0usize;
+    let mut sbuf: Vec<[B; 7]> = Vec::new();
+    let mut rq: Rq<E> = Rq { a: [RqE { e: E::nil(), i: 0, ing: 0, ingest: 0, ex: true, mv: false }; RQ], n: 0 };
+    let mut dzo: Dz<E> = Dz::off();
+    'ln: while pos + 128 <= len {
+        // SAFETY: pos + 128 <= len, and the second window starts at most 64 bytes in
+        let p = unsafe { base.add(pos) };
+        let (ca, qa, na) = masks64(p);
+        let e0 = ca.trailing_zeros();
+        let c1 = blsr(ca);
+        let e1 = c1.trailing_zeros();
+        let c2 = blsr(c1);
+        let e2 = c2.trailing_zeros();
+        'slow: {
+            if !((c2 != 0) & (bzhi(na, e2) == 0)) {
+                break 'slow;
+            }
+            let pb = unsafe { p.add(e2 as usize + 1) };
+            let (cb, qb, nb) = masks64(pb);
+            let l = nb.trailing_zeros();
+            let e3 = cb.trailing_zeros();
+            let d1 = blsr(cb);
+            let e4 = d1.trailing_zeros();
+            let d2 = blsr(d1);
+            let e5 = d2.trailing_zeros();
+            let d3 = blsr(d2);
+            let (xa, bad_a) = quote_bad(bzhi(qa, e2), ca);
+            let (xb, bad_b) = quote_bad(bzhi(qb, l), cb | nb);
+            if !((nb != 0) & (e5 < l) & (bzhi(d3, l) == 0) & ((bad_a | bad_b) == 0)) {
+                break 'slow;
+            }
+            pos += (e2 + l + 2) as usize;
+            let fld = |p: *const u8, x: u64, s: u32, e: u32| {
+                let q = ((x >> s) & 1) as u32;
+                // SAFETY: s <= e <= 63 inside a window; a quoted field has e - s >= 2
+                (unsafe { p.add((s + q) as usize) }, (e - s - 2 * q) as usize)
+            };
+            let (pe, ne) = fld(p, xa, 0, e0);
+            if ne == 0 {
+                continue 'ln;
+            }
+            let (pu, nu) = fld(p, xa, e0 + 1, e1);
+            let (pt, nt) = fld(p, xa, e1 + 1, e2);
+            let (pi, ni) = fld(pb, xb, 0, e3);
+            let (pet, net) = fld(pb, xb, e3 + 1, e4);
+            let (pp, np) = fld(pb, xb, e4 + 1, e5);
+            let (ppr, npr) = fld(pb, xb, e5 + 1, l);
+            // SAFETY: both ids start in the first window, so 16 bytes from each stay inside
+            // the 128 readable bytes at p
+            let (ke, oke, ku, oku) = unsafe { pack6x2(pe, ne, pu, nu) };
+            // SAFETY (ldp, hms): a 20-byte field lies inside its window. (ra, rb, rd): the
+            // ingest's date key and day start when it is a valid F1 date, else 2000-01-01's.
+            let (mut ra, mut rb, mut rd) = (D0_A, D0_B, D0_S);
+            let iso_i = if ni == 20 && unsafe { *pi.add(19) } == b'Z' {
+                let (ia, ib) = unsafe { (ldp(pi), ldp(pi.add(3))) };
+                let (dd, hs) = unsafe { (day_get(ia, ib, pi, &mut dci), hms(pi.add(11))) };
+                Some(match dd {
+                    Some(d) => {
+                        (ra, rb, rd) = (ia, ib, d);
+                        hs.map(|h| d + h)
+                    }
+                    None => None,
+                })
+            } else {
+                None
+            };
+            let (ingest, ik, iex) = match iso_i {
+                Some(Some(s)) => {
+                    let v = s - ibase + IOFF;
+                    (s * 1000, v.clamp(0, u32::MAX as i64) as u32, (v > 0) & (v < u32::MAX as i64))
+                }
+                Some(None) => (i64::MAX, imax_k, imax_x),
+                None => {
+                    let ingest = ts_fast(sl(pi, ni), &mut tci).unwrap_or(i64::MAX);
+                    let (k, x) = ing32(ingest, ibase);
+                    (ingest, k, x)
+                }
+            };
+            let mut r = E::nil();
+            'v: {
+                if (nu == 0) | (np == 0) {
+                    break 'v;
+                }
+                let t = if nt == 20 && unsafe { *pt.add(19) } == b'Z' {
+                    // same date bytes as the ingest: same day start
+                    let (ta, tb) = unsafe { (ldp(pt), ldp(pt.add(3))) };
+                    let d = if (ta == ra) & (tb == rb) {
+                        rd
+                    } else {
+                        match unsafe { day_get(ta, tb, pt, &mut dct) } {
+                            Some(d) => d,
+                            None => break 'v,
+                        }
+                    };
+                    match unsafe { hms(pt.add(11)) } {
+                        Some(h) => (d + h) * 1000,
+                        None => break 'v,
+                    }
+                } else if nt == 13 {
+                    // SAFETY: ts is the third field and the ids are not empty here, so the 3
+                    // bytes before it and the 16 bytes from pt - 3 lie inside the window
+                    match unsafe { ts13(pt) } {
+                        Some(t) => t,
+                        None => break 'v,
+                    }
+                } else {
+                    // SAFETY (ts25): a 25-byte field lies inside its window
+                    let f = if nt == 25 { unsafe { ts25(pt, ra, rb, rd, &mut dct) } } else { None };
+                    match f.or_else(|| parse_ts_c(sl(pt, nt), &mut tct)) {
+                        Some(t) => t,
+                        None => break 'v,
+                    }
+                };
+                if (t < ws) | (t >= we) | (ingest.wrapping_sub(t) > DAY) {
+                    break 'v;
+                }
+                let mut pv = 0u32;
+                let mut cat = 0u32;
+                match et_code(sl(pet, net)) {
+                    1 => {}
+                    2 => {
+                        match parse_price(sl(ppr, npr)) {
+                            Some(v) => pv = v,
+                            None => break 'v,
+                        }
+                        cat = cx.prod.get_fast(sl(pp, np), c0).unwrap_or(cx.unknown_cat);
+                    }
+                    _ => break 'v,
+                }
+                let key = if oku { ku } else { ev_key_slow(sl(pu, nu), cx.rs, fbn) };
+                r = E::mk(key, (t - ws) as u64, pv, cat);
+            }
+            // SAFETY: 16 bytes from pe are readable (see pack6x2)
+            if let Some(i) = unsafe { dz.idx_txt(pe, ne) } {
+                fz_put(dz, &mut rq, ft, i, ik, r, iex, ingest);
+                continue 'ln;
+            }
+            let loc = m.len() as u32;
+            m.push(r);
+            if !iex {
+                side.push((loc, ingest));
+            }
+            if oke {
+                d.push(DRec { eid: ke, ing: ik, loc });
+            } else {
+                fb.push((pack(sl(pe, ne)), ingest, loc));
+            }
+            continue 'ln;
+        }
+        sbuf.clear();
+        pos = scan7_line(c, pos, &mut sbuf);
+        for f in &sbuf {
+            ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side, &mut dzo);
+        }
+    }
+    if pos < len {
+        scan::<7>(&c[pos..], |f| ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side, &mut dzo));
+    }
+    fz_drain(dz, &mut rq, ft);
+}
+
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
 fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
     let mut tci = TsCache::new();
@@ -4151,15 +4440,42 @@ fn idx_find(ev_files: &[B], ev_chunks: &[B]) -> Option<IdxCfg> {
 
 /// Parses one chunk: dense records go straight to their buckets, the rest are grouped by event_id
 /// hash bucket.
+/// the insert table becomes the id table in place (a slot's index turns into its person key), with the whole pool
+fn tab_convert(tab: &mut IdTab, root: &[u32], bk: &[[u64; 2]]) {
+    tab.s.par_chunks_mut(1 << 14).for_each(|c| {
+        let n = c.len();
+        for i in 0..n {
+            if i + 2 * PFD < n {
+                prefetch(root.as_ptr().wrapping_add(c[i + 2 * PFD][1] as usize));
+            }
+            if i + PFD < n {
+                let e = c[i + PFD];
+                if e[0] != 0 {
+                    prefetch(bk.as_ptr().wrapping_add(root[e[1] as usize] as usize));
+                }
+            }
+            let e = &mut c[i];
+            if e[0] != 0 {
+                e[1] = bk[root[e[1] as usize] as usize][0];
+            }
+        }
+    });
+}
+
 fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
-    let mut dz = Dz::new(idx_cfg(), c.len());
+    let fz = fuse_mode();
+    let mut dz = if fz > 0 { Dz::new_pb(idx_cfg(), c.len()) } else { Dz::new(idx_cfg(), c.len()) };
     let cap = if dz.on { c.len() / 4096 } else { c.len() / 64 };
     let mut m: Vec<E> = Vec::with_capacity(cap);
     let mut d: Vec<DRec> = Vec::with_capacity(cap);
     let (mut fb, mut fbn, mut side) = (vec![], vec![], vec![]);
     let mut tm = now();
     static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *OLD.get_or_init(|| std::env::var_os("SHOP_EVOLD").is_some()) {
+    if fz > 0 && dz.on {
+        // SAFETY: FT is set once, to a leaked table, before any fused parse in mode 2
+        let ft = unsafe { FT.load(std::sync::atomic::Ordering::Acquire).as_ref() };
+        parse_events_fuse(ft, c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side, &mut dz);
+    } else if *OLD.get_or_init(|| std::env::var_os("SHOP_EVOLD").is_some()) {
         parse_events(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
     } else {
         parse_events_sol(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side, &mut dz);
@@ -4306,7 +4622,7 @@ fn main() {
     let t0 = std::time::Instant::now();
     let tick = |s: &str| {
         if timing {
-            eprintln!("[{:.2}s] {}", t0.elapsed().as_secs_f64(), s);
+            eprintln!("[{:.3}s] {}", t0.elapsed().as_secs_f64(), s);
         }
         hpa::diag(s);
     };
@@ -4385,8 +4701,69 @@ fn main() {
         })
         .collect();
     tick("links parsed");
+    // clicks parse (needs the converted id table). With SHOP_CKO=1 it runs at the end of the links branch, so it
+    // overlaps the events parse instead of following it.
+    let cko = std::env::var_os("SHOP_CKO").map_or(false, |v| v != "0") && fuse_mode() == 0;
+    let parse_clicks = |tab: &IdTab| -> (MoverF, Vec<(Vec<ClickRec>, Vec<u32>)>) {
+        let click_chunks = all_chunks(&csv_files(&data.join("clicks")), CHUNK);
+        let mut tm = now();
+        let mf = MoverF::build(tab);
+        pt(4, &mut tm);
+        let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_chunks
+            .par_iter()
+            .map(|&c| {
+                let mut tmp: Vec<ClickRec> = Vec::with_capacity(c.len() / 40);
+                let mut tc = TsCache::new();
+                let mut tm = now();
+                let lo = c.as_ptr() as usize;
+                scan4(c, |&[cid, uid, cmp, ts]| {
+                    if cid.is_empty() || uid.is_empty() {
+                        return;
+                    }
+                    let Some(ci) = camp.get_fast2(cmp, lo) else { return };
+                    let Some(t) = ts_fast(ts, &mut tc) else { return };
+                    if t < ws - WEEK || t >= we {
+                        return;
+                    }
+                    tmp.push(ClickRec { key: ukey(&rs, uid), ts: t, cid: pack(cid), camp: ci });
+                });
+                pt(9, &mut tm);
+                // keys that miss the mover filter map to themselves without a table lookup. The
+                // filter pass lists the hits without branching on them, the table pass resolves only
+                // those, and both count the person buckets of the final keys on the way.
+                let n = tmp.len();
+                let mut hit = vec![0u32; n + 1];
+                let mut cnt = vec![0u32; PB + 1];
+                let mut m = 0usize;
+                for i in 0..n {
+                    if i + RPD < n {
+                        mf.pf(tmp[i + RPD].key);
+                    }
+                    let k = tmp[i].key;
+                    let h = mf.hit(k);
+                    hit[m] = i as u32;
+                    m += h as usize;
+                    cnt[pbk(k) + 1] += (!h) as u32;
+                }
+                for j in 0..m {
+                    if j + RPD < m {
+                        tab.pf(tmp[hit[j + RPD] as usize].key);
+                    }
+                    let i = hit[j] as usize;
+                    let k = tab.get(tmp[i].key);
+                    tmp[i].key = k;
+                    cnt[pbk(k) + 1] += 1;
+                }
+                drop(hit);
+                let r = scatter_counted(&tmp, cnt, |x| pbk(x.key));
+                pt(10, &mut tm);
+                r
+            })
+            .collect();
+        (mf, click_out)
+    };
     // links (serial union-find) overlaps the parallel event parse; events do not need the id table
-    let ((mut tab, root, bk, nl, nroot, mut names_map), ev_out) = rayon::join(
+    let ((mut tab, root, bk, nl, nroot, mut names_map, ck), ev_out) = rayon::join(
         || {
             let occ: usize = link_pairs.iter().map(|v| v.len()).sum::<usize>() * 2;
             let mut names_map: AHashMap<u64, u64> = AHashMap::new();
@@ -4511,8 +4888,28 @@ fn main() {
                 (t, root, bk, nl, nroot)
             };
             drop(link_pairs);
+            if fuse_mode() == 2 {
+                tab_convert(&mut t, &root, &bk);
+                t.mov = nl - nroot;
+                let mf = MoverF::build(&t);
+                // SAFETY: the copy shares t's buffer, which outlives every parse, and is never dropped
+                let tc = IdTab { s: unsafe { Vec::from_raw_parts(t.s.as_mut_ptr(), t.s.len(), t.s.capacity()) }, shift: t.shift, mask: t.mask, mov: t.mov };
+                let f = Box::leak(Box::new(FTab { tab: std::mem::ManuallyDrop::new(tc), mf }));
+                FT.store(f, std::sync::atomic::Ordering::Release);
+            }
+            if cko {
+                tab_convert(&mut t, &root, &bk);
+                t.mov = nl - nroot;
+            }
             tick("links done");
-            (t, root, bk, nl, nroot, names_map)
+            let ck = if cko {
+                let r = parse_clicks(&t);
+                tick("clicks early");
+                Some(r)
+            } else {
+                None
+            };
+            (t, root, bk, nl, nroot, names_map, ck)
         },
         || {
             let ev_files = csv_files(&data.join("events"));
@@ -4619,94 +5016,42 @@ fn main() {
                 }
                 eprintln!("probe memchr-lines {:.3}s ({})", t.elapsed().as_secs_f64(), n);
             }
+            if fuse_mode() == 2 {
+                while FT.load(std::sync::atomic::Ordering::Acquire).is_null() {
+                    std::thread::yield_now();
+                }
+            }
+            tick("fuse go");
             let ev_out = if lean { Evs::L(ev_parse(&ev_chunks, &cx)) } else { Evs::W(ev_parse(&ev_chunks, &cx)) };
             tick("events parsed");
+            if fuse_mode() > 0 {
+                let (dense, ov, rest) = match &ev_out {
+                    Evs::L(v) => (v.iter().map(|c| c.dz.len()).sum::<usize>(), v.iter().map(|c| c.dz.ov.len()).sum::<usize>(), v.iter().map(|c| c.d.len() + c.fb.len()).sum::<usize>()),
+                    Evs::W(v) => (v.iter().map(|c| c.dz.len()).sum::<usize>(), v.iter().map(|c| c.dz.ov.len()).sum::<usize>(), v.iter().map(|c| c.d.len() + c.fb.len()).sum::<usize>()),
+                };
+                tick(&format!("fuse records dense {dense} overflow {ov} rest {rest}"));
+                if timing {
+                    let v: Vec<String> = (0..PROF.len()).map(|i| format!("{}={:.2}", PROF_NAMES[i], PROF[i].load(Relaxed) as f64 / 1e9)).collect();
+                    eprintln!("prof(cpu s): {}", v.join(" "));
+                }
+                std::process::exit(0);
+            }
             ev_out
         },
     );
 
-    // the insert table becomes the id table in place (a slot's index turns into its person key), with the whole pool
-    {
-        let (root, bk) = (&root[..], &bk[..]);
-        tab.s.par_chunks_mut(1 << 14).for_each(|c| {
-            let n = c.len();
-            for i in 0..n {
-                if i + 2 * PFD < n {
-                    prefetch(root.as_ptr().wrapping_add(c[i + 2 * PFD][1] as usize));
-                }
-                if i + PFD < n {
-                    let e = c[i + PFD];
-                    if e[0] != 0 {
-                        prefetch(bk.as_ptr().wrapping_add(root[e[1] as usize] as usize));
-                    }
-                }
-                let e = &mut c[i];
-                if e[0] != 0 {
-                    e[1] = bk[root[e[1] as usize] as usize][0];
-                }
-            }
-        });
+    if fuse_mode() != 2 && !cko {
+        tab_convert(&mut tab, &root, &bk);
     }
     tab.mov = nl - nroot;
     drop((root, bk));
     tick(&format!("links table movers {}", tab.mov));
 
     // clicks
-    let click_chunks = all_chunks(&csv_files(&data.join("clicks")), CHUNK);
-    let mut tm = now();
-    let mf = MoverF::build(&tab);
-    pt(4, &mut tm);
-    let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_chunks
-        .par_iter()
-        .map(|&c| {
-            let mut tmp: Vec<ClickRec> = Vec::with_capacity(c.len() / 40);
-            let mut tc = TsCache::new();
-            let mut tm = now();
-            let lo = c.as_ptr() as usize;
-            scan4(c, |&[cid, uid, cmp, ts]| {
-                if cid.is_empty() || uid.is_empty() {
-                    return;
-                }
-                let Some(ci) = camp.get_fast2(cmp, lo) else { return };
-                let Some(t) = ts_fast(ts, &mut tc) else { return };
-                if t < ws - WEEK || t >= we {
-                    return;
-                }
-                tmp.push(ClickRec { key: ukey(&rs, uid), ts: t, cid: pack(cid), camp: ci });
-            });
-            pt(9, &mut tm);
-            // keys that miss the mover filter map to themselves without a table lookup. The
-            // filter pass lists the hits without branching on them, the table pass resolves only
-            // those, and both count the person buckets of the final keys on the way.
-            let n = tmp.len();
-            let mut hit = vec![0u32; n + 1];
-            let mut cnt = vec![0u32; PB + 1];
-            let mut m = 0usize;
-            for i in 0..n {
-                if i + RPD < n {
-                    mf.pf(tmp[i + RPD].key);
-                }
-                let k = tmp[i].key;
-                let h = mf.hit(k);
-                hit[m] = i as u32;
-                m += h as usize;
-                cnt[pbk(k) + 1] += (!h) as u32;
-            }
-            for j in 0..m {
-                if j + RPD < m {
-                    tab.pf(tmp[hit[j + RPD] as usize].key);
-                }
-                let i = hit[j] as usize;
-                let k = tab.get(tmp[i].key);
-                tmp[i].key = k;
-                cnt[pbk(k) + 1] += 1;
-            }
-            drop(hit);
-            let r = scatter_counted(&tmp, cnt, |x| pbk(x.key));
-            pt(10, &mut tm);
-            r
-        })
-        .collect();
+    let (mf, click_out) = match ck {
+        Some(r) => r,
+        None => parse_clicks(&tab),
+    };
     tick("clicks parsed");
     match &ev_out {
         Evs::L(v) => fbn_merge(v, &mut names_map),
