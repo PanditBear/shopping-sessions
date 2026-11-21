@@ -551,8 +551,12 @@ fn leak_file(p: &Path) -> Option<B> {
         let _ = m.advise(memmap2::Advice::Sequential);
     }
     let m: &'static memmap2::Mmap = Box::leak(Box::new(m));
+    MAPS.lock().unwrap().push((m.as_ptr() as usize, m.len()));
     Some(&m[..])
 }
+
+/// input mappings, kept so the timing report can measure what unmapping them costs (exp)
+static MAPS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
 
 fn csv_files(dir: &Path) -> Vec<B> {
     let mut v = vec![];
@@ -1722,6 +1726,17 @@ fn main() {
     }
     if timing {
         eprintln!("{}", memstats());
+        #[cfg(unix)]
+        {
+            let t = std::time::Instant::now();
+            let v = MAPS.lock().unwrap().clone();
+            let mut tot = 0usize;
+            for &(a, n) in &v {
+                unsafe { munmap(a as *mut u8, n) };
+                tot += n;
+            }
+            eprintln!("unmap inputs {:.3}s ({} maps, {} MB)", t.elapsed().as_secs_f64(), v.len(), tot >> 20);
+        }
         eprintln!("epoch main={:.3} end={:.3}", ep0, ep());
     }
     // all output files are written and closed: leave at once, skipping the allocator's exit-time cleanup
@@ -1737,4 +1752,5 @@ fn main() {
 #[cfg(unix)]
 extern "C" {
     fn _exit(code: i32) -> !;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
 }
