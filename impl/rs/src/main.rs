@@ -298,7 +298,7 @@ unsafe fn masks64_z256(p: *const u8) -> (u64, u64, u64) {
     let a = _mm256_loadu_si256(p as *const __m256i);
     let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
     let (c, q, n) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'"' as i8), _mm256_set1_epi8(b'\n' as i8));
-    let (cm, qm, nm): (u64, u64, u64);
+    let (ca, cb, qa, qb, na, nb): (u32, u32, u32, u32, u32, u32);
     // SAFETY: register-only AVX-512BW/VL compares (enabled for this fn); asm keeps them 256-bit,
     // where LLVM would fuse the two halves of intrinsics into one 512-bit compare
     unsafe {
@@ -309,19 +309,21 @@ unsafe fn masks64_z256(p: *const u8) -> (u64, u64, u64) {
             "vpcmpeqb {k4}, {b}, {q}",
             "vpcmpeqb {k5}, {a}, {n}",
             "vpcmpeqb {k6}, {b}, {n}",
-            "kunpckdq {k1}, {k2}, {k1}",
-            "kunpckdq {k3}, {k4}, {k3}",
-            "kunpckdq {k5}, {k6}, {k5}",
-            "kmovq {cm}, {k1}",
-            "kmovq {qm}, {k3}",
-            "kmovq {nm}, {k5}",
+            "kmovd {ca:e}, {k1}",
+            "kmovd {cb:e}, {k2}",
+            "kmovd {qa:e}, {k3}",
+            "kmovd {qb:e}, {k4}",
+            "kmovd {na:e}, {k5}",
+            "kmovd {nb:e}, {k6}",
             a = in(ymm_reg) a, b = in(ymm_reg) b, c = in(ymm_reg) c, q = in(ymm_reg) q, n = in(ymm_reg) n,
             k1 = out(kreg) _, k2 = out(kreg) _, k3 = out(kreg) _, k4 = out(kreg) _, k5 = out(kreg) _, k6 = out(kreg) _,
-            cm = lateout(reg) cm, qm = lateout(reg) qm, nm = lateout(reg) nm,
+            ca = lateout(reg) ca, cb = lateout(reg) cb, qa = lateout(reg) qa, qb = lateout(reg) qb,
+            na = lateout(reg) na, nb = lateout(reg) nb,
             options(pure, nomem, nostack, preserves_flags),
         );
     }
-    (cm, qm, nm)
+    let j = |lo: u32, hi: u32| lo as u64 | (hi as u64) << 32;
+    (j(ca, cb), j(qa, qb), j(na, nb))
 }
 
 /// Calls `f` with the unquoted fields of every well-formed line of `chunk` (N fields).
