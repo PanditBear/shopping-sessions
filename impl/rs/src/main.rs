@@ -2502,6 +2502,26 @@ unsafe fn hms(p: *const u8) -> Option<i64> {
     Some((h * 60 + ((v >> 24) & 0xFF) as i64) * 60 + ((v >> 48) & 0xFF) as i64)
 }
 
+/// `ts_num` of the 13 bytes at `p`, read as one 16-byte vector from `p - 3` (those 3 bytes are
+/// masked off, so they act as leading zeros): digit test, then 2-, 4- and 8-digit sums.
+#[inline(always)]
+unsafe fn ts13(p: *const u8) -> Option<i64> {
+    use core::arch::x86_64::*;
+    let keep = _mm_setr_epi8(0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    let raw = _mm_loadu_si128(p.sub(3) as *const __m128i);
+    let v = _mm_and_si128(_mm_add_epi8(raw, _mm_set1_epi8(-(b'0' as i8))), keep);
+    let over = _mm_subs_epu8(v, _mm_set1_epi8(9));
+    if _mm_testz_si128(over, over) == 0 {
+        return None;
+    }
+    let a = _mm_maddubs_epi16(v, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1));
+    let b = _mm_madd_epi16(a, _mm_setr_epi16(100, 1, 100, 1, 100, 1, 100, 1));
+    let c = _mm_packus_epi32(b, b);
+    let d = _mm_madd_epi16(c, _mm_setr_epi16(10000, 1, 10000, 1, 10000, 1, 10000, 1));
+    let x = _mm_cvtsi128_si64(d) as u64;
+    Some(((x & 0xFFFF_FFFF) * 100_000_000 + (x >> 32)) as i64)
+}
+
 /// Milliseconds of the 25 bytes "YYYY-MM-DDTHH:MM:SS+HH:MM" (or '-') at `p`, the same value as
 /// `ts_iso`; None means "use the general parser". `(ra, rb, rd)` is a valid date key and its day
 /// start. The 8 bytes "SS+HH:MM" get one range test per byte (',' sits between '+' and '-').
@@ -2655,7 +2675,9 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
                         None => break 'v,
                     }
                 } else if nt == 13 {
-                    match ts_num(sl(pt, 13)) {
+                    // SAFETY: ts is the third field and the ids are not empty here, so the 3
+                    // bytes before it and the 16 bytes from pt - 3 lie inside the window
+                    match unsafe { ts13(pt) } {
                         Some(t) => t,
                         None => break 'v,
                     }
@@ -4050,5 +4072,35 @@ mod pack_simd_tests {
             ok += want.is_some() as u32;
         }
         assert!(ok > 50_000 && fast > 50_000, "{ok} {fast}");
+    }
+
+    #[test]
+    fn ts13_matches_ts_num() {
+        let mut x = 0x1313_5EED_0DD5_EEDEu64;
+        let mut nx = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alpha = b"0123456789/:;,\"+- ";
+        let mut buf = [0u8; 32];
+        let mut ok = 0u32;
+        for i in 0..400_000u32 {
+            for j in 0..32 {
+                buf[j] = if j < 3 || j >= 16 { nx() as u8 } else { b'0' + (nx() % 10) as u8 };
+            }
+            let k = if i % 3 == 0 { 0 } else { 1 + nx() % 2 };
+            for _ in 0..k {
+                let at = 3 + (nx() % 13) as usize;
+                buf[at] = if nx() % 100 < 70 { alpha[(nx() % alpha.len() as u64) as usize] } else { nx() as u8 };
+            }
+            let want = ts_num(&buf[3..16]);
+            // SAFETY: buf has 3 bytes before and 3 after the 13
+            let got = unsafe { ts13(buf.as_ptr().add(3)) };
+            assert_eq!(got, want, "{:?}", &buf[3..16]);
+            ok += want.is_some() as u32;
+        }
+        assert!(ok > 100_000, "{ok}");
     }
 }
