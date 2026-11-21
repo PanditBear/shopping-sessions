@@ -1650,24 +1650,35 @@ fn ck_flush(ds: &mut Vec<CkD>, dc: &mut DayCache, tc: &mut TsCache, rs: &RandomS
     }
     let sl = |p: *const u8, n: usize| -> B { unsafe { std::slice::from_raw_parts(p, n) } };
     let n = ds.len();
-    let mut i13: Vec<u32> = Vec::with_capacity(n);
-    let mut i25: Vec<u32> = Vec::with_capacity(n);
+    let mut i20: Vec<u32> = vec![0; n + 1];
+    let mut i13: Vec<u32> = vec![0; n + 1];
+    let mut i25: Vec<u32> = vec![0; n + 1];
+    let (mut k20, mut k13, mut k25) = (0usize, 0usize, 0usize);
     for (i, d) in ds.iter_mut().enumerate() {
+        // SAFETY: a 20-byte field lies inside the window; the byte 19 is read only for nt == 20
+        let z = d.nt == 20 && unsafe { *d.pt.add(19) } == b'Z';
+        let is13 = d.nt == 13;
+        let is25 = d.nt == 25;
+        d.t = CK_FAIL;
+        i20[k20] = i as u32;
+        i13[k13] = i as u32;
+        i25[k25] = i as u32;
+        k20 += z as usize;
+        k13 += is13 as usize;
+        k25 += is25 as usize;
+    }
+    i20.truncate(k20);
+    i13.truncate(k13);
+    i25.truncate(k25);
+    for &i in &i20 {
+        let d = &mut ds[i as usize];
+        let pt = d.pt;
         // SAFETY (ldp, day_get, hms): a 20-byte field lies inside the window
-        if d.nt == 20 && unsafe { *d.pt.add(19) } == b'Z' {
-            let pt = d.pt;
-            let (ta, tb) = unsafe { (ldp(pt), ldp(pt.add(3))) };
-            d.t = match unsafe { (day_get(ta, tb, pt, dc), hms(pt.add(11))) } {
-                (Some(dd), Some(h)) => (dd + h) * 1000,
-                _ => CK_FAIL,
-            };
-        } else if d.nt == 13 {
-            i13.push(i as u32);
-        } else if d.nt == 25 {
-            i25.push(i as u32);
-        } else {
-            d.t = CK_FAIL;
-        }
+        let (ta, tb) = unsafe { (ldp(pt), ldp(pt.add(3))) };
+        d.t = match unsafe { (day_get(ta, tb, pt, dc), hms(pt.add(11))) } {
+            (Some(dd), Some(h)) => (dd + h) * 1000,
+            _ => CK_FAIL,
+        };
     }
     // SAFETY (ts13): the time is the fourth field and both ids are not empty, so the 3 bytes
     // before it and the 16 bytes from pt - 3 lie inside the window
