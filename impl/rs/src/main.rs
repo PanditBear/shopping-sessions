@@ -36,6 +36,39 @@ mod hpa {
         };
         eprintln!("thp {label}: anon {} MB, anonhuge {} MB, rss {} MB", f("Anonymous:") >> 10, f("AnonHugePages:") >> 10, f("Rss:") >> 10);
     }
+
+    // SHOP_RUSAGE=1: process user/system CPU and page faults spent since the previous tick (Linux only)
+    #[cfg(target_os = "linux")]
+    pub fn rusage(label: &str) {
+        use std::sync::Mutex;
+        extern "C" {
+            fn getrusage(who: i32, r: *mut i64) -> i32;
+        }
+        static PREV: Mutex<[i64; 4]> = Mutex::new([0; 4]);
+        if std::env::var_os("SHOP_RUSAGE").is_none() {
+            return;
+        }
+        let mut r = [0i64; 64]; // struct rusage is 144 bytes (+128 reserved in musl)
+        if unsafe { getrusage(0, r.as_mut_ptr()) } != 0 {
+            return;
+        }
+        let c = [r[0] * 1_000_000 + r[1], r[2] * 1_000_000 + r[3], r[8], r[9]];
+        let mut p = PREV.lock().unwrap();
+        eprintln!(
+            "rusage {label}: utime {:.3} stime {:.3} minflt {} majflt {} | total utime {:.3} stime {:.3} minflt {} majflt {}",
+            (c[0] - p[0]) as f64 / 1e6,
+            (c[1] - p[1]) as f64 / 1e6,
+            c[2] - p[2],
+            c[3] - p[3],
+            c[0] as f64 / 1e6,
+            c[1] as f64 / 1e6,
+            c[2],
+            c[3]
+        );
+        *p = c;
+    }
+    #[cfg(not(target_os = "linux"))]
+    pub fn rusage(_: &str) {}
 }
 
 type B = &'static [u8];
@@ -2606,6 +2639,7 @@ fn main() {
             eprintln!("[{:.2}s] {}", t0.elapsed().as_secs_f64(), s);
         }
         hpa::diag(s);
+        hpa::rusage(s);
     };
 
     let mf = std::fs::read_to_string(data.join("manifest.json")).unwrap_or_default();
