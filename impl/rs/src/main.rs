@@ -267,6 +267,63 @@ fn masks64(p: *const u8) -> (u64, u64, u64) {
     (cm, qm, nm)
 }
 
+/// `masks64` with the window classifier chosen at compile time: 0 AVX2 (`masks64`), 1 one
+/// 512-bit AVX-512BW compare per character, 2 two 256-bit AVX-512VL compares per character
+/// (mask registers, no 512-bit ops). Kinds 1 and 2 need a caller built with AVX-512 F/BW/VL.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn win<const K: u8>(p: *const u8) -> (u64, u64, u64) {
+    match K {
+        1 => masks64_z512(p),
+        2 => masks64_z256(p),
+        _ => masks64(p),
+    }
+}
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx512f,avx512bw")]
+#[inline]
+unsafe fn masks64_z512(p: *const u8) -> (u64, u64, u64) {
+    use core::arch::x86_64::*;
+    let v = _mm512_loadu_si512(p as *const _);
+    let cm = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8));
+    let qm = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8));
+    let nm = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8));
+    (cm, qm, nm)
+}
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+#[inline]
+unsafe fn masks64_z256(p: *const u8) -> (u64, u64, u64) {
+    use core::arch::x86_64::*;
+    let a = _mm256_loadu_si256(p as *const __m256i);
+    let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+    let (c, q, n) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'"' as i8), _mm256_set1_epi8(b'\n' as i8));
+    let (cm, qm, nm): (u64, u64, u64);
+    // SAFETY: register-only AVX-512BW/VL compares (enabled for this fn); asm keeps them 256-bit,
+    // where LLVM would fuse the two halves of intrinsics into one 512-bit compare
+    unsafe {
+        core::arch::asm!(
+            "vpcmpeqb {k1}, {a}, {c}",
+            "vpcmpeqb {k2}, {b}, {c}",
+            "vpcmpeqb {k3}, {a}, {q}",
+            "vpcmpeqb {k4}, {b}, {q}",
+            "vpcmpeqb {k5}, {a}, {n}",
+            "vpcmpeqb {k6}, {b}, {n}",
+            "kunpckdq {k1}, {k2}, {k1}",
+            "kunpckdq {k3}, {k4}, {k3}",
+            "kunpckdq {k5}, {k6}, {k5}",
+            "kmovq {cm}, {k1}",
+            "kmovq {qm}, {k3}",
+            "kmovq {nm}, {k5}",
+            a = in(ymm_reg) a, b = in(ymm_reg) b, c = in(ymm_reg) c, q = in(ymm_reg) q, n = in(ymm_reg) n,
+            k1 = out(kreg) _, k2 = out(kreg) _, k3 = out(kreg) _, k4 = out(kreg) _, k5 = out(kreg) _, k6 = out(kreg) _,
+            cm = lateout(reg) cm, qm = lateout(reg) qm, nm = lateout(reg) nm,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    (cm, qm, nm)
+}
+
 /// Calls `f` with the unquoted fields of every well-formed line of `chunk` (N fields).
 /// Same dialect as rules.md: only \n ends a line; quotes allowed only around a whole field.
 #[inline(always)]
@@ -2084,6 +2141,32 @@ unsafe fn iso_secs(p: *const u8, c: &mut TsCache) -> Option<i64> {
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
 #[inline(never)]
 fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>) {
+    // SAFETY: kind 0 needs only AVX2 and BMI2, enabled for this build
+    unsafe { sol_body::<E, 0>(c, cx, m, d, fb, fbn, side) }
+}
+
+/// `parse_events_sol` with each 64-byte window classified by 512-bit AVX-512BW compares into
+/// mask registers. The caller checks that the CPU has AVX-512 F/BW/VL.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+#[inline(never)]
+unsafe fn parse_events_z512<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>) {
+    sol_body::<E, 1>(c, cx, m, d, fb, fbn, side)
+}
+
+/// `parse_events_sol` with each window classified by 256-bit AVX-512VL compares into mask
+/// registers (no 512-bit ops). The caller checks that the CPU has AVX-512 F/BW/VL.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+#[inline(never)]
+unsafe fn parse_events_z256<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>) {
+    sol_body::<E, 2>(c, cx, m, d, fb, fbn, side)
+}
+
+/// The body of `parse_events_sol`, with the window classifier `win::<K>`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn sol_body<E: Ev, const K: u8>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>) {
     use core::arch::x86_64::_bzhi_u64;
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
@@ -2102,7 +2185,7 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
     'ln: while pos + 128 <= len {
         // SAFETY: pos + 128 <= len, and the second window starts at most 64 bytes in
         let p = unsafe { base.add(pos) };
-        let (ca, qa, na) = masks64(p);
+        let (ca, qa, na) = win::<K>(p);
         let e0 = ca.trailing_zeros();
         let c1 = blsr(ca);
         let e1 = c1.trailing_zeros();
@@ -2113,7 +2196,7 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
                 break 'slow;
             }
             let pb = unsafe { p.add(e2 as usize + 1) };
-            let (cb, qb, nb) = masks64(pb);
+            let (cb, qb, nb) = win::<K>(pb);
             let l = nb.trailing_zeros();
             let e3 = cb.trailing_zeros();
             let d1 = blsr(cb);
@@ -2220,6 +2303,10 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
             }
             continue 'ln;
         }
+        if K != 0 {
+            pos = sol_slow(c, pos, &mut sbuf, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side);
+            continue 'ln;
+        }
         sbuf.clear();
         pos = scan7_line(c, pos, &mut sbuf);
         for f in &sbuf {
@@ -2227,8 +2314,34 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
         }
     }
     if pos < len {
+        if K != 0 {
+            sol_tail(&c[pos..], cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side);
+            return;
+        }
         scan::<7>(&c[pos..], |f| ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side));
     }
+}
+
+/// The slow line of `sol_body` for the AVX-512 kernels: out of line, so it is compiled for
+/// the build's base features only.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn sol_slow<E: Ev>(c: B, pos: usize, sbuf: &mut Vec<[B; 7]>, cx: &EvCtx, c0: usize, tci: &mut TsCache, tct: &mut TsCache, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>) -> usize {
+    sbuf.clear();
+    let pos = scan7_line(c, pos, sbuf);
+    for f in sbuf.iter() {
+        ev_line(f, cx, c0, tci, tct, m, d, fb, fbn, side);
+    }
+    pos
+}
+
+/// The chunk tail of `sol_body` for the AVX-512 kernels (see `sol_slow`).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn sol_tail<E: Ev>(c: B, cx: &EvCtx, c0: usize, tci: &mut TsCache, tct: &mut TsCache, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>) {
+    scan::<7>(c, |f| ev_line(f, cx, c0, tci, tct, m, d, fb, fbn, side));
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
@@ -2237,6 +2350,53 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
     let mut tct = TsCache::new();
     let c0 = c.as_ptr() as usize;
     scan::<7>(c, |f| ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side));
+}
+
+/// Event parse kernels: 0 `parse_events`, 1 `parse_events_sol` (AVX2), 2 its AVX-512 512-bit
+/// classifier, 3 its AVX-512VL 256-bit classifier.
+const EVK_NAMES: [&str; 4] = ["old", "sol", "z512", "z256"];
+
+/// The kernel `parse_events_k` runs by default: SHOP_EVK=old|sol|z512|z256 (SHOP_EVOLD=1 means
+/// old), else z256 when the CPU has AVX-512 F/BW/VL, else sol. A kernel the CPU cannot run
+/// falls back to sol.
+fn ev_kernel() -> u8 {
+    static K: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        let want = match std::env::var("SHOP_EVK") {
+            Ok(s) => EVK_NAMES.iter().position(|&n| n == s).map(|i| i as u8),
+            Err(_) => None,
+        };
+        let want = if std::env::var_os("SHOP_EVOLD").is_some() { Some(0) } else { want };
+        let k = want.unwrap_or(if ev_has512() { 3 } else { 1 });
+        if k >= 2 && !ev_has512() {
+            1
+        } else {
+            k
+        }
+    })
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+fn ev_has512() -> bool {
+    std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw") && std::is_x86_feature_detected!("avx512vl")
+}
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
+fn ev_has512() -> bool {
+    false
+}
+
+/// Parses one chunk with kernel `k` (see `EVK_NAMES`); kinds 2 and 3 only when `ev_has512()`.
+#[allow(clippy::too_many_arguments)]
+fn parse_events_k<E: Ev>(k: u8, c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>) {
+    match k {
+        0 => parse_events(c, cx, m, d, fb, fbn, side),
+        // SAFETY: ev_has512() checked the CPU features these kernels are built for
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+        2 if ev_has512() => unsafe { parse_events_z512(c, cx, m, d, fb, fbn, side) },
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+        3 if ev_has512() => unsafe { parse_events_z256(c, cx, m, d, fb, fbn, side) },
+        _ => parse_events_sol(c, cx, m, d, fb, fbn, side),
+    }
 }
 
 /// Output buffers of one event-parse call.
@@ -2285,48 +2445,60 @@ impl<E: Ev> EvBufs<E> {
     }
 }
 
-/// measurement aid (SHOP_SOLBENCH): `parse_events` and `parse_events_sol`, serial, alternating
-/// which runs first per chunk; prints ns per record for each and checks the outputs agree.
+/// measurement aid (SHOP_SOLBENCH): two event kernels (SHOP_SOLA, SHOP_SOLB; see `EVK_NAMES`),
+/// serial, alternating which runs first per chunk; prints ns per record for each and checks the outputs agree.
 fn sol_bench<E: Ev>(ev_chunks: &[B], cx: &EvCtx) {
     let (mut a, mut b) = (EvBufs::<E>::new(), EvBufs::<E>::new());
     let reps: usize = std::env::var("SHOP_SOLREPS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
-    let (mut best_o, mut best_n) = (f64::MAX, f64::MAX);
-    for rep in 0..reps {
-        let (mut to, mut tn, mut n, mut bad) = (0f64, 0f64, 0usize, 0usize);
-        for (i, &c) in ev_chunks.iter().enumerate() {
-            a.clear();
-            b.clear();
-            let old = |a: &mut EvBufs<E>| {
-                let t = std::time::Instant::now();
-                parse_events(c, cx, &mut a.m, &mut a.d, &mut a.fb, &mut a.fbn, &mut a.side);
-                t.elapsed().as_secs_f64()
-            };
-            let new = |b: &mut EvBufs<E>| {
-                let t = std::time::Instant::now();
-                parse_events_sol(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side);
-                t.elapsed().as_secs_f64()
-            };
-            if i % 2 == 0 {
-                to += old(&mut a);
-                tn += new(&mut b);
-            } else {
-                tn += new(&mut b);
-                to += old(&mut a);
-            }
-            n += a.m.len();
-            if let Some(e) = a.diff(&b) {
-                if bad == 0 {
-                    eprintln!("solbench MISMATCH chunk {i}: {e}");
+    let pick = |v: &str, dflt: u8| std::env::var(v).ok().and_then(|s| EVK_NAMES.iter().position(|&n| n == s)).map_or(dflt, |i| i as u8);
+    // default pairs: sol against z256 and z512 when the CPU has AVX-512, else old against the
+    // selected kernel
+    let kbs: Vec<u8> = match std::env::var("SHOP_SOLB") {
+        Ok(_) => vec![pick("SHOP_SOLB", 1)],
+        Err(_) if ev_kernel() >= 2 => vec![3, 2],
+        Err(_) => vec![ev_kernel()],
+    };
+    for kb in kbs {
+        let ka = pick("SHOP_SOLA", if kb >= 2 { 1 } else { 0 });
+        eprintln!("solbench old = {} new = {} (avx512 {})", EVK_NAMES[ka as usize], EVK_NAMES[kb as usize], ev_has512());
+        let (mut best_o, mut best_n) = (f64::MAX, f64::MAX);
+        for rep in 0..reps {
+            let (mut to, mut tn, mut n, mut bad) = (0f64, 0f64, 0usize, 0usize);
+            for (i, &c) in ev_chunks.iter().enumerate() {
+                a.clear();
+                b.clear();
+                let old = |a: &mut EvBufs<E>| {
+                    let t = std::time::Instant::now();
+                    parse_events_k(ka, c, cx, &mut a.m, &mut a.d, &mut a.fb, &mut a.fbn, &mut a.side);
+                    t.elapsed().as_secs_f64()
+                };
+                let new = |b: &mut EvBufs<E>| {
+                    let t = std::time::Instant::now();
+                    parse_events_k(kb, c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side);
+                    t.elapsed().as_secs_f64()
+                };
+                if i % 2 == 0 {
+                    to += old(&mut a);
+                    tn += new(&mut b);
+                } else {
+                    tn += new(&mut b);
+                    to += old(&mut a);
                 }
-                bad += 1;
+                n += a.m.len();
+                if let Some(e) = a.diff(&b) {
+                    if bad == 0 {
+                        eprintln!("solbench MISMATCH chunk {i}: {e}");
+                    }
+                    bad += 1;
+                }
             }
+            let (no, nn) = (to * 1e9 / n.max(1) as f64, tn * 1e9 / n.max(1) as f64);
+            best_o = best_o.min(no);
+            best_n = best_n.min(nn);
+            eprintln!("solbench rep{rep} old {no:.2} ns/rec new {nn:.2} ns/rec ratio {:.3} recs {n} chunks {} mismatched {bad}", no / nn, ev_chunks.len());
         }
-        let (no, nn) = (to * 1e9 / n.max(1) as f64, tn * 1e9 / n.max(1) as f64);
-        best_o = best_o.min(no);
-        best_n = best_n.min(nn);
-        eprintln!("solbench rep{rep} old {no:.2} ns/rec new {nn:.2} ns/rec ratio {:.3} recs {n} chunks {} mismatched {bad}", no / nn, ev_chunks.len());
+        eprintln!("solbench best old {best_o:.2} ns/rec new {best_n:.2} ns/rec speedup {:.3}", best_o / best_n);
     }
-    eprintln!("solbench best old {best_o:.2} ns/rec new {best_n:.2} ns/rec speedup {:.3}", best_o / best_n);
 }
 
 struct EvChunk<E> {
@@ -2552,12 +2724,7 @@ fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
     let mut d: Vec<DRec> = Vec::with_capacity(c.len() / 64);
     let (mut fb, mut fbn, mut side) = (vec![], vec![], vec![]);
     let mut tm = now();
-    static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *OLD.get_or_init(|| std::env::var_os("SHOP_EVOLD").is_some()) {
-        parse_events(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
-    } else {
-        parse_events_sol(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
-    }
+    parse_events_k(ev_kernel(), c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
     pt(0, &mut tm);
     let (d, doff) = bucketize(&d, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize);
     pt(1, &mut tm);
@@ -3176,11 +3343,17 @@ mod tests {
     fn sol_cmp<E: Ev>(c: B, cx: &EvCtx) -> Result<(usize, usize), String> {
         let (mut a, mut b) = (EvBufs::<E>::new(), EvBufs::<E>::new());
         parse_events(c, cx, &mut a.m, &mut a.d, &mut a.fb, &mut a.fbn, &mut a.side);
-        parse_events_sol(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side);
-        match a.diff(&b) {
-            Some(e) => Err(e),
-            None => Ok((a.m.len(), a.m.iter().filter(|e| e.pc().is_some()).count())),
+        for k in 1..EVK_NAMES.len() as u8 {
+            if k >= 2 && !ev_has512() {
+                continue;
+            }
+            b.clear();
+            parse_events_k(k, c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side);
+            if let Some(e) = a.diff(&b) {
+                return Err(format!("{}: {e}", EVK_NAMES[k as usize]));
+            }
         }
+        Ok((a.m.len(), a.m.iter().filter(|e| e.pc().is_some()).count()))
     }
 
     fn leak_str(s: String) -> B {
