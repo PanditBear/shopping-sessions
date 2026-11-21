@@ -1010,6 +1010,150 @@ struct DRec {
     loc: u32,
 }
 
+/// Dense dedup record: the generator index of the event_id, the ingest key and the line's record.
+#[derive(Clone, Copy)]
+struct DR<E> {
+    i: u32,
+    ing: u32,
+    e: E,
+}
+
+/// A chunk's dense dedup records, written once by the parser: a line whose event_id decodes to an
+/// index below the bound goes to the `cap` slots of its bucket (index >> sh) in `r`, or to `ov`
+/// once those are full. A record's position is its slot (b * cap + n), or ndb * cap plus its place
+/// in `ov` (bucket order after `finish`); `dside` holds the exact ingest of the records whose key
+/// is inexact, by position.
+struct Dz<E> {
+    on: bool,
+    key: u64,
+    lim: u64,
+    sh: u32,
+    ndb: usize,
+    cap: usize,
+    r: Vec<std::mem::MaybeUninit<DR<E>>>,
+    dn: Vec<u32>,
+    ov: Vec<DR<E>>,
+    ovb: Vec<u32>,
+    ovoff: Vec<u32>,
+    dside: Vec<(u32, i64)>,
+}
+
+impl<E: Ev> Dz<E> {
+    /// takes no record: every line keeps the event_id hash path
+    fn off() -> Self {
+        Dz { on: false, key: 0, lim: 0, sh: 0, ndb: 0, cap: 0, r: vec![], dn: vec![], ov: vec![], ovb: vec![], ovoff: vec![], dside: vec![] }
+    }
+    /// for a chunk of `len` bytes: room for the expected bucket size plus a margin (the rest
+    /// overflows)
+    fn new(cfg: Option<IdxCfg>, len: usize) -> Self {
+        let Some(c) = cfg else { return Self::off() };
+        let lines = len as f64 * c.lpb;
+        let mean = lines * (1u64 << c.sh) as f64 / ((c.lim - 64) as f64 / 1.3).max(1.0) * 1.04;
+        let cap = ((mean + 2.5 * mean.sqrt() + 4.0) as usize).min(lines as usize + 16);
+        let n = c.ndb * cap;
+        let mut r = Vec::with_capacity(n);
+        // SAFETY: MaybeUninit needs no initialization
+        unsafe { r.set_len(n) };
+        Dz { on: true, key: c.key, lim: c.lim, sh: c.sh, ndb: c.ndb, cap, r, dn: vec![0; c.ndb], ov: vec![], ovb: vec![], ovoff: vec![], dside: vec![] }
+    }
+    /// the dense index of a packed event_id, if it has one
+    #[inline(always)]
+    fn idx(&self, k: u64) -> Option<u64> {
+        if !self.on {
+            return None;
+        }
+        match gen_val(k, 42) {
+            Some(v) => {
+                let i = gen_idx(v, self.key);
+                if i < self.lim {
+                    Some(i)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
+    }
+    #[inline(always)]
+    fn put(&mut self, i: u64, ing: u32, e: E, exact: bool, ingest: i64) {
+        let b = (i >> self.sh) as usize;
+        let x = DR { i: i as u32, ing, e };
+        // SAFETY: i < lim, so b < ndb; a slot below cap lies in b's stretch of r
+        let n = unsafe { *self.dn.get_unchecked(b) } as usize;
+        let pos = if n < self.cap {
+            let p = b * self.cap + n;
+            unsafe {
+                self.r.get_unchecked_mut(p).write(x);
+                *self.dn.get_unchecked_mut(b) = n as u32 + 1;
+            }
+            p
+        } else {
+            self.ov_put(b, x)
+        };
+        if !exact {
+            self.dside.push((pos as u32, ingest));
+        }
+    }
+    #[cold]
+    #[inline(never)]
+    fn ov_put(&mut self, b: usize, x: DR<E>) -> usize {
+        self.ov.push(x);
+        self.ovb.push(b as u32);
+        self.ndb * self.cap + self.ov.len() - 1
+    }
+    /// orders `ov` by bucket (keeping the line order) and sorts `dside` by position
+    fn finish(&mut self) {
+        if !self.ov.is_empty() {
+            let base = self.ndb * self.cap;
+            let mut off = vec![0u32; self.ndb + 1];
+            for &b in &self.ovb {
+                off[b as usize + 1] += 1;
+            }
+            for i in 0..self.ndb {
+                off[i + 1] += off[i];
+            }
+            let mut w = off.clone();
+            let mut perm = vec![0u32; self.ov.len()];
+            let mut ov = self.ov.clone();
+            for (j, &b) in self.ovb.iter().enumerate() {
+                let q = w[b as usize];
+                ov[q as usize] = self.ov[j];
+                perm[j] = q;
+                w[b as usize] += 1;
+            }
+            for x in self.dside.iter_mut() {
+                if x.0 as usize >= base {
+                    x.0 = (base + perm[x.0 as usize - base] as usize) as u32;
+                }
+            }
+            self.ov = ov;
+            self.ovoff = off;
+            self.ovb = vec![];
+        }
+        self.dside.sort_unstable_by_key(|x| x.0);
+    }
+    fn len(&self) -> usize {
+        self.dn.iter().map(|&n| n as usize).sum::<usize>() + self.ov.len()
+    }
+    /// bucket b's records: its slots and the position of the first, then its overflow records and
+    /// the position of the first
+    #[inline]
+    fn seg(&self, b: usize) -> (&[DR<E>], usize, &[DR<E>], usize) {
+        if b >= self.dn.len() {
+            return (&[], 0, &[], 0);
+        }
+        // SAFETY: put wrote the first dn[b] slots of b's stretch
+        let s = unsafe { std::slice::from_raw_parts(self.r.as_ptr().add(b * self.cap) as *const DR<E>, self.dn[b] as usize) };
+        let (o, p) = if self.ovoff.is_empty() {
+            (&self.ov[..0], 0)
+        } else {
+            let (a, z) = (self.ovoff[b] as usize, self.ovoff[b + 1] as usize);
+            (&self.ov[a..z], self.ndb * self.cap + a)
+        };
+        (s, b * self.cap, o, p)
+    }
+}
+
 const IOFF: i64 = 1 << 31;
 
 /// Order-preserving 32-bit key of an ingest time (ms): whole seconds from `base_s`, offset by
@@ -2330,7 +2474,7 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
 /// `parse_events_sol` go through it).
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn ev_line<E: Ev>(f: &[B; 7], cx: &EvCtx, c0: usize, tci: &mut TsCache, tct: &mut TsCache, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>) {
+fn ev_line<E: Ev>(f: &[B; 7], cx: &EvCtx, c0: usize, tci: &mut TsCache, tct: &mut TsCache, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
     let &[eid, uid, ts, ing, et, pr, price] = f;
     if eid.is_empty() {
         return;
@@ -2364,13 +2508,18 @@ fn ev_line<E: Ev>(f: &[B; 7], cx: &EvCtx, c0: usize, tci: &mut TsCache, tct: &mu
         }
         r = E::mk(ev_key(uid, cx.rs, fbn), (t - cx.ws) as u64, pv, cat);
     }
+    let (ik, exact) = ing32(ingest, cx.ibase);
+    let k6 = pack6(eid);
+    if let Some(i) = k6.and_then(|k| dz.idx(k)) {
+        dz.put(i, ik, r, exact, ingest);
+        return;
+    }
     let loc = m.len() as u32;
     m.push(r);
-    let (ik, exact) = ing32(ingest, cx.ibase);
     if !exact {
         side.push((loc, ingest));
     }
-    match pack6(eid) {
+    match k6 {
         Some(k) => d.push(DRec { eid: k, ing: ik, loc }),
         None => fb.push((pack(eid), ingest, loc)),
     }
@@ -2553,7 +2702,7 @@ unsafe fn ts25(p: *const u8, ra: u64, rb: u64, rd: i64, c: &mut DayCache) -> Opt
 /// as pointer and length, both ids packed in one vector, ISO times straight to seconds.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
 #[inline(never)]
-fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>) {
+fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
     use core::arch::x86_64::_bzhi_u64;
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
@@ -2708,6 +2857,12 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
                 let key = if oku { ku } else { ev_key_slow(sl(pu, nu), cx.rs, fbn) };
                 r = E::mk(key, (t - ws) as u64, pv, cat);
             }
+            if oke {
+                if let Some(i) = dz.idx(ke) {
+                    dz.put(i, ik, r, iex, ingest);
+                    continue 'ln;
+                }
+            }
             let loc = m.len() as u32;
             m.push(r);
             if !iex {
@@ -2723,20 +2878,20 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
         sbuf.clear();
         pos = scan7_line(c, pos, &mut sbuf);
         for f in &sbuf {
-            ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side);
+            ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side, dz);
         }
     }
     if pos < len {
-        scan::<7>(&c[pos..], |f| ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side));
+        scan::<7>(&c[pos..], |f| ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side, dz));
     }
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
-fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>) {
+fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
     let c0 = c.as_ptr() as usize;
-    scan::<7>(c, |f| ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side));
+    scan::<7>(c, |f| ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side, dz));
 }
 
 /// Output buffers of one event-parse call.
@@ -2803,7 +2958,7 @@ fn sol_bench<E: Ev>(ev_chunks: &[B], cx: &EvCtx) {
             };
             let new = |b: &mut EvBufs<E>| {
                 let t = std::time::Instant::now();
-                parse_events_sol(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side);
+                parse_events_sol(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side, &mut Dz::off());
                 t.elapsed().as_secs_f64()
             };
             if i % 2 == 0 {
@@ -2833,8 +2988,7 @@ struct EvChunk<E> {
     m: Vec<E>,
     d: Vec<DRec>,
     doff: Vec<u32>,
-    /// the line of each dense record (d[..doff[ndb]]), scattered with it
-    de: Vec<E>,
+    dz: Dz<E>,
     fb: Vec<(u64, i64, u32)>,
     fbn: Vec<(u64, u64)>,
     side: Vec<(u32, i64)>,
@@ -2854,10 +3008,7 @@ fn ev_after<E: Ev>(
     tick: &dyn Fn(&str),
 ) -> Vec<(Vec<Vec<UD>>, CampAcc)> {
     if let Some(cfg) = idx_cfg() {
-        static NOB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*NOB.get_or_init(|| std::env::var_os("SHOP_NOB").is_some()) {
-            return ev_after_idx(ev_out, tab, mf, click_out, ws, we, ncamp, d0, nd, tick, cfg);
-        }
+        return ev_after_idx(ev_out, tab, mf, click_out, ws, we, ncamp, d0, nd, tick, cfg);
     }
     // dedup on event_id: every line has a global index (chunk base + its index in the chunk);
     // each event_id's losers are marked in the dead bitmap. Each task takes DDG consecutive
@@ -3181,13 +3332,24 @@ fn ev_after_idx<E: Ev>(
     assert!(acc < u32::MAX as usize);
     mbase.push(acc as u32);
     if TIMING.load(Relaxed) {
-        let dense: usize = ev_out.iter().map(|c| c.doff[ndb] as usize).sum();
-        let all: usize = ev_out.iter().map(|c| c.d.len() + c.fb.len()).sum();
-        tick(&format!("idx dense records {dense} of {all} ({:.5})", dense as f64 / all.max(1) as f64));
+        let dense: usize = ev_out.iter().map(|c| c.dz.len()).sum();
+        let ov: usize = ev_out.iter().map(|c| c.dz.ov.len()).sum();
+        let slots: usize = ev_out.iter().map(|c| c.dz.r.len()).sum();
+        let all: usize = dense + ev_out.iter().map(|c| c.d.len() + c.fb.len()).sum::<usize>();
+        tick(&format!("idx dense records {dense} of {all} ({:.5}) overflow {ov} slots {slots}", dense as f64 / all.max(1) as f64));
     }
     let parts: Vec<(Vec<E>, Vec<u32>)> = {
         let side_any = ev_out.iter().any(|c| !c.side.is_empty());
+        let dside_any = ev_out.iter().any(|c| !c.dz.dside.is_empty());
         let ibase = ws.div_euclid(1000);
+        // the same for dense record l (chunk << 32 | position)
+        let dexact = |l: u64, k: u32| -> i64 {
+            let sd = &ev_out[(l >> 32) as usize].dz.dside;
+            match sd.binary_search_by_key(&(l as u32), |x| x.0) {
+                Ok(i) => sd[i].1,
+                Err(_) => (k as i64 - IOFF + ibase) * 1000,
+            }
+        };
         // exact ingest of line g with key k (only needed on key ties when some key is inexact)
         let exact = |g: u32, k: u32| -> i64 {
             let c = mbase.partition_point(|&b| b <= g) - 1;
@@ -3215,35 +3377,36 @@ fn ev_after_idx<E: Ev>(
                         let mut tm = now();
                         let mut t: Vec<u64> = vec![u64::MAX; span];
                         let mut lb: Vec<E> = Vec::new();
-                        let mut lg: Vec<u32> = Vec::new();
+                        let mut lg: Vec<u64> = Vec::new();
                         let mut em: Vec<E> = Vec::new();
                         let mut pc = PkCache { k: [0; 4], p: [0; 4], n: 0 };
                         for b in g * G..((g + 1) * G).min(ndb) {
                             lb.clear();
                             lg.clear();
                             for (ci, c) in ev_out.iter().enumerate() {
-                                let mb = mbase[ci];
-                                let (s, e) = (c.doff[b] as usize, c.doff[b + 1] as usize);
-                                for (r, x) in c.d[s..e].iter().zip(&c.de[s..e]) {
-                                    let q = lb.len() as u32;
-                                    lb.push(*x);
-                                    if side_any {
-                                        lg.push(mb + r.loc);
-                                    }
-                                    let pk = ((r.ing as u64) << 32) | q as u64;
-                                    // SAFETY: the slot index is masked to span
-                                    let o = unsafe { t.get_unchecked_mut((r.eid & mask) as usize) };
-                                    if *o == u64::MAX {
-                                        *o = pk;
-                                        continue;
-                                    }
-                                    let ok = (*o >> 32) as u32;
-                                    if r.ing < ok
-                                        || (r.ing == ok
-                                            && side_any
-                                            && exact(lg[q as usize], r.ing) < exact(lg[*o as u32 as usize], ok))
-                                    {
-                                        *o = pk;
+                                let (sa, sp, oa, op) = c.dz.seg(b);
+                                for (part, p0) in [(sa, sp), (oa, op)] {
+                                    for (j, x) in part.iter().enumerate() {
+                                        let q = lb.len() as u32;
+                                        lb.push(x.e);
+                                        if dside_any {
+                                            lg.push(((ci as u64) << 32) | (p0 + j) as u64);
+                                        }
+                                        let pk = ((x.ing as u64) << 32) | q as u64;
+                                        // SAFETY: the slot index is masked to span
+                                        let o = unsafe { t.get_unchecked_mut((x.i as u64 & mask) as usize) };
+                                        if *o == u64::MAX {
+                                            *o = pk;
+                                            continue;
+                                        }
+                                        let ok = (*o >> 32) as u32;
+                                        if x.ing < ok
+                                            || (x.ing == ok
+                                                && dside_any
+                                                && dexact(lg[q as usize], x.ing) < dexact(lg[*o as u32 as usize], ok))
+                                        {
+                                            *o = pk;
+                                        }
                                     }
                                 }
                             }
@@ -3279,7 +3442,7 @@ fn ev_after_idx<E: Ev>(
                         let totals: [usize; DDG] = std::array::from_fn(|i| {
                             ev_out
                                 .iter()
-                                .map(|c| (c.doff[ndb + g * DDG + i + 1] - c.doff[ndb + g * DDG + i]) as usize)
+                                .map(|c| (c.doff[g * DDG + i + 1] - c.doff[g * DDG + i]) as usize)
                                 .sum()
                         });
                         if totals.iter().all(|&x| x == 0) {
@@ -3291,7 +3454,7 @@ fn ev_after_idx<E: Ev>(
                             if total == 0 {
                                 continue;
                             }
-                            let b = ndb + g * DDG + i;
+                            let b = g * DDG + i;
                             let cap = (total * 2).max(16).next_power_of_two();
                             let mask = cap - 1;
                             let t = &mut tbuf[..cap];
@@ -3648,6 +3811,8 @@ struct IdxCfg {
     lim: u64,
     sh: u32,
     ndb: usize,
+    /// lines per byte in the sample
+    lpb: f64,
 }
 
 static IDXC: std::sync::OnceLock<Option<IdxCfg>> = std::sync::OnceLock::new();
@@ -3701,75 +3866,29 @@ fn idx_find(ev_files: &[B], ev_chunks: &[B]) -> Option<IdxCfg> {
         })
     })?;
     let sh = (64 - (lim / 2048).max(1).leading_zeros()).clamp(10, 15);
-    Some(IdxCfg { key, lim, sh, ndb: (lim >> sh) as usize + 1 })
+    Some(IdxCfg { key, lim, sh, ndb: (lim >> sh) as usize + 1, lpb: lines as f64 / pos as f64 })
 }
 
-/// Groups a chunk's dedup records by bucket: a record whose event_id decodes to an index below
-/// the bound goes to dense bucket index >> sh with eid replaced by the index; the rest go to the
-/// event_id hash buckets after the ndb dense ones. Order within a bucket stays the line order.
-fn idx_split<E: Ev>(mut d: Vec<DRec>, m: &[E], cfg: &IdxCfg) -> (Vec<DRec>, Vec<u32>, Vec<E>) {
-    let nb = cfg.ndb + EB;
-    let mut cnt = vec![0u32; nb + 1];
-    let mut bk: Vec<u32> = Vec::with_capacity(d.len());
-    for r in d.iter_mut() {
-        let b = match gen_val(r.eid, 42).map(|v| gen_idx(v, cfg.key)) {
-            Some(i) if i < cfg.lim => {
-                r.eid = i;
-                (i >> cfg.sh) as usize
-            }
-            _ => cfg.ndb + (mix(r.eid) >> (64 - EBB)) as usize,
-        };
-        cnt[b + 1] += 1;
-        bk.push(b as u32);
-    }
-    for i in 0..nb {
-        cnt[i + 1] += cnt[i];
-    }
-    let mut w = cnt.clone();
-    let mut out: Vec<DRec> = Vec::with_capacity(d.len());
-    let nde = cnt[cfg.ndb] as usize;
-    let mut de: Vec<E> = Vec::with_capacity(nde);
-    {
-        let sp = out.spare_capacity_mut();
-        let dsp = de.spare_capacity_mut();
-        for (x, &b) in d.iter().zip(&bk) {
-            let q = w[b as usize] as usize;
-            sp[q].write(*x);
-            if (b as usize) < cfg.ndb {
-                dsp[q].write(m[x.loc as usize]);
-            }
-            w[b as usize] += 1;
-        }
-    }
-    unsafe {
-        out.set_len(d.len());
-        de.set_len(nde);
-    }
-    (out, cnt, de)
-}
-
-/// Parses one chunk and groups its dedup records by event_id bucket.
+/// Parses one chunk: dense records go straight to their buckets, the rest are grouped by event_id
+/// hash bucket.
 fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
-    let mut m: Vec<E> = Vec::with_capacity(c.len() / 64);
-    let mut d: Vec<DRec> = Vec::with_capacity(c.len() / 64);
+    let mut dz = Dz::new(idx_cfg(), c.len());
+    let cap = if dz.on { c.len() / 4096 } else { c.len() / 64 };
+    let mut m: Vec<E> = Vec::with_capacity(cap);
+    let mut d: Vec<DRec> = Vec::with_capacity(cap);
     let (mut fb, mut fbn, mut side) = (vec![], vec![], vec![]);
     let mut tm = now();
     static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *OLD.get_or_init(|| std::env::var_os("SHOP_EVOLD").is_some()) {
         parse_events(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
     } else {
-        parse_events_sol(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
+        parse_events_sol(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side, &mut dz);
     }
     pt(0, &mut tm);
-    let (d, doff, de) = match idx_cfg() {
-        Some(cfg) => idx_split(d, &m, &cfg),
-        None => {
-            let (d, doff) = bucketize(&d, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize);
-            (d, doff, Vec::new())
-        }
-    };
+    let (d, doff) = bucketize(&d, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize);
+    dz.finish();
     pt(1, &mut tm);
-    EvChunk { m, d, doff, de, fb, fbn, side }
+    EvChunk { m, d, doff, dz, fb, fbn, side }
 }
 
 fn ev_parse<E: Ev>(ev_chunks: &[B], cx: &EvCtx) -> Vec<EvChunk<E>> {
@@ -3799,6 +3918,22 @@ fn hash_chunk<E: Ev>(mut h: u64, r: &EvChunk<E>) -> u64 {
         add(x.0 ^ x.1);
     }
     for x in &r.side {
+        add(x.0 as u64 ^ x.1 as u64);
+    }
+    for b in 0..r.dz.dn.len() {
+        let (sa, sp, oa, op) = r.dz.seg(b);
+        for (part, p0) in [(sa, sp), (oa, op)] {
+            add(part.len() as u64 ^ ((p0 as u64) << 32));
+            for x in part {
+                add(x.i as u64 ^ ((x.ing as u64) << 32));
+                add(x.e.key() ^ (x.e.rts() << 1));
+                if let Some((p, cat)) = x.e.pc() {
+                    add(p ^ ((cat as u64) << 32));
+                }
+            }
+        }
+    }
+    for x in &r.dz.dside {
         add(x.0 as u64 ^ x.1 as u64);
     }
     h
@@ -4443,7 +4578,7 @@ mod tests {
     fn sol_cmp<E: Ev>(c: B, cx: &EvCtx) -> Result<(usize, usize), String> {
         let (mut a, mut b) = (EvBufs::<E>::new(), EvBufs::<E>::new());
         parse_events(c, cx, &mut a.m, &mut a.d, &mut a.fb, &mut a.fbn, &mut a.side);
-        parse_events_sol(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side);
+        parse_events_sol(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side, &mut Dz::off());
         match a.diff(&b) {
             Some(e) => Err(e),
             None => Ok((a.m.len(), a.m.iter().filter(|e| e.pc().is_some()).count())),
