@@ -165,6 +165,55 @@ fn pack6_slow(b: &[u8]) -> Option<u64> {
     Some(k << (6 * (10 - n)))
 }
 
+/// 8 six-bit codes, byte 0 of the id in the high byte, packed into 48 bits (byte 0 most
+/// significant).
+#[inline(always)]
+fn pk48(x: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        // SAFETY: BMI2 is enabled for this build
+        unsafe { core::arch::x86_64::_pext_u64(x, h8(0x3F)) }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let mut x = x;
+        x = ((x & 0xFF00FF00FF00FF00) >> 2) | (x & 0x00FF00FF00FF00FF);
+        x = ((x & 0xFFFF0000FFFF0000) >> 4) | (x & 0x0000FFFF0000FFFF);
+        ((x & 0xFFFFFFFF00000000) >> 8) | (x & 0x00000000FFFFFFFF)
+    }
+}
+
+#[inline(never)]
+fn pack6_cold(b: &[u8]) -> Option<u64> {
+    pack6(b)
+}
+
+/// Same result as `pack6`; an id of 8-10 bytes whose first 8 are digits or lower-case letters
+/// takes a shorter path.
+#[inline(always)]
+fn pack6n(b: &[u8]) -> Option<u64> {
+    let n = b.len();
+    if (8..=10).contains(&n) {
+        let w = ld8(b, 0);
+        let hi = h8(0x80);
+        // with every byte below 0x80, bit 7 of byte i of s(k) is set iff byte i >= k
+        let s = |k: u8| w.wrapping_add(h8(0x80 - k));
+        let lo = s(0x61) & hi;
+        let valid = ((s(0x30) & !s(0x3A)) | (lo & !s(0x7B))) & hi;
+        let t = n - 8;
+        let ca = CODE[b[8.min(n - 1)] as usize] as u64;
+        let cb = CODE[b[n - 1] as usize] as u64;
+        if ((w & hi) == 0) & (valid == hi) & ((ca != 0) | (t < 1)) & ((cb != 0) | (t < 2)) {
+            // '0'-'9' -> 1-10, 'a'-'z' -> 38-63
+            let k0 = pk48(w.wrapping_sub(h8(0x2F) + (lo >> 7) * 12).swap_bytes());
+            let ma = 0u64.wrapping_sub((t >= 1) as u64);
+            let mb = 0u64.wrapping_sub((t >= 2) as u64);
+            return Some((k0 << 12) | ((ca & ma) << 6) | (cb & mb));
+        }
+    }
+    pack6_cold(b)
+}
+
 fn decode6(k: u64, out: &mut Vec<u8>) {
     for i in 0..10 {
         let c = (k >> (54 - 6 * i)) & 63;
@@ -602,6 +651,49 @@ fn ts_fast(b: &[u8], c: &mut TsCache) -> Option<i64> {
     } else {
         parse_ts_c(b, c)
     }
+}
+
+/// Day number of the "YYYY-MM-DD" bytes of `b` through the date cache; `p8` and `tag2` are the
+/// cache tag of those bytes (as in `ts_iso`).
+#[inline(always)]
+fn tc_days(b: &[u8], c: &mut TsCache, p8: u64, tag2: u32) -> Option<i64> {
+    let hi = ((p8 ^ ((tag2 as u64) << 40)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> c.sh) as usize;
+    let ent = &mut c.ents[hi];
+    if ent.p8 == p8 && ent.tag2 == tag2 {
+        Some(ent.days as i64)
+    } else {
+        let days = ts_days(b)?;
+        if days == days as i32 as i64 {
+            *ent = TsEnt { p8, tag2, days: days as i32 };
+        }
+        Some(days)
+    }
+}
+
+/// Cache tag of the date bytes of `b` (at least 10 bytes).
+#[inline(always)]
+fn tc_tag(b: &[u8]) -> (u64, u32) {
+    (ld8(b, 0), u16::from_le_bytes([b[8], b[9]]) as u32 | 0x1_0000)
+}
+
+/// Seconds of the day of the "THH:MM:SS" at byte 10 of `b` (same checks as `ts_iso`).
+#[inline(always)]
+fn iso_sod(b: &[u8]) -> Option<i64> {
+    if b[10] != b'T' {
+        return None;
+    }
+    let t = ld8(b, 11);
+    let t2 = t ^ 0x00000A00000A0000;
+    if (t & 0x0000FF0000FF0000) != 0x00003A00003A0000 || !dig8(t2) {
+        return None;
+    }
+    let v = t2.wrapping_sub(h8(0x30));
+    let v = v.wrapping_mul(10).wrapping_add(v >> 8);
+    let (h, mi, s) = ((v & 0xFF) as i64, ((v >> 24) & 0xFF) as i64, ((v >> 48) & 0xFF) as i64);
+    if h > 23 || mi > 59 || s > 59 {
+        return None;
+    }
+    Some((h * 60 + mi) * 60 + s)
 }
 
 /// 1 for "view" or "cart", 2 for "purchase", 0 otherwise.
@@ -1731,13 +1823,46 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
             if eid.is_empty() {
                 return;
             }
-            let ingest = ts_fast(ing, &mut tci).unwrap_or(i64::MAX);
+            let mut ihint = (0u64, 0u32, 0i64);
+            let (ingest, ik, iexact) = 'i: {
+                if ing.len() == 20 && ing[19] == b'Z' {
+                    // whole seconds: the key needs no division
+                    if let Some(sod) = iso_sod(ing) {
+                        let (p8, tag2) = tc_tag(ing);
+                        if let Some(dy) = tc_days(ing, &mut tci, p8, tag2) {
+                            ihint = (p8, tag2, dy);
+                            let s = dy * 86_400 + sod;
+                            let v = s.saturating_sub(cx.ibase).saturating_add(IOFF);
+                            break 'i (s * 1000, v.clamp(0, u32::MAX as i64) as u32, v > 0 && v < u32::MAX as i64);
+                        }
+                    }
+                    let (k, e) = ing32(i64::MAX, cx.ibase);
+                    break 'i (i64::MAX, k, e);
+                }
+                let ingest = parse_ts_c(ing, &mut tci).unwrap_or(i64::MAX);
+                let (k, e) = ing32(ingest, cx.ibase);
+                (ingest, k, e)
+            };
             let mut r = E::nil();
             'v: {
                 if uid.is_empty() || pr.is_empty() {
                     break 'v;
                 }
-                let Some(t) = ts_fast(ts, &mut tct) else { break 'v };
+                let t = if ts.len() == 20 && ts[19] == b'Z' {
+                    let Some(sod) = iso_sod(ts) else { break 'v };
+                    let (p8, tag2) = tc_tag(ts);
+                    // most lines share the ingest date
+                    let dy = if (p8 == ihint.0) & (tag2 == ihint.1) {
+                        ihint.2
+                    } else {
+                        let Some(dy) = tc_days(ts, &mut tct, p8, tag2) else { break 'v };
+                        dy
+                    };
+                    dy * DAY + sod * 1000
+                } else {
+                    let Some(t) = ts_fast(ts, &mut tct) else { break 'v };
+                    t
+                };
                 if t < cx.ws || t >= cx.we {
                     break 'v;
                 }
@@ -1760,7 +1885,7 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
                 if purch {
                     cat = cx.prod.get_fast(pr, c0).unwrap_or(cx.unknown_cat);
                 }
-                let key = match pack6(uid) {
+                let key = match pack6n(uid) {
                     Some(k) => k,
                     None => {
                         let k = cx.rs.hash_one(uid) | HBIT;
@@ -1772,11 +1897,10 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
             }
             let loc = m.len() as u32;
             m.push(r);
-            let (ik, exact) = ing32(ingest, cx.ibase);
-            if !exact {
+            if !iexact {
                 side.push((loc, ingest));
             }
-            match pack6(eid) {
+            match pack6n(eid) {
                 Some(k) => d.push(DRec { eid: k, ing: ik, loc }),
                 None => fb.push((pack(eid), ingest, loc)),
             }
@@ -2019,6 +2143,7 @@ fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
 fn ev_parse<E: Ev>(ev_chunks: &[B], cx: &EvCtx) -> Vec<EvChunk<E>> {
     ev_chunks.par_iter().map(|&c| ev_chunk_parse(c, cx)).collect()
 }
+
 
 /// measurement aid: order-sensitive checksum of one parsed chunk, chained on h
 fn hash_chunk<E: Ev>(mut h: u64, r: &EvChunk<E>) -> u64 {
