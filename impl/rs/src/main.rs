@@ -1131,6 +1131,8 @@ impl MoverF {
 const PFD: usize = 12;
 /// prefetch distance of the user -> person passes (mover filter, then table), sized for DRAM latency
 const RPD: usize = 32;
+/// chunks ahead that the dense gather prefetches a bucket's slot stretch
+const DPF: usize = 4;
 
 // ---------- records ----------
 
@@ -1332,6 +1334,21 @@ impl<E: Ev> Dz<E> {
             (&self.ov[a..z], self.ndb * self.cap + a)
         };
         (s, b * self.cap, o, p)
+    }
+    /// prefetch dn[b] and the head of b's stretch of slots (up to 512 bytes), ahead of seg(b)
+    #[inline(always)]
+    fn pf_seg(&self, b: usize) {
+        if b < self.dn.len() {
+            prefetch(self.dn.as_ptr().wrapping_add(b));
+            let sz = std::mem::size_of::<DR<E>>();
+            let p = (self.r.as_ptr() as *const u8).wrapping_add(b * self.cap * sz);
+            let n = (self.cap * sz).min(512);
+            let mut o = 0;
+            while o < n {
+                prefetch(p.wrapping_add(o));
+                o += 64;
+            }
+        }
     }
     fn slots(&self) -> usize {
         self.ndb * self.cap
@@ -3609,6 +3626,10 @@ fn ev_after_idx<E: Ev>(
                             lb.clear();
                             lg.clear();
                             for (ci, c) in ev_out.iter().enumerate() {
+                                // each chunk's stretch for b starts at a cold, far-off line
+                                if let Some(cn) = ev_out.get(ci + DPF) {
+                                    cn.dz.pf_seg(b);
+                                }
                                 let (sa, sp, oa, op) = c.dz.seg(b);
                                 for (part, p0) in [(sa, sp), (oa, op)] {
                                     for (j, x) in part.iter().enumerate() {
