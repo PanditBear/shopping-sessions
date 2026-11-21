@@ -2823,6 +2823,12 @@ fn ev_after<E: Ev>(
                         }
                         for (ci, c) in ev_out.iter().enumerate() {
                             let mb = mbase[ci];
+                            // the next chunk's segment starts at an unpredictable address: fetch its head early
+                            if let Some(nx) = ev_out.get(ci + 1) {
+                                let s = nx.doff[b] as usize;
+                                prefetch(nx.d.as_ptr().wrapping_add(s));
+                                prefetch(nx.d.as_ptr().wrapping_add(s + 4));
+                            }
                             for r in &c.d[c.doff[b] as usize..c.doff[b + 1] as usize] {
                                 let gi = mb + r.loc;
                                 let pk = ((r.ing as u64) << 32) | gi as u64;
