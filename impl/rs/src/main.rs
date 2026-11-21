@@ -866,6 +866,43 @@ impl IdTab {
     }
 }
 
+/// Blocked bloom filter (three bits in one u64 word per key) over the identity table's movers:
+/// keys whose person key is not the key itself. It has no false negatives, so a key that misses it
+/// maps to itself and needs no table lookup.
+struct MoverF {
+    w: Vec<AtomicU64>,
+    mask: usize,
+}
+impl MoverF {
+    fn build(tab: &IdTab) -> Self {
+        let nw = (tab.s.len() / 16).max(1);
+        let w: Vec<AtomicU64> = (0..nw).map(|_| AtomicU64::new(0)).collect();
+        tab.s.par_chunks(1 << 15).for_each(|c| {
+            for e in c {
+                if e[0] != 0 && e[0] != e[1] {
+                    let h = mix(e[0]);
+                    w[h as usize & (nw - 1)].fetch_or(Self::bits(h), Relaxed);
+                }
+            }
+        });
+        MoverF { w, mask: nw - 1 }
+    }
+    #[inline(always)]
+    fn bits(h: u64) -> u64 {
+        (1u64 << ((h >> 20) & 63)) | (1u64 << ((h >> 26) & 63)) | (1u64 << ((h >> 32) & 63))
+    }
+    #[inline(always)]
+    fn pf(&self, k: u64) {
+        prefetch(unsafe { self.w.as_ptr().add(mix(k) as usize & self.mask) });
+    }
+    #[inline(always)]
+    fn hit(&self, k: u64) -> bool {
+        let h = mix(k);
+        let b = Self::bits(h);
+        unsafe { self.w.get_unchecked(h as usize & self.mask) }.load(Relaxed) & b == b
+    }
+}
+
 const PFD: usize = 12;
 
 // ---------- records ----------
@@ -1837,7 +1874,11 @@ fn ev_after<E: Ev>(
             },
         );
     }
-    // kept lines: user key -> person key (0 marks a dropped line), then each chunk's kept lines
+    let mut tm = now();
+    let mf = MoverF::build(tab);
+    pt(4, &mut tm);
+    // kept lines: user key -> person key (0 marks a dropped line; keys that miss the mover filter
+    // map to themselves without a table lookup), then each chunk's kept lines
     // are grouped by person bucket inside the chunk (a cache-sized scatter; the order within a
     // bucket stays the line order). The sessionizer gathers a bucket from every chunk in chunk order.
     let parts: Vec<(Vec<E>, Vec<u32>)> = ev_out
@@ -1850,13 +1891,19 @@ fn ev_after<E: Ev>(
             let mut m = c.m;
             let n = m.len();
             for i in 0..n {
+                if i + 2 * PFD < n {
+                    mf.pf(m[i + 2 * PFD].key());
+                }
                 if i + PFD < n {
-                    tab.pf(m[i + PFD].key());
+                    let k = m[i + PFD].key();
+                    if mf.hit(k) {
+                        tab.pf(k);
+                    }
                 }
                 let g = mb + i;
                 let k = m[i].key();
                 if k != 0 && dead[g >> 6].load(Relaxed) & (1u64 << (g & 63)) == 0 {
-                    let pk = tab.get(k);
+                    let pk = if mf.hit(k) { tab.get(k) } else { k };
                     m[i].set_key(pk);
                     cnt[pbk(pk) + 1] += 1;
                 } else {
