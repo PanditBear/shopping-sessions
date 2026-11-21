@@ -16,6 +16,9 @@ on:
       perf:
         description: "1 = perf profile of the first image's binary on the host"
         default: "1"
+      exitprobe:
+        description: "1 = split exit time: teardown vs docker, native run, kernel profile"
+        default: "0"
 permissions:
   contents: read
 jobs:
@@ -38,4 +41,5 @@ jobs:
           REFS: ${{ github.event.inputs.refs || '8d8e4cc e513d9d 8d8e4cc@MIMALLOC_ALLOW_LARGE_OS_PAGES=1@MIMALLOC_VERBOSE=1 1698b09' }}
           PROBE: ${{ github.event.inputs.probe || '0' }}
           PERF: ${{ github.event.inputs.perf || '0' }}
+          EXITPROBE: ${{ github.event.inputs.exitprobe || '0' }}
         run: bash bench.sh $REFS

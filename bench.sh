@@ -3,7 +3,8 @@
 # then run them interleaved with the scorer's docker flags on a generated practice-size dataset.
 # A ref may carry image ENV lines: REF@VAR=val@VAR2=val (same binary, different environment).
 # Env: RUNS (timed runs per ref), CPUS, MEM, EVENTS, CLICKS, SEED, PROBE=1 (one SHOP_PROBE run per image),
-#      PERF=1 (profile the first image's binary on the host with perf).
+#      PERF=1 (profile the first image's binary on the host with perf),
+#      EXITPROBE=1 (split the time after the binary's last tick: process teardown vs docker, plus a native run).
 set -euo pipefail
 RUNS=${RUNS:-5}; CPUS=${CPUS:-4}; MEM=${MEM:-14g}
 EVENTS=${EVENTS:-20000000}; CLICKS=${CLICKS:-5000000}; SEED=${SEED:-7}
@@ -104,5 +105,62 @@ if [ "${PERF:-}" = 1 ]; then
     sudo $P report -i $W/perf.data --stdio --no-children --sort sym --percent-limit 0.4 2>/dev/null | grep -v '^#' | grep -v '^$' | head -60
     sudo $P report -i $W/perf.data --stdio --no-children --sort dso --percent-limit 0.5 2>/dev/null | grep -v '^#' | grep -v '^$' | head -10
   fi
+  set -e
+fi
+
+if [ "${EXITPROBE:-}" = 1 ]; then
+  echo "== exit probe: kernel and docker setup"
+  set +e
+  cat /proc/cmdline
+  grep -E 'INIT_ON_(ALLOC|FREE)|^CONFIG_PREEMPT|TRANSPARENT_HUGEPAGE_(ALWAYS|MADVISE)' /boot/config-$(uname -r) 2>/dev/null
+  docker info -f 'cgroup v{{.CgroupVersion}} driver {{.CgroupDriver}} storage {{.Driver}} runtime {{.DefaultRuntime}}'
+  ep() { date -d "$1" +%s.%N; }
+  echo "-- docker runs without --rm (s): create>started started>main end>finished finished>return rm"
+  for im in "${IMGS[@]}"; do
+    for k in 1 2 3; do
+      out=$(mktemp -d); scr=$(mktemp -d); chmod 777 $out $scr; nm=xp-$im-$k
+      t0=$(date +%s.%N)
+      docker run --name $nm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 \
+        --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 \
+        --cpus $CPUS --memory $MEM --memory-swap $MEM --user 1000:1000 \
+        -v $W/data:/data:ro -v $out:/output -v $scr:/scratch \
+        -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
+        -e NCPU=$CPUS -e SHOP_TIMING=1 $im 2>$W/xerr.txt
+      t1=$(date +%s.%N)
+      st=$(ep "$(docker inspect -f '{{.State.StartedAt}}' $nm)"); fa=$(ep "$(docker inspect -f '{{.State.FinishedAt}}' $nm)")
+      t2=$(date +%s.%N); docker rm $nm >/dev/null; t3=$(date +%s.%N)
+      em=$(grep -o 'main=[0-9.]*' $W/xerr.txt | cut -d= -f2); ee=$(grep -o 'end=[0-9.]*' $W/xerr.txt | cut -d= -f2)
+      printf '%s %.3f %.3f %.3f %.3f %.3f\n' $im "$(echo "$st - $t0" | bc)" "$(echo "$em - $st" | bc)" \
+        "$(echo "$fa - $ee" | bc)" "$(echo "$t1 - $fa" | bc)" "$(echo "$t3 - $t2" | bc)"
+      sudo rm -rf $out $scr
+    done
+  done
+  echo "-- native runs of ${IMGS[0]}'s binary (s): exec>main end>reaped wall"
+  for k in 1 2 3; do
+    o=$(mktemp -d); s2=$(mktemp -d)
+    t0=$(date +%s.%N)
+    env DATA_DIR=$W/data OUTPUT_DIR=$o SCRATCH_DIR=$s2 NCPU=$CPUS SHOP_TIMING=1 $BIN1 2>$W/xerr.txt
+    t1=$(date +%s.%N)
+    em=$(grep -o 'main=[0-9.]*' $W/xerr.txt | cut -d= -f2); ee=$(grep -o 'end=[0-9.]*' $W/xerr.txt | cut -d= -f2)
+    printf 'native %.3f %.3f %.3f\n' "$(echo "$em - $t0" | bc)" "$(echo "$t1 - $ee" | bc)" "$(echo "$t1 - $t0" | bc)"
+    rm -rf $o $s2
+  done
+  o=$(mktemp -d); s2=$(mktemp -d)
+  env DATA_DIR=$W/data OUTPUT_DIR=$o SCRATCH_DIR=$s2 NCPU=$CPUS /usr/bin/time -v $BIN1 2>&1 | grep -E 'Maximum resident|faults|Elapsed|context switches'
+  rm -rf $o $s2
+  echo "-- kernel profile of a native run (all cpus, comm shop)"
+  P=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1)
+  if [ -z "$P" ]; then
+    sudo apt-get install -y -q --no-install-recommends linux-tools-common "linux-tools-$(uname -r)" >/dev/null 2>&1 \
+      || sudo apt-get install -y -q --no-install-recommends linux-tools-common linux-tools-azure >/dev/null 2>&1
+    P=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1)
+  fi
+  if [ -n "$P" ]; then
+    o=$(mktemp -d); s2=$(mktemp -d)
+    sudo sysctl -q kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+    sudo env DATA_DIR=$W/data OUTPUT_DIR=$o SCRATCH_DIR=$s2 NCPU=$CPUS $P record -q -a -F 2999 -e cpu-clock -o $W/xperf.data $BIN1 >/dev/null 2>&1
+    sudo $P report -i $W/xperf.data --stdio --no-children --comms shop --sort sym --percent-limit 0.5 2>/dev/null | grep -v '^#' | grep -v '^$' | head -45
+    sudo rm -rf $o $s2
+  else echo "perf unavailable"; fi
   set -e
 fi
