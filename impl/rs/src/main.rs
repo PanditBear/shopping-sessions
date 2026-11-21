@@ -1303,37 +1303,89 @@ fn isort_by<T: Copy>(v: &mut [T], less: impl Fn(&T, &T) -> bool) {
     }
 }
 
+/// Low digit bits that `sort_evs` scatters per digit group in its second pass.
+const LB: u32 = 7;
+
 /// Sort by (dg(key), key, ts); equal (key, ts) pairs may end up in any order. `span` bounds
-/// every rts. A counting pass on the digit, then per range: a range shorter than RADIX_MIN with
-/// few keys is ordered as packed u64s (`pack_sort`), a long one-key range with `radix_rts`.
-fn sort_evs<E: Ev>(evs: &mut [E], tmp: &mut Vec<E>, cnt: &mut Vec<u32>, span: i64) {
+/// every rts. One counting pass on the digit, then two scatter passes: into `tmp` by the digit's
+/// high bits (few output streams), then each group into `gb` by the low LB bits, where the group
+/// stays in cache for the per-range step: a range shorter than RADIX_MIN with few keys is ordered
+/// as packed u64s (`pack_sort`), a long one-key range with `radix_rts`.
+fn sort_evs<E: Ev>(evs: &mut [E], tmp: &mut Vec<E>, gb: &mut Vec<E>, cnt: &mut Vec<u32>, span: i64) {
     let n = evs.len();
     if n < 256 {
         evs.sort_unstable_by_key(|e| (dg(e.key()), k128(e)));
         return;
     }
-    hk_scatter(evs, tmp, cnt, |e| e.key());
+    let nb = 1usize << NBK;
+    cnt.clear();
+    cnt.resize(nb + 1, 0);
+    for e in evs.iter() {
+        cnt[dg(e.key()) + 1] += 1;
+    }
+    for i in 0..nb {
+        cnt[i + 1] += cnt[i];
+    }
+    const NH: usize = 1 << (NBK - LB);
+    const NL: usize = 1 << LB;
+    let mut w = [0u32; NH];
+    for h in 0..NH {
+        w[h] = cnt[h << LB];
+    }
+    tmp.clear();
+    tmp.reserve(n);
+    {
+        let sp = tmp.spare_capacity_mut();
+        for e in evs.iter() {
+            let h = dg(e.key()) >> LB;
+            sp[w[h] as usize].write(*e);
+            w[h] += 1;
+        }
+    }
+    unsafe { tmp.set_len(n) };
     let fast = span >= 0 && span < (1i64 << 55);
     let sb = 64 - (span as u64).leading_zeros();
     let mut ks = vec![0u64; RADIX_MIN];
-    let mut st = 0usize;
-    for d in 0..1usize << NBK {
-        let en = cnt[d] as usize;
-        let m = en - st;
-        let r = &tmp[st..en];
-        if m == 1 {
-            evs[st] = r[0];
-        } else if m > 1 {
-            let k0 = r[0].key();
-            if fast && m < RADIX_MIN && pack_sort(r, &mut evs[st..en], &mut ks, sb) {
-            } else if fast && m >= RADIX_MIN && r.iter().all(|e| e.key() == k0) {
-                radix_rts(&mut tmp[st..en], &mut evs[st..en]);
-            } else {
-                evs[st..en].copy_from_slice(r);
-                sort_small(&mut evs[st..en]);
+    let mut wl = [0u32; NL];
+    for h in 0..NH {
+        let d0 = h << LB;
+        let gs = cnt[d0] as usize;
+        let ge = cnt[d0 + NL] as usize;
+        if ge == gs {
+            continue;
+        }
+        gb.clear();
+        gb.reserve(ge - gs);
+        for l in 0..NL {
+            wl[l] = cnt[d0 + l] - gs as u32;
+        }
+        {
+            let sp = gb.spare_capacity_mut();
+            for e in &tmp[gs..ge] {
+                let l = dg(e.key()) & (NL - 1);
+                sp[wl[l] as usize].write(*e);
+                wl[l] += 1;
             }
         }
-        st = en;
+        unsafe { gb.set_len(ge - gs) };
+        for l in 0..NL {
+            let st = cnt[d0 + l] as usize;
+            let en = cnt[d0 + l + 1] as usize;
+            let m = en - st;
+            if m == 1 {
+                evs[st] = gb[st - gs];
+            } else if m > 1 {
+                let r = &mut gb[st - gs..en - gs];
+                let k0 = r[0].key();
+                if fast && m < RADIX_MIN && pack_sort(r, &mut evs[st..en], &mut ks, sb) {
+                } else if fast && m >= RADIX_MIN && r.iter().all(|e| e.key() == k0) {
+                    radix_rts(r, &mut evs[st..en]);
+                } else {
+                    evs[st..en].copy_from_slice(r);
+                    sort_small(&mut evs[st..en]);
+                }
+            }
+        }
     }
 }
 
@@ -1511,6 +1563,7 @@ fn sort_one_clicker(src: &[ClickRec], out: &mut [ClickRec], pk: &mut Vec<u64>) -
 fn process_bucket<E: Ev>(
     evs: &mut [E],
     tmp: &mut Vec<E>,
+    gb: &mut Vec<E>,
     cnt: &mut Vec<u32>,
     clicks: &mut Vec<ClickRec>,
     ctmp: &mut Vec<ClickRec>,
@@ -1522,7 +1575,7 @@ fn process_bucket<E: Ev>(
     span: i64,
 ) {
     let mut tm = now();
-    sort_evs(evs, tmp, cnt, span);
+    sort_evs(evs, tmp, gb, cnt, span);
     pt(7, &mut tm);
     sort_clicks(clicks, ctmp, cnt);
     pt(11, &mut tm);
@@ -2066,6 +2119,7 @@ fn ev_after<E: Ev>(
             let mut out = vec![];
             let mut evs: Vec<E> = vec![];
             let mut tmp: Vec<E> = vec![];
+            let mut gb: Vec<E> = vec![];
             let mut cnt: Vec<u32> = vec![];
             let mut cl: Vec<ClickRec> = vec![];
             let mut ctmp: Vec<ClickRec> = vec![];
@@ -2081,7 +2135,7 @@ fn ev_after<E: Ev>(
                 }
                 pt(6, &mut tm);
                 let mut uds = Vec::new();
-                process_bucket(&mut evs, &mut tmp, &mut cnt, &mut cl, &mut ctmp, &mut win, ncamp as u32, &mut uds, &mut cm, ws, we.wrapping_sub(ws));
+                process_bucket(&mut evs, &mut tmp, &mut gb, &mut cnt, &mut cl, &mut ctmp, &mut win, ncamp as u32, &mut uds, &mut cm, ws, we.wrapping_sub(ws));
                 out.push(uds);
             }
             (out, cm)
