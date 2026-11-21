@@ -20,6 +20,8 @@ mod sys {
         pub fn pread(fd: i32, buf: *mut c_void, n: usize, off: i64) -> isize;
         pub fn sched_setaffinity(pid: i32, size: usize, mask: *const u8) -> i32;
         pub fn getrusage(who: i32, usage: *mut [i64; 18]) -> i32;
+        pub fn sync_file_range(fd: i32, off: i64, n: i64, flags: u32) -> i32;
+        pub fn fdatasync(fd: i32) -> i32;
     }
     pub const PROT_READ: i32 = 1;
     pub const MAP_PRIVATE: i32 = 2;
@@ -158,18 +160,20 @@ pub fn run(mode: &str, ep0: f64) -> ! {
         report_end(ep0, t0, &format!("mode=pool threads={ncpu} pool_ms={:.2}", t_pool * 1e3));
     }
     if let Some(mb) = mode.strip_prefix("wr") {
-        let mb: usize = mb.parse().unwrap_or(12);
+        let sy = mb.chars().last().filter(|c| c.is_ascii_alphabetic());
+        let mb: usize = mb.trim_end_matches(|c: char| c.is_ascii_alphabetic()).parse().unwrap_or(12);
+        let nf: usize = std::env::var("FLOOR_NF").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
         let outd = std::path::PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
         let ud = outd.join("user_daily");
         let cd = outd.join("campaign_daily");
         std::fs::create_dir_all(&ud).unwrap();
         std::fs::create_dir_all(&cd).unwrap();
-        let per = (mb << 20) / 16;
+        let per = (mb << 20) / nf;
         let tw = Instant::now();
         rayon::join(
             || {
                 use rayon::prelude::*;
-                (0..16usize).into_par_iter().for_each(|i| {
+                (0..nf).into_par_iter().for_each(|i| {
                     let mut v = vec![0u8; per];
                     let mut x = 0x9e3779b97f4a7c15u64 ^ i as u64;
                     for c in v.chunks_mut(8) {
@@ -179,7 +183,20 @@ pub fn run(mode: &str, ep0: f64) -> ! {
                         let b = x.to_le_bytes();
                         c.copy_from_slice(&b[..c.len()]);
                     }
-                    std::fs::write(ud.join(format!("part-{i}.parquet")), &v).unwrap();
+                    let path = ud.join(format!("part-{i}.parquet"));
+                    std::fs::write(&path, &v).unwrap();
+                    #[cfg(target_os = "linux")]
+                    if sy.is_some() {
+                        use std::os::fd::AsRawFd;
+                        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                        unsafe {
+                            if sy == Some('f') {
+                                sys::fdatasync(f.as_raw_fd());
+                            } else {
+                                sys::sync_file_range(f.as_raw_fd(), 0, 0, 2);
+                            }
+                        }
+                    }
                 })
             },
             || std::fs::write(cd.join("part-0.parquet"), vec![1u8; 200 << 10]).unwrap(),
