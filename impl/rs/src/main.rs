@@ -2153,23 +2153,27 @@ fn main() {
                     }
                 }
                 let nl = idx_key.len();
-                let mut best: Vec<u32> = (0..nl as u32).collect();
+                let mut bestk: Vec<u64> = idx_key.clone();
+                let mut besti: Vec<u32> = (0..nl as u32).collect();
+                let mut root: Vec<u32> = Vec::with_capacity(nl);
                 for g in 0..nl {
                     let r = find(&mut parent, g as u32) as usize;
-                    let (kg, kb) = (idx_key[g], idx_key[best[r] as usize]);
-                    let less = if kg & HBIT == 0 && kb & HBIT == 0 { kg < kb } else { unpack(idx_ref[g]) < unpack(idx_ref[best[r] as usize]) };
+                    root.push(r as u32);
+                    let (kg, kb) = (idx_key[g], bestk[r]);
+                    let less = if kg & HBIT == 0 && kb & HBIT == 0 { kg < kb } else { unpack(idx_ref[g]) < unpack(idx_ref[besti[r] as usize]) };
                     if less {
-                        best[r] = g as u32;
+                        bestk[r] = kg;
+                        besti[r] = g as u32;
                     }
                 }
                 // person key per id index, then rewrite the table's values in place
                 let mut pkv: Vec<u64> = Vec::with_capacity(nl);
                 for g in 0..nl {
-                    let b = best[find(&mut parent, g as u32) as usize] as usize;
-                    let pk = idx_key[b];
+                    let r = root[g] as usize;
+                    let pk = bestk[r];
                     pkv.push(pk);
-                    if pk & HBIT != 0 && b == g {
-                        names_map.insert(pk, idx_ref[b]);
+                    if pk & HBIT != 0 && besti[r] as usize == g {
+                        names_map.insert(pk, idx_ref[g]);
                     }
                 }
                 for e in t.s.iter_mut() {
