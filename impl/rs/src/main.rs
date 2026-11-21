@@ -3421,6 +3421,14 @@ fn proc_cpu() -> f64 {
 /// e: full field parse with no dense index or store, c: plus the dense index (no store),
 /// d: the real chunk parse. Prints wall, process CPU and summed per-chunk time per rep.
 fn solp<E: Ev>(ev_chunks: &[B], cx: &EvCtx, mode: &str) {
+    // SHOP_SOLT: run the layer on a pool of that many threads instead of the global pool
+    match std::env::var("SHOP_SOLT").ok().and_then(|s| s.parse::<usize>().ok()) {
+        Some(t) => rayon::ThreadPoolBuilder::new().num_threads(t).build().unwrap().install(|| solp_run::<E>(ev_chunks, cx, mode)),
+        None => solp_run::<E>(ev_chunks, cx, mode),
+    }
+}
+
+fn solp_run<E: Ev>(ev_chunks: &[B], cx: &EvCtx, mode: &str) {
     let reps: usize = std::env::var("SHOP_SOLREPS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
     let kern = std::sync::atomic::AtomicU64::new(0);
     for rep in 0..reps {
