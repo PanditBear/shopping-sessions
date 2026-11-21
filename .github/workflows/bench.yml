@@ -128,13 +128,14 @@ jobs:
             sudo $P report -i $R --stdio --no-children -G --sort sym --percent-limit 4 2>/dev/null | grep -v '^#' | grep -v '^$' | head -120
             echo "== inclusive view"
             sudo $P report -i $R --stdio --children -g none --sort sym --percent-limit 3 2>/dev/null | grep -v '^#' | grep -v '^$' | head -30
-            echo "== annotate top 3"
-            for s in $(sudo $P report -i $R --stdio --no-children -g none --sort sym 2>/dev/null | grep -v '^#' | grep -v '^$' | head -3 | awk '{print $NF}'); do
-              echo "---- annotate $s"
+            echo "== annotate top 4"
+            sudo $P report -i $R --stdio --no-children -g none --sort sym 2>/dev/null | grep -v '^#' | grep -v '^$' | head -4 | sed -E 's/^ *[0-9.]+% +\[.\] //' > $W/syms.txt
+            while IFS= read -r s; do
+              echo "---- annotate $s" | cut -c1-200
               sudo $P annotate -i $R --stdio -s "$s" > $W/ann.txt 2>/dev/null
-              awk '$1+0>=0.8' $W/ann.txt | sort -rn | head -25
-              echo "-- context of the hottest 3"
-              for pc in $(awk '$1+0>=0.8 {print $1" "$2}' $W/ann.txt | sort -rn | head -3 | awk '{print $2}'); do grep -B5 -A1 -F -- "$pc" $W/ann.txt | head -14; echo ..; done
-            done
+              echo "-- hottest instructions"; grep -E '^ +[0-9]+\.[0-9]+ +:' $W/ann.txt | sort -rn | head -12
+              echo "-- context (15 lines before) of the hottest 3"
+              for ln in $(grep -nE '^ +[0-9]+\.[0-9]+ +:' $W/ann.txt | sort -t: -k2 -rn | head -3 | cut -d: -f1); do sed -n "$((ln-15)),$((ln+1))p" $W/ann.txt | cut -c1-160; echo ..; done
+            done < $W/syms.txt
             sudo find $o $s2 -mindepth 1 -delete; sudo rm -f $R; sudo find $D -mindepth 1 -delete
           done
