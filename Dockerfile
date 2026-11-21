@@ -1,6 +1,6 @@
 # Shopping Sessions: Rust implementation. Static musl binary in a scratch image.
 # The scorer runs CMD with no arguments, as uid 1000, read-only root, no network.
-FROM rust:1-bookworm AS build
+FROM rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea AS build
 RUN apt-get update && apt-get install -y --no-install-recommends musl-tools \
  && rustup target add x86_64-unknown-linux-musl
 WORKDIR /src
