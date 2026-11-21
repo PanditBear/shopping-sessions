@@ -1606,19 +1606,84 @@ impl Ev for EvW {
     }
 }
 
+/// A click: person key, click_id bytes (`pack`) and its (ts, campaign) part `t`.
 #[derive(Clone, Copy)]
-struct ClickRec {
+struct ClickRec<T> {
     key: u64,
-    ts: i64,
+    t: T,
     cid: u64,
+}
+
+/// The (ts, campaign) part of a click record. `u64` packs both into one word, `ts - tlo` above
+/// `CB` campaign bits (24-byte records), when every kept click fits (`pk_fits`); `Ck32` keeps them
+/// apart (32-byte records) for any other input. `tlo` is `ws - WEEK`, the smallest kept ts.
+trait CkT: Copy + Send + Sync + 'static {
+    /// bits of `sv` below the ts
+    const SH: u32;
+    fn mk(ts: i64, camp: u32, tlo: i64) -> Self;
+    /// (key, sv) orders like (key, ts); clicks with equal ts may differ in sv
+    fn sv(&self) -> u64;
+    fn ts(&self, tlo: i64) -> i64;
+    fn camp(&self) -> u32;
+}
+
+#[derive(Clone, Copy)]
+struct Ck32 {
+    ts: i64,
     camp: u32,
+}
+impl CkT for Ck32 {
+    const SH: u32 = 0;
+    #[inline(always)]
+    fn mk(ts: i64, camp: u32, _: i64) -> Self {
+        Ck32 { ts, camp }
+    }
+    #[inline(always)]
+    fn sv(&self) -> u64 {
+        (self.ts as u64) ^ (1 << 63)
+    }
+    #[inline(always)]
+    fn ts(&self, _: i64) -> i64 {
+        self.ts
+    }
+    #[inline(always)]
+    fn camp(&self) -> u32 {
+        self.camp
+    }
+}
+
+/// campaign bits of a packed click (2000 campaigns in the test data; 2^44 ms is 557 years of ts)
+const CB: u32 = 20;
+impl CkT for u64 {
+    const SH: u32 = CB;
+    #[inline(always)]
+    fn mk(ts: i64, camp: u32, tlo: i64) -> Self {
+        ((ts.wrapping_sub(tlo) as u64) << CB) | camp as u64
+    }
+    #[inline(always)]
+    fn sv(&self) -> u64 {
+        *self
+    }
+    #[inline(always)]
+    fn ts(&self, tlo: i64) -> i64 {
+        ((*self >> CB) as i64).wrapping_add(tlo)
+    }
+    #[inline(always)]
+    fn camp(&self) -> u32 {
+        (*self as u32) & ((1 << CB) - 1)
+    }
+}
+
+/// Packed clicks hold every campaign index below `ncamp` and every kept ts in [ws - WEEK, we).
+fn pk_fits(ncamp: usize, ws: i64, we: i64) -> bool {
+    ncamp <= 1 << CB && we as i128 - (ws as i128 - WEEK as i128) <= 1i128 << (64 - CB)
 }
 
 /// One click line of `scan4`: its record when the ids are not empty, the campaign is known and
 /// the time parses and lies in [ws - WEEK, we). `lo` is the chunk start (for `get_fast2`).
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn click_line(f: &[B; 4], camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, lo: usize, tc: &mut TsCache, out: &mut Vec<ClickRec>) {
+fn click_line<T: CkT>(f: &[B; 4], camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, lo: usize, tc: &mut TsCache, out: &mut Vec<ClickRec<T>>) {
     let [cid, uid, cmp, ts] = *f;
     if cid.is_empty() || uid.is_empty() {
         return;
@@ -1628,19 +1693,19 @@ fn click_line(f: &[B; 4], camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, l
     if t < ws - WEEK || t >= we {
         return;
     }
-    out.push(ClickRec { key: ukey(rs, uid), ts: t, cid: pack(cid), camp: ci });
+    out.push(ClickRec { key: ukey(rs, uid), t: T::mk(t, ci, ws - WEEK), cid: pack(cid) });
 }
 
 /// The click records of one chunk, in line order: `scan4` with `click_line` on every line.
 #[cfg_attr(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"), allow(dead_code))]
-fn parse_clicks_old(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: &mut Vec<ClickRec>) {
+fn parse_clicks_old<T: CkT>(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: &mut Vec<ClickRec<T>>) {
     let mut tc = TsCache::new();
     let lo = c.as_ptr() as usize;
     scan4(c, |f| click_line(f, camp, rs, ws, we, lo, &mut tc, out));
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
-fn parse_clicks(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: &mut Vec<ClickRec>) {
+fn parse_clicks<T: CkT>(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: &mut Vec<ClickRec<T>>) {
     parse_clicks_old(c, camp, rs, ws, we, out)
 }
 
@@ -1652,7 +1717,7 @@ fn parse_clicks(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: 
 /// the chunk to `scan::<4>`.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
 #[inline(never)]
-fn parse_clicks(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: &mut Vec<ClickRec>) {
+fn parse_clicks<T: CkT>(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: &mut Vec<ClickRec<T>>) {
     use core::arch::x86_64::_bzhi_u64;
     let mut tc = TsCache::new();
     let mut dc = DayCache::new();
@@ -1723,7 +1788,7 @@ fn parse_clicks(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: 
                 (k, true) => k,
                 _ => ukey(rs, uid),
             };
-            out.push(ClickRec { key, ts: t, cid: pack(sl(pc, nc)), camp: ci });
+            out.push(ClickRec { key, t: T::mk(t, ci, tlo), cid: pack(sl(pc, nc)) });
             continue;
         }
         sbuf.clear();
@@ -2160,31 +2225,31 @@ fn radix_rts<E: Ev>(a: &mut [E], b: &mut [E]) {
 }
 
 #[inline(always)]
-fn click_less(a: &ClickRec, b: &ClickRec) -> bool {
-    (a.key, a.ts) < (b.key, b.ts)
+fn click_less<T: CkT>(a: &ClickRec<T>, b: &ClickRec<T>) -> bool {
+    (a.key, a.t.sv()) < (b.key, b.t.sv())
 }
 
 /// Last touch among clicks of one person with one ts that do not all share a campaign: the
 /// campaign of the click with the byte-wise smallest click_id. Copies of a click are equal here.
 #[inline(never)]
-fn min_cid_camp(g: &[ClickRec]) -> u32 {
+fn min_cid_camp<T: CkT>(g: &[ClickRec<T>]) -> u32 {
     let mut w = &g[0];
     for c in &g[1..] {
         if unpack(c.cid) < unpack(w.cid) {
             w = c;
         }
     }
-    w.camp
+    w.t.camp()
 }
 
 /// Sort clicks by (dg(key), key, ts): a counting pass on the digit, then a small sort per range.
 /// Clicks of one key with equal ts stay in no particular order: the sessionizer reads them as a
 /// set, and its last-touch choice orders a tie by click_id bytes itself (`min_cid_camp`), so the
 /// sort never touches the click_id bytes.
-fn sort_clicks(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Vec<u32>) {
+fn sort_clicks<T: CkT>(cl: &mut Vec<ClickRec<T>>, tmp: &mut Vec<ClickRec<T>>, cnt: &mut Vec<u32>) {
     let n = cl.len();
     if n < 256 {
-        cl.sort_unstable_by_key(|c| (dg(c.key), c.key, c.ts));
+        cl.sort_unstable_by_key(|c| (dg(c.key), c.key, c.t.sv()));
         return;
     }
     if ck_rdx() && sort_clicks_rdx(cl, tmp, cnt) {
@@ -2206,7 +2271,7 @@ fn sort_clicks(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Vec<u3
             if m <= 32 {
                 isort_by(o, click_less);
             } else {
-                o.sort_unstable_by_key(|c| (c.key, c.ts));
+                o.sort_unstable_by_key(|c| (c.key, c.t.sv()));
             }
         }
         st = en;
@@ -2226,19 +2291,18 @@ thread_local! {
 /// LSD radix sorted (two 11-bit ts passes, one digit pass), the records are gathered once, then
 /// each digit range that is not yet in (key, ts) order (several keys, or two clicks in one
 /// quantum) is sorted. Returns false (and leaves `cl` alone) when the fields do not fit.
-fn sort_clicks_rdx(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Vec<u32>) -> bool {
+fn sort_clicks_rdx<T: CkT>(cl: &mut Vec<ClickRec<T>>, tmp: &mut Vec<ClickRec<T>>, cnt: &mut Vec<u32>) -> bool {
     let n = cl.len();
     let ib = 64 - ((n - 1) as u64).leading_zeros();
     if ib + 22 + NBK > 64 {
         return false;
     }
-    let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+    let (mut lo, mut hi) = (u64::MAX, 0u64);
     for c in cl.iter() {
-        lo = lo.min(c.ts);
-        hi = hi.max(c.ts);
+        lo = lo.min(c.t.sv());
+        hi = hi.max(c.t.sv());
     }
-    let Some(span) = hi.checked_sub(lo) else { return false };
-    let q = (64 - (span as u64).leading_zeros()).saturating_sub(22);
+    let q = (64 - (hi - lo).leading_zeros()).saturating_sub(22);
     let (sht, shd) = (ib, ib + 22);
     const H1: usize = 2048;
     const HD: usize = 4096;
@@ -2251,7 +2315,7 @@ fn sort_clicks_rdx(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Ve
         kb.clear();
         kb.resize(n, 0);
         for (j, c) in cl.iter().enumerate() {
-            let t = (c.ts.wrapping_sub(lo) as u64) >> q;
+            let t = (c.t.sv() - lo) >> q;
             let d = dg(c.key);
             ka.push(((d as u64) << shd) | (t << sht) | j as u64);
             cnt[(t & 2047) as usize] += 1;
@@ -2299,7 +2363,7 @@ fn sort_clicks_rdx(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Ve
             if r.len() <= 32 {
                 isort_by(r, click_less);
             } else {
-                r.sort_unstable_by_key(|c| (c.key, c.ts));
+                r.sort_unstable_by_key(|c| (c.key, c.t.sv()));
             }
         }
         st = en;
@@ -2309,10 +2373,10 @@ fn sort_clicks_rdx(cl: &mut Vec<ClickRec>, tmp: &mut Vec<ClickRec>, cnt: &mut Ve
 
 /// Insertion sort of one clicker's clicks (already in ts quantum order) by ts.
 /// Gives up after about two moves per click and returns false, leaving `r` a permutation.
-fn isort_one(r: &mut [ClickRec]) -> bool {
+fn isort_one<T: CkT>(r: &mut [ClickRec<T>]) -> bool {
     #[inline(always)]
-    fn less(a: &ClickRec, b: &ClickRec) -> bool {
-        a.ts < b.ts
+    fn less<T: CkT>(a: &ClickRec<T>, b: &ClickRec<T>) -> bool {
+        a.t.sv() < b.t.sv()
     }
     let mut budget = 2 * r.len() + 16;
     for i in 1..r.len() {
@@ -2337,22 +2401,23 @@ fn isort_one(r: &mut [ClickRec]) -> bool {
 
 /// A long digit range is nearly always one heavy clicker. When every click in `src` has the same key,
 /// sort (ts, index) pairs packed into u64s and gather into `out`. Returns false (and leaves `out` alone) for a range with several keys.
-fn sort_one_clicker(src: &[ClickRec], out: &mut [ClickRec], pk: &mut Vec<u64>) -> bool {
+fn sort_one_clicker<T: CkT>(src: &[ClickRec<T>], out: &mut [ClickRec<T>], pk: &mut Vec<u64>) -> bool {
     let m = src.len();
     let k0 = src[0].key;
-    let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+    let (mut lo, mut hi) = (u64::MAX, 0u64);
     for c in src {
         if c.key != k0 {
             return false;
         }
-        lo = lo.min(c.ts);
-        hi = hi.max(c.ts);
+        let v = c.t.sv() >> T::SH;
+        lo = lo.min(v);
+        hi = hi.max(v);
     }
-    if m >= 1 << 20 || hi.wrapping_sub(lo) as u64 >= 1 << 43 {
+    if m >= 1 << 20 || hi - lo >= 1 << 43 {
         return false;
     }
     pk.clear();
-    pk.extend(src.iter().enumerate().map(|(j, c)| ((c.ts.wrapping_sub(lo) as u64) << 20) | j as u64));
+    pk.extend(src.iter().enumerate().map(|(j, c)| (((c.t.sv() >> T::SH) - lo) << 20) | j as u64));
     pk.sort_unstable();
     for (o, &u) in out.iter_mut().zip(pk.iter()) {
         *o = src[(u & 0xF_FFFF) as usize];
@@ -2361,12 +2426,12 @@ fn sort_one_clicker(src: &[ClickRec], out: &mut [ClickRec], pk: &mut Vec<u64>) -
 }
 
 #[allow(clippy::too_many_arguments)]
-fn process_bucket<E: Ev>(
+fn process_bucket<E: Ev, T: CkT>(
     evs: &mut [E],
     tmp: &mut Vec<E>,
     cnt: &mut Vec<u32>,
-    clicks: &mut Vec<ClickRec>,
-    ctmp: &mut Vec<ClickRec>,
+    clicks: &mut Vec<ClickRec<T>>,
+    ctmp: &mut Vec<ClickRec<T>>,
     win: &mut Win,
     organic: u32,
     uds: &mut Vec<UD>,
@@ -2379,6 +2444,7 @@ fn process_bucket<E: Ev>(
     pt(7, &mut tm);
     sort_clicks(clicks, ctmp, cnt);
     pt(11, &mut tm);
+    let tlo = base.wrapping_sub(WEEK);
     let mut ci = 0;
     let mut i = 0;
     let mut day = DayAcc { key: 0, day: 0, sessions: 0, events: 0, rev: 0, cats: vec![] };
@@ -2420,23 +2486,23 @@ fn process_bucket<E: Ev>(
                 s_day = d;
                 s_rev = 0;
                 s_purch = false;
-                while hi < cs.len() && cs[hi].ts <= s {
-                    win.add(cs[hi].camp);
+                while hi < cs.len() && cs[hi].t.ts(tlo) <= s {
+                    win.add(cs[hi].t.camp());
                     hi += 1;
                 }
-                while lo < hi && cs[lo].ts < s - WEEK {
-                    win.remove(cs[lo].camp);
+                while lo < hi && cs[lo].t.ts(tlo) < s - WEEK {
+                    win.remove(cs[lo].t.camp());
                     lo += 1;
                 }
                 s_camp = if hi > lo {
                     // the clicks at the latest ts; ties are not in click_id order
-                    let t = cs[hi - 1].ts;
-                    let c0 = cs[hi - 1].camp;
+                    let t = cs[hi - 1].t.ts(tlo);
+                    let c0 = cs[hi - 1].t.camp();
                     let mut g = hi - 1;
                     let mut mixed = false;
-                    while g > lo && cs[g - 1].ts == t {
+                    while g > lo && cs[g - 1].t.ts(tlo) == t {
                         g -= 1;
-                        mixed |= cs[g].camp != c0;
+                        mixed |= cs[g].t.camp() != c0;
                     }
                     if mixed {
                         min_cid_camp(&cs[g..hi])
@@ -3719,11 +3785,68 @@ struct EvChunk<E> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn ev_after<E: Ev>(
+/// The click records of every chunk, keys resolved, scattered by person bucket.
+fn parse_all_clicks<T: CkT>(
+    click_chunks: &[B],
+    camp: &IdLookup,
+    rs: &RandomState,
+    ws: i64,
+    we: i64,
+    mf: &MoverF,
+    tab: &IdTab,
+) -> Vec<(Vec<ClickRec<T>>, Vec<u32>)> {
+    click_chunks
+        .par_iter()
+        .map(|&c| {
+            let mut tmp: Vec<ClickRec<T>> = Vec::with_capacity(c.len() / 40);
+            let mut tm = now();
+            parse_clicks(c, camp, rs, ws, we, &mut tmp);
+            pt(9, &mut tm);
+            // keys that miss the mover filter map to themselves without a table lookup. The
+            // filter pass lists the hits without branching on them, the table pass resolves only
+            // those, and both count the person buckets of the final keys on the way.
+            let n = tmp.len();
+            let mut hit = vec![0u32; n + 1];
+            let mut cnt = vec![0u32; PB + 1];
+            let mut m = 0usize;
+            for i in 0..n {
+                if i + RPD < n {
+                    mf.pf(tmp[i + RPD].key);
+                }
+                let k = tmp[i].key;
+                let h = mf.hit(k);
+                hit[m] = i as u32;
+                m += h as usize;
+                cnt[pbk(k) + 1] += (!h) as u32;
+            }
+            for j in 0..m {
+                if j + RPD < m {
+                    tab.pf(tmp[hit[j + RPD] as usize].key);
+                }
+                let i = hit[j] as usize;
+                let k = tab.get(tmp[i].key);
+                tmp[i].key = k;
+                cnt[pbk(k) + 1] += 1;
+            }
+            drop(hit);
+            let r = scatter_counted(&tmp, cnt, |x| pbk(x.key));
+            pt(10, &mut tm);
+            r
+        })
+        .collect()
+}
+
+/// Click records of the whole run, packed or not (`pk_fits`).
+enum Co {
+    P(Vec<(Vec<ClickRec<u64>>, Vec<u32>)>),
+    T(Vec<(Vec<ClickRec<Ck32>>, Vec<u32>)>),
+}
+
+fn ev_after<E: Ev, T: CkT>(
     mut ev_out: Vec<EvChunk<E>>,
     tab: &IdTab,
     mf: &MoverF,
-    click_out: &[(Vec<ClickRec>, Vec<u32>)],
+    click_out: &[(Vec<ClickRec<T>>, Vec<u32>)],
     ws: i64,
     we: i64,
     ncamp: usize,
@@ -3949,7 +4072,7 @@ fn ev_after<E: Ev>(
 
     let offs: Vec<&[u32]> = parts.iter().map(|x| &x.1[..]).collect();
     let cost = pb_cost(&offs, click_out);
-    lpt_run(&cost, || SsW::new(ncamp, d0, nd), |p, w: &mut SsW<E>| {
+    lpt_run(&cost, || SsW::new(ncamp, d0, nd), |p, w: &mut SsW<E, T>| {
         w.gather(p, &parts, click_out);
         let mut uds = Vec::new();
         process_bucket(&mut w.evs, &mut w.tmp, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut uds, &mut w.cm, ws, we.wrapping_sub(ws));
@@ -3961,7 +4084,7 @@ fn ev_after<E: Ev>(
 }
 
 /// Scratch and accumulators of one sessionize worker.
-struct SsW<E> {
+struct SsW<E, T> {
     cm: CampAcc,
     win: Win,
     out: Vec<Vec<UD>>,
@@ -3970,11 +4093,11 @@ struct SsW<E> {
     runs: Vec<Run>,
     srt: Vec<SRun>,
     cnt: Vec<u32>,
-    cl: Vec<ClickRec>,
-    ctmp: Vec<ClickRec>,
+    cl: Vec<ClickRec<T>>,
+    ctmp: Vec<ClickRec<T>>,
 }
 
-impl<E: Ev> SsW<E> {
+impl<E: Ev, T: CkT> SsW<E, T> {
     fn new(ncamp: usize, d0: i64, nd: usize) -> Self {
         SsW {
             cm: CampAcc::new(ncamp + 1, d0, nd),
@@ -3990,7 +4113,7 @@ impl<E: Ev> SsW<E> {
         }
     }
     /// Collects person bucket p's lines and clicks from every chunk.
-    fn gather(&mut self, p: usize, parts: &[(Vec<E>, Vec<u32>)], click_out: &[(Vec<ClickRec>, Vec<u32>)]) {
+    fn gather(&mut self, p: usize, parts: &[(Vec<E>, Vec<u32>)], click_out: &[(Vec<ClickRec<T>>, Vec<u32>)]) {
         let mut tm = now();
         self.cl.clear();
         for (v, o) in click_out.iter() {
@@ -4007,7 +4130,7 @@ impl<E: Ev> SsW<E> {
     /// (digit, key, part, offset) (the order process_runs used to rebuild from the gathered
     /// lines), then copies each run's lines into evs in that order. Runs of one person end up
     /// adjacent and are joined into one Run (sorted if every piece is sorted and the seams are).
-    fn gather_rd(&mut self, p: usize, dparts: &[RdPart<E>], rest: &(Vec<E>, Vec<u32>), click_out: &[(Vec<ClickRec>, Vec<u32>)]) {
+    fn gather_rd(&mut self, p: usize, dparts: &[RdPart<E>], rest: &(Vec<E>, Vec<u32>), click_out: &[(Vec<ClickRec<T>>, Vec<u32>)]) {
         let mut tm = now();
         self.cl.clear();
         for (v, o) in click_out.iter() {
@@ -4142,7 +4265,7 @@ fn rd_scatter(ds: &[RunD]) -> (Vec<RunD>, Vec<u32>, Vec<u32>) {
 
 /// Estimated sessionize work of each person bucket: its lines plus twice its clicks (a click
 /// costs about two lines: radix sort plus window upkeep).
-fn pb_cost(offs: &[&[u32]], click_out: &[(Vec<ClickRec>, Vec<u32>)]) -> Vec<u64> {
+fn pb_cost<T: CkT>(offs: &[&[u32]], click_out: &[(Vec<ClickRec<T>>, Vec<u32>)]) -> Vec<u64> {
     const BLK: usize = 64;
     let mut cost = vec![0u64; PB];
     cost.par_chunks_mut(BLK).enumerate().for_each(|(b, c)| {
@@ -4248,11 +4371,11 @@ fn pb_scatter<E: Ev>(em: &[E]) -> (Vec<E>, Vec<u32>) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn ev_after_idx<E: Ev>(
+fn ev_after_idx<E: Ev, T: CkT>(
     ev_out: Vec<EvChunk<E>>,
     tab: &IdTab,
     mf: &MoverF,
-    click_out: &[(Vec<ClickRec>, Vec<u32>)],
+    click_out: &[(Vec<ClickRec<T>>, Vec<u32>)],
     ws: i64,
     we: i64,
     ncamp: usize,
@@ -4570,7 +4693,7 @@ fn ev_after_idx<E: Ev>(
 
     let offs: Vec<&[u32]> = dparts.iter().map(|x| &x.3[..]).chain(std::iter::once(&rest.1[..])).collect();
     let cost = pb_cost(&offs, click_out);
-    lpt_run(&cost, || SsW::new(ncamp, d0, nd), |p, w: &mut SsW<E>| {
+    lpt_run(&cost, || SsW::new(ncamp, d0, nd), |p, w: &mut SsW<E, T>| {
         w.gather_rd(p, &dparts, &rest, click_out);
         let mut uds = Vec::new();
         process_runs(&w.evs, &mut w.tmp, &w.runs, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut uds, &mut w.cm, ws);
@@ -4595,13 +4718,13 @@ struct Run {
 /// ordered by (digit, key) (gather_rd); a person given as one sorted run is sessionized in place,
 /// any other person (several runs, or a run out of ts order) is gathered and sorted by ts first.
 #[allow(clippy::too_many_arguments)]
-fn process_runs<E: Ev>(
+fn process_runs<E: Ev, T: CkT>(
     evs: &[E],
     tmp: &mut Vec<E>,
     runs: &[Run],
     cnt: &mut Vec<u32>,
-    clicks: &mut Vec<ClickRec>,
-    ctmp: &mut Vec<ClickRec>,
+    clicks: &mut Vec<ClickRec<T>>,
+    ctmp: &mut Vec<ClickRec<T>>,
     win: &mut Win,
     organic: u32,
     uds: &mut Vec<UD>,
@@ -4649,10 +4772,10 @@ fn process_runs<E: Ev>(
 /// process_bucket.
 #[allow(clippy::too_many_arguments)]
 #[inline]
-fn person_sess<E: Ev>(
+fn person_sess<E: Ev, T: CkT>(
     pes: &[E],
     pid: u64,
-    cs: &[ClickRec],
+    cs: &[ClickRec<T>],
     win: &mut Win,
     organic: u32,
     day: &mut DayAcc,
@@ -4660,6 +4783,7 @@ fn person_sess<E: Ev>(
     cm: &mut CampAcc,
     base: i64,
 ) {
+    let tlo = base.wrapping_sub(WEEK);
     let (mut lo, mut hi) = (0usize, 0usize);
     day.key = pid;
     day.day = 0;
@@ -4683,23 +4807,23 @@ fn person_sess<E: Ev>(
             s_day = d;
             s_rev = 0;
             s_purch = false;
-            while hi < cs.len() && cs[hi].ts <= s {
-                win.add(cs[hi].camp);
+            while hi < cs.len() && cs[hi].t.ts(tlo) <= s {
+                win.add(cs[hi].t.camp());
                 hi += 1;
             }
-            while lo < hi && cs[lo].ts < s - WEEK {
-                win.remove(cs[lo].camp);
+            while lo < hi && cs[lo].t.ts(tlo) < s - WEEK {
+                win.remove(cs[lo].t.camp());
                 lo += 1;
             }
             s_camp = if hi > lo {
                 // the clicks at the latest ts; ties are not in click_id order
-                let t = cs[hi - 1].ts;
-                let c0 = cs[hi - 1].camp;
+                let t = cs[hi - 1].t.ts(tlo);
+                let c0 = cs[hi - 1].t.camp();
                 let mut g = hi - 1;
                 let mut mixed = false;
-                while g > lo && cs[g - 1].ts == t {
+                while g > lo && cs[g - 1].t.ts(tlo) == t {
                     g -= 1;
-                    mixed |= cs[g].camp != c0;
+                    mixed |= cs[g].t.camp() != c0;
                 }
                 if mixed {
                     min_cid_camp(&cs[g..hi])
@@ -5472,45 +5596,12 @@ fn main() {
     let mut tm = now();
     let mf = MoverF::build(&tab);
     pt(4, &mut tm);
-    let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_chunks
-        .par_iter()
-        .map(|&c| {
-            let mut tmp: Vec<ClickRec> = Vec::with_capacity(c.len() / 40);
-            let mut tm = now();
-            parse_clicks(c, &camp, &rs, ws, we, &mut tmp);
-            pt(9, &mut tm);
-            // keys that miss the mover filter map to themselves without a table lookup. The
-            // filter pass lists the hits without branching on them, the table pass resolves only
-            // those, and both count the person buckets of the final keys on the way.
-            let n = tmp.len();
-            let mut hit = vec![0u32; n + 1];
-            let mut cnt = vec![0u32; PB + 1];
-            let mut m = 0usize;
-            for i in 0..n {
-                if i + RPD < n {
-                    mf.pf(tmp[i + RPD].key);
-                }
-                let k = tmp[i].key;
-                let h = mf.hit(k);
-                hit[m] = i as u32;
-                m += h as usize;
-                cnt[pbk(k) + 1] += (!h) as u32;
-            }
-            for j in 0..m {
-                if j + RPD < m {
-                    tab.pf(tmp[hit[j + RPD] as usize].key);
-                }
-                let i = hit[j] as usize;
-                let k = tab.get(tmp[i].key);
-                tmp[i].key = k;
-                cnt[pbk(k) + 1] += 1;
-            }
-            drop(hit);
-            let r = scatter_counted(&tmp, cnt, |x| pbk(x.key));
-            pt(10, &mut tm);
-            r
-        })
-        .collect();
+    // 24-byte packed click records when every campaign index and kept ts fits, else 32 bytes
+    let click_out = if pk_fits(ncamp, ws, we) && std::env::var_os("SHOP_CK32").is_none() {
+        Co::P(parse_all_clicks(&click_chunks, &camp, &rs, ws, we, &mf, &tab))
+    } else {
+        Co::T(parse_all_clicks(&click_chunks, &camp, &rs, ws, we, &mf, &tab))
+    };
     tick("clicks parsed");
     match &ev_out {
         Evs::L(v) => fbn_merge(v, &mut names_map),
@@ -5520,9 +5611,11 @@ fn main() {
     // person buckets
     let d0 = ws.div_euclid(DAY);
     let nd = if we > ws { ((we - 1).div_euclid(DAY) - d0 + 1) as usize } else { 0 };
-    let results = match ev_out {
-        Evs::L(v) => ev_after(v, &tab, &mf, &click_out, ws, we, ncamp, d0, nd, &tick),
-        Evs::W(v) => ev_after(v, &tab, &mf, &click_out, ws, we, ncamp, d0, nd, &tick),
+    let results = match (ev_out, &click_out) {
+        (Evs::L(v), Co::P(c)) => ev_after(v, &tab, &mf, c, ws, we, ncamp, d0, nd, &tick),
+        (Evs::W(v), Co::P(c)) => ev_after(v, &tab, &mf, c, ws, we, ncamp, d0, nd, &tick),
+        (Evs::L(v), Co::T(c)) => ev_after(v, &tab, &mf, c, ws, we, ncamp, d0, nd, &tick),
+        (Evs::W(v), Co::T(c)) => ev_after(v, &tab, &mf, c, ws, we, ncamp, d0, nd, &tick),
     };
     tick("sessionized");
 
@@ -5895,7 +5988,10 @@ mod tests {
         let mut r = Rng(0x3c6e_f372_fe94_f82b);
         let mut text = Vec::new();
         let (mut cases, mut lines, mut total, mut fast_lines) = (0u64, 0u64, 0u64, 0u64);
-        let key = |v: &[ClickRec]| v.iter().map(|c| (c.key, c.ts, c.cid, c.camp)).collect::<Vec<_>>();
+        fn key<T: CkT>(v: &[ClickRec<T>], tlo: i64) -> Vec<(u64, i64, u64, u32)> {
+            v.iter().map(|c| (c.key, c.t.ts(tlo), c.cid, c.t.camp())).collect()
+        }
+        let mut packed = 0u64;
         for _ in 0..200_000 {
             text.clear();
             if r.chance(20) {
@@ -5926,18 +6022,27 @@ mod tests {
                 1 => (-(1i64 << 62), 1i64 << 62),
                 _ => (w0 - 3 * DAY, w0 + 3 * DAY),
             };
-            let mut want = vec![];
+            let tlo = ws - WEEK;
+            let mut want: Vec<ClickRec<Ck32>> = vec![];
             parse_clicks_old(chunk, &camp, &rs, ws, we, &mut want);
             SCAN7_FAST.with(|c| c.set(0));
-            let mut got = vec![];
+            let mut got: Vec<ClickRec<Ck32>> = vec![];
             parse_clicks(chunk, &camp, &rs, ws, we, &mut got);
             fast_lines += SCAN7_FAST.with(|c| c.replace(0));
-            assert_eq!(key(&got), key(&want), "case {cases} ws {ws} we {we}: {:?}", String::from_utf8_lossy(chunk));
+            assert_eq!(key(&got, tlo), key(&want, tlo), "case {cases} ws {ws} we {we}: {:?}", String::from_utf8_lossy(chunk));
+            if pk_fits(names.len(), ws, we) {
+                let (mut gp, mut wp): (Vec<ClickRec<u64>>, Vec<ClickRec<u64>>) = (vec![], vec![]);
+                parse_clicks(chunk, &camp, &rs, ws, we, &mut gp);
+                parse_clicks_old(chunk, &camp, &rs, ws, we, &mut wp);
+                assert_eq!(key(&gp, tlo), key(&want, tlo), "packed case {cases} ws {ws} we {we}: {:?}", String::from_utf8_lossy(chunk));
+                assert_eq!(key(&wp, tlo), key(&want, tlo), "packed old case {cases}");
+                packed += 1;
+            }
             cases += 1;
             total += want.len() as u64;
         }
-        eprintln!("parse_clicks test: {cases} chunks, {lines} lines, {total} records, {fast_lines} lines via the kernel");
-        assert!(total > 300_000 && fast_lines > lines / 2);
+        eprintln!("parse_clicks test: {cases} chunks ({packed} also packed), {lines} lines, {total} records, {fast_lines} lines via the kernel");
+        assert!(total > 300_000 && fast_lines > lines / 2 && packed > cases / 2 && packed < cases);
     }
 
     /// IdLookup::get_fast2 returns exactly what get returns, for ids near and far from canonical
@@ -6794,8 +6899,31 @@ mod ck_sort_tests {
         *s
     }
 
-    fn mk(key: u64, ts: i64, id: B, camp: u32) -> ClickRec {
-        ClickRec { key, ts, cid: pack(id), camp }
+    fn mk<T: CkT>(key: u64, ts: i64, id: B, camp: u32, tlo: i64) -> ClickRec<T> {
+        ClickRec { key, t: T::mk(ts, camp, tlo), cid: pack(id) }
+    }
+
+    /// sort_clicks and sort_clicks_rdx on clicks (key, ts, click_id, camp) as records of type T
+    fn sort_check<T: CkT>(raw: &[(u64, i64, B, u32)], tlo: i64, ci: usize) {
+        let v: Vec<ClickRec<T>> = raw.iter().map(|&(k, t, id, c)| mk(k, t, id, c, tlo)).collect();
+        // the contract: a permutation of the input in (dg, key, ts) order; equal (key, ts) in
+        // any order, so both sides are compared after a full sort that includes click_id and camp
+        let full = |v: &[ClickRec<T>]| {
+            let mut d: Vec<_> = v.iter().map(|c| (dg(c.key), c.key, c.t.ts(tlo), unpack(c.cid).to_vec(), c.t.camp())).collect();
+            d.sort();
+            d
+        };
+        let ord = |v: &[ClickRec<T>]| v.windows(2).all(|w| (dg(w[0].key), w[0].key, w[0].t.ts(tlo)) <= (dg(w[1].key), w[1].key, w[1].t.ts(tlo)));
+        let want = full(&v);
+        let (mut tmp, mut cnt) = (vec![], vec![]);
+        let mut a = v.clone();
+        sort_clicks(&mut a, &mut tmp, &mut cnt);
+        assert!(ord(&a), "sort_clicks order case {ci} sh {}", T::SH);
+        assert!(full(&a) == want, "sort_clicks case {ci} sh {}", T::SH);
+        let mut b = v.clone();
+        assert!(sort_clicks_rdx(&mut b, &mut tmp, &mut cnt), "rdx fits case {ci} sh {}", T::SH);
+        assert!(ord(&b), "sort_clicks_rdx order case {ci} sh {}", T::SH);
+        assert!(full(&b) == want, "sort_clicks_rdx case {ci} sh {}", T::SH);
     }
 
     #[test]
@@ -6821,38 +6949,96 @@ mod ck_sort_tests {
         for (ci, &(n, nk, span, step, far)) in cases.iter().enumerate() {
             let keys: Vec<u64> = (0..nk).map(|_| rnd(&mut s)).collect();
             let base = if ci % 2 == 0 { 1_830_000_000_000i64 } else { -5_000_000_000 };
-            let mut v: Vec<ClickRec> = (0..n)
+            let mut v: Vec<(u64, i64, B, u32)> = (0..n)
                 .map(|j| {
                     let k = keys[(rnd(&mut s) % nk) as usize];
                     let t = base + (rnd(&mut s) % (span as u64 / step as u64 + 1)) as i64 * step;
                     let t = if far && j == n / 2 { base + (1i64 << 40) } else { t };
-                    mk(k, t, &ids[(rnd(&mut s) % ids.len() as u64) as usize], j as u32)
+                    (k, t, &ids[(rnd(&mut s) % ids.len() as u64) as usize][..], j as u32)
                 })
                 .collect();
             if ci == 3 {
                 // one clicker, one quantum, reversed: the insertion sort must give up
-                v.sort_by(|a, b| b.ts.cmp(&a.ts));
+                v.sort_by(|a, b| b.1.cmp(&a.1));
             }
-            // the contract: a permutation of the input in (dg, key, ts) order; equal (key, ts) in
-            // any order, so both sides are compared after a full sort that includes click_id and camp
-            let full = |v: &mut Vec<ClickRec>| {
-                v.sort_by(|a, b| (dg(a.key), a.key, a.ts).cmp(&(dg(b.key), b.key, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid))).then(a.camp.cmp(&b.camp)))
-            };
-            let mut want = v.clone();
-            full(&mut want);
-            let f = |v: &[ClickRec]| v.iter().map(|c| (c.key, c.ts, unpack(c.cid).to_vec(), c.camp)).collect::<Vec<_>>();
-            let ord = |v: &[ClickRec]| v.windows(2).all(|w| (dg(w[0].key), w[0].key, w[0].ts) <= (dg(w[1].key), w[1].key, w[1].ts));
-            let (mut tmp, mut cnt) = (vec![], vec![]);
-            let mut a = v.clone();
+            sort_check::<Ck32>(&v, 0, ci);
+            sort_check::<u64>(&v, base, ci);
+        }
+    }
+
+    #[test]
+    fn packed_click_guard() {
+        let w0 = days_from_civil(2026, 9, 6) * DAY;
+        let lim = 1i64 << (64 - CB);
+        assert!(pk_fits(2000, w0, w0 + 14 * DAY));
+        assert!(pk_fits(1 << CB, w0, w0 + 14 * DAY));
+        assert!(!pk_fits((1 << CB) + 1, w0, w0 + 14 * DAY));
+        // kept ts lie in [ws - WEEK, we): a span of exactly 2^(64-CB) still fits
+        assert!(pk_fits(2000, w0, w0 - WEEK + lim));
+        assert!(!pk_fits(2000, w0, w0 - WEEK + lim + 1));
+        assert!(!pk_fits(2000, -(1i64 << 62), 1i64 << 62));
+        assert!(!pk_fits(2000, i64::MIN, i64::MAX));
+        assert!(pk_fits(0, w0, w0));
+        // the extremes of a fitting run round-trip, with the largest campaign index
+        let (ws, we) = (w0, w0 - WEEK + lim);
+        for &(t, c) in &[(ws - WEEK, 0u32), (we - 1, (1 << CB) - 1), (ws, 1999), (we - 1, 0), (ws - WEEK, (1 << CB) - 1)] {
+            let p = u64::mk(t, c, ws - WEEK);
+            assert_eq!((p.ts(ws - WEEK), p.camp()), (t, c));
+        }
+        // packed order is (ts, camp) order
+        let a = u64::mk(we - 2, (1 << CB) - 1, ws - WEEK);
+        let b = u64::mk(we - 1, 0, ws - WEEK);
+        assert!(a.sv() < b.sv());
+        assert!(Ck32::mk(-5, 0, 0).sv() < Ck32::mk(3, 0, 0).sv() && Ck32::mk(i64::MIN, 0, 0).sv() < Ck32::mk(i64::MAX, 0, 0).sv());
+    }
+
+    /// The 32-byte fallback and the packed records give the same sessions and attribution.
+    #[test]
+    fn packed_and_fallback_clicks_agree() {
+        let mut s = 0x5eed_0f_c11c_c0deu64;
+        let ids: &'static [Vec<u8>] = Vec::leak((0..300)
+            .map(|_| {
+                let l = 1 + (rnd(&mut s) % 6) as usize;
+                (0..l).map(|_| b"ab0 z"[(rnd(&mut s) % 5) as usize]).collect()
+            })
+            .collect::<Vec<Vec<u8>>>());
+        let ws = days_from_civil(2026, 9, 6) * DAY;
+        let tlo = ws - WEEK;
+        for round in 0..300 {
+            let n = 1 + (rnd(&mut s) % 400) as usize;
+            let nk = 1 + rnd(&mut s) % 6;
+            let span = [60_000u64, 3 * DAY as u64, 21 * DAY as u64][round % 3];
+            let raw: Vec<(u64, i64, B, u32)> = (0..n)
+                .map(|_| {
+                    let i = (rnd(&mut s) % ids.len() as u64) as usize;
+                    (100 + rnd(&mut s) % nk, tlo + (rnd(&mut s) % span) as i64, &ids[i][..], (rnd(&mut s) % 2000) as u32)
+                })
+                .collect();
+            let mut a: Vec<ClickRec<Ck32>> = raw.iter().map(|&(k, t, id, c)| mk(k, t, id, c, tlo)).collect();
+            let mut b: Vec<ClickRec<u64>> = raw.iter().map(|&(k, t, id, c)| mk(k, t, id, c, tlo)).collect();
+            let (mut tmp, mut tmp2, mut cnt) = (vec![], vec![], vec![]);
             sort_clicks(&mut a, &mut tmp, &mut cnt);
-            assert!(ord(&a), "sort_clicks order case {ci}");
-            full(&mut a);
-            assert!(f(&a) == f(&want), "sort_clicks case {ci}");
-            let mut b = v.clone();
-            assert!(sort_clicks_rdx(&mut b, &mut tmp, &mut cnt), "rdx fits case {ci}");
-            assert!(ord(&b), "sort_clicks_rdx order case {ci}");
-            full(&mut b);
-            assert!(f(&b) == f(&want), "sort_clicks_rdx case {ci}");
+            sort_clicks(&mut b, &mut tmp2, &mut cnt);
+            // per (key, ts) group: the same clicks, and the same smallest-click_id campaign
+            let grp = |k: u64, t: i64| -> (Vec<(Vec<u8>, u32)>, Vec<(Vec<u8>, u32)>, u32, u32) {
+                let ga: Vec<ClickRec<Ck32>> = a.iter().copied().filter(|c| c.key == k && c.t.ts(tlo) == t).collect();
+                let gb: Vec<ClickRec<u64>> = b.iter().copied().filter(|c| c.key == k && c.t.ts(tlo) == t).collect();
+                let mut sa: Vec<_> = ga.iter().map(|c| (unpack(c.cid).to_vec(), c.t.camp())).collect();
+                let mut sb: Vec<_> = gb.iter().map(|c| (unpack(c.cid).to_vec(), c.t.camp())).collect();
+                sa.sort();
+                sb.sort();
+                (sa, sb, min_cid_camp(&ga), min_cid_camp(&gb))
+            };
+            let da: Vec<(u64, i64)> = a.iter().map(|c| (c.key, c.t.ts(tlo))).collect();
+            let db: Vec<(u64, i64)> = b.iter().map(|c| (c.key, c.t.ts(tlo))).collect();
+            assert_eq!(da, db, "round {round}");
+            let mut seen = da.clone();
+            seen.dedup();
+            for &(k, t) in seen.iter().take(40) {
+                let (sa, sb, ma, mb) = grp(k, t);
+                assert_eq!(sa, sb, "round {round}");
+                assert_eq!(ma, mb, "round {round}");
+            }
         }
     }
 
@@ -6868,14 +7054,16 @@ mod ck_sort_tests {
         for _ in 0..20000 {
             let n = 2 + (rnd(&mut s) % 6) as usize;
             // copies of one click share their campaign
-            let g: Vec<ClickRec> = (0..n)
+            let g: Vec<ClickRec<Ck32>> = (0..n)
                 .map(|_| {
                     let i = (rnd(&mut s) % ids.len() as u64) as usize;
-                    mk(7, 0, &ids[i], (i % 3) as u32)
+                    mk(7, 0, &ids[i], (i % 3) as u32, 0)
                 })
                 .collect();
-            let want = g.iter().min_by(|a, b| unpack(a.cid).cmp(unpack(b.cid))).unwrap().camp;
+            let want = g.iter().min_by(|a, b| unpack(a.cid).cmp(unpack(b.cid))).unwrap().t.camp;
             assert_eq!(min_cid_camp(&g), want);
+            let gp: Vec<ClickRec<u64>> = g.iter().map(|c| ClickRec { key: c.key, t: u64::mk(c.t.ts, c.t.camp, -WEEK), cid: c.cid }).collect();
+            assert_eq!(min_cid_camp(&gp), want);
         }
     }
 }
