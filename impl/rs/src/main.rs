@@ -1278,6 +1278,29 @@ fn bucketize<T: Copy>(v: &[T], nb: usize, bk: impl Fn(&T) -> usize) -> (Vec<T>, 
     (out, cnt)
 }
 
+/// `bucketize` when the bucket counts are already known: `cnt[b + 1]` = the number of items in
+/// bucket `b` (`cnt[0]` = 0); returns (vec ordered by bucket, offsets[nb+1]).
+fn scatter_counted<T: Copy>(v: &[T], mut cnt: Vec<u32>, bk: impl Fn(&T) -> usize) -> (Vec<T>, Vec<u32>) {
+    let nb = cnt.len() - 1;
+    for i in 0..nb {
+        cnt[i + 1] += cnt[i];
+    }
+    debug_assert_eq!(cnt[nb] as usize, v.len());
+    let mut w = cnt.clone();
+    let mut out: Vec<T> = Vec::with_capacity(v.len());
+    {
+        let sp: &mut [MaybeUninit<T>] = out.spare_capacity_mut();
+        for x in v {
+            let b = bk(x);
+            sp[w[b] as usize].write(*x);
+            w[b] += 1;
+        }
+    }
+    assert_eq!(cnt[nb] as usize, v.len());
+    unsafe { out.set_len(v.len()) };
+    (out, cnt)
+}
+
 #[inline(always)]
 fn pbk(key: u64) -> usize {
     (mix(key) >> 20) as usize & (PB - 1)
@@ -3632,24 +3655,34 @@ fn main() {
                 tmp.push(ClickRec { key: ukey(&rs, uid), ts: t, cid: pack(cid), camp: ci });
             });
             pt(9, &mut tm);
-            // keys that miss the mover filter map to themselves without a table lookup
+            // keys that miss the mover filter map to themselves without a table lookup. The
+            // filter pass lists the hits without branching on them, the table pass resolves only
+            // those, and both count the person buckets of the final keys on the way.
             let n = tmp.len();
+            let mut hit = vec![0u32; n + 1];
+            let mut cnt = vec![0u32; PB + 1];
+            let mut m = 0usize;
             for i in 0..n {
-                if i + 2 * RPD < n {
-                    mf.pf(tmp[i + 2 * RPD].key);
-                }
                 if i + RPD < n {
-                    let k = tmp[i + RPD].key;
-                    if mf.hit(k) {
-                        tab.pf(k);
-                    }
+                    mf.pf(tmp[i + RPD].key);
                 }
                 let k = tmp[i].key;
-                if mf.hit(k) {
-                    tmp[i].key = tab.get(k);
-                }
+                let h = mf.hit(k);
+                hit[m] = i as u32;
+                m += h as usize;
+                cnt[pbk(k) + 1] += (!h) as u32;
             }
-            let r = bucketize(&tmp, PB, |x| pbk(x.key));
+            for j in 0..m {
+                if j + RPD < m {
+                    tab.pf(tmp[hit[j + RPD] as usize].key);
+                }
+                let i = hit[j] as usize;
+                let k = tab.get(tmp[i].key);
+                tmp[i].key = k;
+                cnt[pbk(k) + 1] += 1;
+            }
+            drop(hit);
+            let r = scatter_counted(&tmp, cnt, |x| pbk(x.key));
             pt(10, &mut tm);
             r
         })
@@ -4155,6 +4188,24 @@ mod tests {
         }
         eprintln!("sol test random: {recs} records, {purch} priced");
         assert!(recs > 1_000_000 && purch > 10_000);
+    }
+    #[test]
+    fn scatter_counted_matches_bucketize() {
+        let mut r = Rng(0x5eed_0bad_cafe_f00d);
+        for case in 0..200 {
+            let nb = 1usize << (r.below(11) as u32);
+            let n = r.below(if case % 4 == 0 { 50_000 } else { 300 }) as usize;
+            let v: Vec<(u64, u32)> = (0..n).map(|i| (r.next(), i as u32)).collect();
+            let bk = |x: &(u64, u32)| (mix(x.0) >> 20) as usize & (nb - 1);
+            let mut cnt = vec![0u32; nb + 1];
+            for x in &v {
+                cnt[bk(x) + 1] += 1;
+            }
+            let (a, ao) = bucketize(&v, nb, bk);
+            let (b, bo) = scatter_counted(&v, cnt, bk);
+            assert_eq!(ao, bo);
+            assert!(a.iter().zip(&b).all(|(x, y)| x == y), "nb={nb} n={n}");
+        }
     }
 }
 
