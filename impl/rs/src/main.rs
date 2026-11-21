@@ -865,12 +865,16 @@ fn drop_inputs() {
         let _ = unsafe { m.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, o, n) };
     });
 }
-/// SHOP_DROPANON=1: also release the big anonymous read-write regions (allocator arenas) in parallel
-/// before exit, so the single-threaded exit_mmap has fewer pages to free.
+/// SHOP_DROPANON=1: release the big anonymous read-write regions (allocator arenas) on all cores and
+/// leave with _exit, so the single-threaded exit_mmap has fewer pages to free. The arenas hold the
+/// allocator's own metadata, so nothing may allocate once they are zapped: the helper threads are
+/// created and parked first, then spin on atomics only, and the caller never returns.
 #[cfg(target_os = "linux")]
-fn drop_anon() {
+fn drop_anon_exit() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::*};
     extern "C" {
         fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+        fn _exit(code: i32) -> !;
     }
     let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
     let mut parts: Vec<(usize, usize)> = vec![];
@@ -878,11 +882,7 @@ fn drop_anon() {
     for l in maps.lines() {
         let mut it = l.split_whitespace();
         let (Some(range), Some(perm)) = (it.next(), it.next()) else { continue };
-        if perm != "rw-p" {
-            continue;
-        }
-        let rest: Vec<&str> = l.split_whitespace().skip(5).collect();
-        if !rest.is_empty() {
+        if perm != "rw-p" || l.split_whitespace().count() > 5 {
             continue; // file-backed or named (stack, heap)
         }
         let Some((a, b)) = range.split_once('-') else { continue };
@@ -897,14 +897,49 @@ fn drop_anon() {
             o += n;
         }
     }
-    parts.par_iter().for_each(|&(o, n)| unsafe {
-        madvise(o as *mut std::ffi::c_void, n, 4); // MADV_DONTNEED
-    });
+    let nt = rayon::current_num_threads().max(1);
+    let parts: &'static [(usize, usize)] = Box::leak(parts.into_boxed_slice());
+    let ready: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+    let done: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+    let go: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+    let mut spawned = 0;
+    for t in 1..nt {
+        let r = std::thread::Builder::new().spawn(move || {
+            ready.fetch_add(1, SeqCst);
+            while !go.load(Acquire) {
+                std::hint::spin_loop();
+            }
+            let mut i = t;
+            while i < parts.len() {
+                unsafe { madvise(parts[i].0 as *mut std::ffi::c_void, parts[i].1, 4) };
+                i += nt;
+            }
+            done.fetch_add(1, SeqCst);
+            loop {
+                std::hint::spin_loop();
+            }
+        });
+        if r.is_ok() {
+            spawned += 1;
+        }
+    }
+    while ready.load(Acquire) < spawned {
+        std::hint::spin_loop();
+    }
+    // threads that failed to spawn leave their stride unprocessed, which is only a speed loss
+    go.store(true, Release);
+    let mut i = 0;
+    while i < parts.len() {
+        unsafe { madvise(parts[i].0 as *mut std::ffi::c_void, parts[i].1, 4) };
+        i += nt;
+    }
+    while done.load(Acquire) < spawned {
+        std::hint::spin_loop();
+    }
+    unsafe { _exit(0) }
 }
 #[cfg(not(target_os = "linux"))]
 fn drop_inputs() {}
-#[cfg(not(target_os = "linux"))]
-fn drop_anon() {}
 
 fn leak_file(p: &Path) -> Option<B> {
     let f = File::open(p).ok()?;
@@ -4987,16 +5022,9 @@ fn main() {
     if std::env::var("SHOP_DROPIN").map_or(true, |v| v != "off") {
         let t = ep();
         drop_inputs();
+        #[cfg(target_os = "linux")]
         if std::env::var_os("SHOP_DROPANON").is_some() {
-            drop_anon();
-            // allocator metadata lives in the zeroed arenas: skip its exit handlers
-            #[cfg(target_os = "linux")]
-            {
-                extern "C" {
-                    fn _exit(code: i32) -> !;
-                }
-                unsafe { _exit(0) }
-            }
+            drop_anon_exit();
         }
         if timing {
             eprintln!("dropin end {:.3}s", ep() - t);
