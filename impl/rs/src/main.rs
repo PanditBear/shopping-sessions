@@ -15,8 +15,9 @@ const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 1_800_000;
 const CHUNK: usize = 4 << 20;
-const EBB: u32 = 9;
+const EBB: u32 = 11;
 const EB: usize = 1 << EBB; // event dedup buckets (by event_id)
+const DDG: usize = 4; // event_id buckets per dedup task
 const PBB: u32 = 10;
 const PB: usize = 1 << PBB; // person buckets
 
@@ -1536,46 +1537,68 @@ fn main() {
         r
     };
 
-    // dedup per event_id bucket -> person buckets
-    let mut dd: Vec<(Vec<EvOut>, Vec<u32>)> = (0..EB)
+    // dedup per event_id bucket -> person buckets. Each task takes DDG consecutive event_id
+    // buckets, one small (L2-sized) table at a time, and resolves and buckets them together.
+    let mut dd: Vec<(Vec<EvOut>, Vec<u32>)> = (0..EB / DDG)
         .into_par_iter()
-        .map(|b| {
+        .map(|g| {
             let mut tm = now();
-            let total: usize = ev_out.iter().map(|c| (c.1[b + 1] - c.1[b]) as usize).sum();
-            let cap = (total * 2).max(16).next_power_of_two();
-            let mask = cap - 1;
-            let mut t: Vec<(u64, *const EvRec)> = vec![(0, std::ptr::null()); cap];
-            for c in &ev_out {
-                for r in &c.0[c.1[b] as usize..c.1[b + 1] as usize] {
-                    let mut p = (mix(r.eid) >> 8) as usize & mask;
-                    loop {
-                        let o = &mut t[p];
-                        if o.0 == 0 {
-                            *o = (r.eid, r as *const EvRec);
-                            break;
-                        }
-                        if o.0 == r.eid {
-                            if r.ingest < unsafe { (*o.1).ingest } {
-                                o.1 = r as *const EvRec;
+            let totals: [usize; DDG] =
+                std::array::from_fn(|i| ev_out.iter().map(|c| (c.1[g * DDG + i + 1] - c.1[g * DDG + i]) as usize).sum());
+            let maxcap = (totals.iter().max().unwrap() * 2).max(16).next_power_of_two();
+            let mut tbuf: Vec<(u64, *const EvRec)> = vec![(0, std::ptr::null()); maxcap];
+            let mut sv: Vec<EvOut> = Vec::with_capacity(totals.iter().sum());
+            for (i, &total) in totals.iter().enumerate() {
+                let b = g * DDG + i;
+                let cap = (total * 2).max(16).next_power_of_two();
+                let mask = cap - 1;
+                let t = &mut tbuf[..cap];
+                if i > 0 {
+                    t.fill((0, std::ptr::null()));
+                }
+                for c in &ev_out {
+                    for r in &c.0[c.1[b] as usize..c.1[b + 1] as usize] {
+                        let mut p = (mix(r.eid) >> 8) as usize & mask;
+                        loop {
+                            let o = &mut t[p];
+                            if o.0 == 0 {
+                                *o = (r.eid, r as *const EvRec);
+                                break;
                             }
-                            break;
+                            if o.0 == r.eid {
+                                if r.ingest < unsafe { (*o.1).ingest } {
+                                    o.1 = r as *const EvRec;
+                                }
+                                break;
+                            }
+                            p = (p + 1) & mask;
                         }
-                        p = (p + 1) & mask;
                     }
                 }
-            }
-            pt(2, &mut tm);
-            let mut sv: Vec<EvOut> = Vec::with_capacity(total);
-            for &(k, rp) in &t {
-                if k != 0 {
-                    let r = unsafe { &*rp };
-                    if r.meta & META_OK != 0 {
-                        sv.push(EvOut { key: r.uid, ts: r.ts, meta: r.meta });
+                pt(2, &mut tm);
+                // Second pass in record order (sequential reads, no pointer chasing): a record is
+                // kept when it is valid and is the one its event_id's slot points to.
+                for c in &ev_out {
+                    for r in &c.0[c.1[b] as usize..c.1[b + 1] as usize] {
+                        if r.meta & META_OK == 0 {
+                            continue;
+                        }
+                        let mut p = (mix(r.eid) >> 8) as usize & mask;
+                        loop {
+                            let o = unsafe { t.get_unchecked(p) };
+                            if o.0 == r.eid {
+                                if std::ptr::eq(o.1, r) {
+                                    sv.push(EvOut { key: r.uid, ts: r.ts, meta: r.meta });
+                                }
+                                break;
+                            }
+                            p = (p + 1) & mask;
+                        }
                     }
                 }
+                pt(3, &mut tm);
             }
-            drop(t);
-            pt(3, &mut tm);
+            drop(tbuf);
             resolve_out(sv)
         })
         .collect();
