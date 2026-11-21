@@ -6,8 +6,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends musl-tools \
 WORKDIR /src
 COPY impl/rs/Cargo.toml impl/rs/Cargo.lock ./
 COPY impl/rs/src ./src
+COPY impl/rs/pgo/merged.profdata /pgo/merged.profdata
+# PGO: merged.profdata was recorded with the pinned toolchain above (LLVM 23.1.5) on this source tree.
 # x86-64-v3 (AVX2): the scorer's machines are Cascade Lake or newer.
-RUN CC_x86_64_unknown_linux_musl=musl-gcc RUSTFLAGS="-C target-cpu=x86-64-v3" \
+RUN CC_x86_64_unknown_linux_musl=musl-gcc RUSTFLAGS="-C target-cpu=x86-64-v3 -C profile-use=/pgo/merged.profdata -C llvm-args=-pgo-warn-mismatch=false" \
     cargo build --release --locked --target x86_64-unknown-linux-musl \
  && cp target/x86_64-unknown-linux-musl/release/shop /shop
 
