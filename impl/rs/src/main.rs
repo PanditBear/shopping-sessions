@@ -4248,6 +4248,13 @@ fn pb_scatter<E: Ev>(em: &[E]) -> (Vec<E>, Vec<u32>) {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Slot<E: Ev> {
+    h: u64,
+    e: E,
+}
+
 fn ev_after_idx<E: Ev>(
     ev_out: Vec<EvChunk<E>>,
     tab: &IdTab,
@@ -4315,8 +4322,9 @@ fn ev_after_idx<E: Ev>(
                     .into_par_iter()
                     .map(|g| {
                         let mut tm = now();
-                        let mut t: Vec<u64> = vec![u64::MAX; span];
-                        let mut lb: Vec<E> = Vec::new();
+                        // one slot per index: header (ingest << 32 | record number) and the winning record
+                        let mut t: Vec<Slot<E>> = Vec::with_capacity(span);
+                        t.resize(span, Slot { h: u64::MAX, e: E::nil() });
                         let mut lg: Vec<u64> = Vec::new();
                         // em outlives the task (sessionize reads its runs), so size it once from the
                         // record counts instead of growing it by doubling
@@ -4337,7 +4345,7 @@ fn ev_after_idx<E: Ev>(
                         let (mut rk, mut rs, mut rok, mut lts) = (0u64, 0usize, true, 0u64);
                         let mut pc = PkCache { k: [0; 4], p: [0; 4], n: 0 };
                         for b in g * G..((g + 1) * G).min(ndb) {
-                            lb.clear();
+                            let mut nq = 0u32;
                             lg.clear();
                             for (ci, c) in ev_out.iter().enumerate() {
                                 // each chunk keeps bucket b in its own far-off stretch: fetch the count a few
@@ -4362,44 +4370,39 @@ fn ev_after_idx<E: Ev>(
                                         if let Some(y) = part.get(j + 16) {
                                             prefetch(t.as_ptr().wrapping_add((y.i as u64 & mask) as usize) as *const u8);
                                         }
-                                        let q = lb.len() as u32;
-                                        lb.push(x.e);
+                                        let q = nq;
+                                        nq += 1;
                                         if dside_any {
                                             lg.push(((ci as u64) << 32) | (p0 + j) as u64);
                                         }
                                         let pk = ((x.ing as u64) << 32) | q as u64;
                                         // SAFETY: the slot index is masked to span
                                         let o = unsafe { t.get_unchecked_mut((x.i as u64 & mask) as usize) };
-                                        if *o == u64::MAX {
-                                            *o = pk;
+                                        if o.h == u64::MAX {
+                                            o.h = pk;
+                                            o.e = x.e;
                                             continue;
                                         }
-                                        let ok = (*o >> 32) as u32;
+                                        let ok = (o.h >> 32) as u32;
                                         if x.ing < ok
                                             || (x.ing == ok
                                                 && dside_any
-                                                && dexact(lg[q as usize], x.ing) < dexact(lg[*o as u32 as usize], ok))
+                                                && dexact(lg[q as usize], x.ing) < dexact(lg[o.h as u32 as usize], ok))
                                         {
-                                            *o = pk;
+                                            o.h = pk;
+                                            o.e = x.e;
                                         }
                                     }
                                 }
                             }
                             pt(2, &mut tm);
-                            if !lb.is_empty() {
-                                const PD: usize = 16;
+                            if nq != 0 {
                                 let tl = t.len();
                                 for j in 0..tl {
-                                    if j + PD < tl {
-                                        let n = t[j + PD];
-                                        if n != u64::MAX {
-                                            prefetch(lb.as_ptr().wrapping_add(n as u32 as usize) as *const u8);
-                                        }
-                                    }
                                     let o = &mut t[j];
-                                    if *o != u64::MAX {
-                                        let mut e = lb[*o as u32 as usize];
-                                        *o = u64::MAX;
+                                    if o.h != u64::MAX {
+                                        let mut e = o.e;
+                                        o.h = u64::MAX;
                                         let k = e.key();
                                         if k != 0 {
                                             let pk = pk_of(&mut pc, k, tab, mf);
