@@ -3671,7 +3671,17 @@ fn ev_after_idx<E: Ev>(
                             }
                             pt(2, &mut tm);
                             if !lb.is_empty() {
-                                for o in t.iter_mut() {
+                                // the slots are in index order and lb is in file order, so each slot reads a random
+                                // record: fetch the record of a slot a little way ahead
+                                const D: usize = 16;
+                                for i in 0..span {
+                                    // SAFETY: both slot indexes are masked to span; a slot that wraps to the front was
+                                    // already cleared, so it fetches nothing
+                                    let nx = unsafe { *t.get_unchecked((i + D) & (span - 1)) };
+                                    if nx != u64::MAX {
+                                        prefetch(lb.as_ptr().wrapping_add(nx as u32 as usize));
+                                    }
+                                    let o = unsafe { t.get_unchecked_mut(i) };
                                     if *o != u64::MAX {
                                         let mut e = lb[*o as u32 as usize];
                                         *o = u64::MAX;
