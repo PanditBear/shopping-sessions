@@ -2039,11 +2039,10 @@ fn ev_after<E: Ev>(
 
 /// Scatter the kept lines of `m` (key != 0) by person bucket; `cnt` holds the PB + 1 bucket starts.
 /// 16-byte records use software write-combining: each bucket stages its records in a 64-byte line
-/// buffer whose slots follow the output's line alignment, and a full line goes out as one
-/// non-temporal store (no read-for-ownership; the output is read back much later, so caching it
-/// buys nothing). The bucket owning a line's last slot writes the line; slots before that bucket's
-/// start hold stale data and belong to earlier buckets, whose partial last lines are written with
-/// plain stores after a fence.
+/// buffer whose slots follow the output's line alignment, and a full line goes out as two aligned
+/// 32-byte stores. The bucket owning a line's last slot writes the line; slots before that bucket's
+/// start hold stale data and belong to earlier buckets, whose partial last lines are written
+/// afterwards.
 fn bucket_scatter<E: Ev>(m: &[E], cnt: &[u32]) -> Vec<E> {
     use core::arch::x86_64::*;
     let tot = cnt[PB] as usize;
@@ -2083,8 +2082,8 @@ fn bucket_scatter<E: Ev>(m: &[E], cnt: &[u32]) -> Vec<E> {
                     if j >= 3 {
                         let src = bp.add(p * 4) as *const __m256i;
                         let dst = base.add(j - 3) as *mut __m256i;
-                        _mm256_stream_si256(dst, _mm256_load_si256(src));
-                        _mm256_stream_si256(dst.add(1), _mm256_load_si256(src.add(1)));
+                        _mm256_store_si256(dst, _mm256_load_si256(src));
+                        _mm256_store_si256(dst.add(1), _mm256_load_si256(src.add(1)));
                     } else {
                         // the output's first line starts before the allocation
                         for i in cnt[p] as usize..=j {
@@ -2094,7 +2093,6 @@ fn bucket_scatter<E: Ev>(m: &[E], cnt: &[u32]) -> Vec<E> {
                 }
             }
         }
-        _mm_sfence();
         for p in 0..PB {
             let en = w[p] as usize;
             let from = (cnt[p] as usize).max(en.saturating_sub((en + boff) & 3));
