@@ -1839,7 +1839,7 @@ fn main() {
     // person buckets
     let d0 = ws.div_euclid(DAY);
     let nd = if we > ws { ((we - 1).div_euclid(DAY) - d0 + 1) as usize } else { 0 };
-    let ngroups = (rayon::current_num_threads() * 4).clamp(1, PB);
+    let ngroups = (rayon::current_num_threads() * 2).clamp(1, PB);
     let per = PB.div_ceil(ngroups);
     let results: Vec<(Vec<Vec<UD>>, CampAcc)> = (0..ngroups)
         .into_par_iter()
