@@ -1261,8 +1261,15 @@ struct DR<E> {
 #[derive(Clone, Copy)]
 struct Line([u64; 8]);
 
-/// records staged per bucket before they go to the slots as whole cache lines (WK records of 24 or
-/// 32 bytes are 3 or 4 lines)
+/// A dense record's generator index and ingest key: the iw stream of a Dz.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IW {
+    i: u32,
+    ing: u32,
+}
+
+/// iw records staged per bucket before they go to the slots as one whole cache line
 const WK: usize = 8;
 
 thread_local! {
@@ -1274,10 +1281,12 @@ thread_local! {
 /// index below the bound goes to the `cap` slots of its bucket (index >> sh) in `r`, or to `ov`
 /// once those are full. A record's position is its slot (b * cap + n), or ndb * cap plus its place
 /// in `ov` (bucket order after `finish`); `dside` holds the exact ingest of the records whose key
-/// is inexact, by position. Slot records are staged per bucket in `wc` (WK at a time, in L2) and
-/// copied to `r` with streaming stores once WK are there, so the scattered slots are written as
-/// whole lines and never read in; cap is a multiple of WK and `r` is line-aligned, so every copy
-/// covers whole lines.
+/// is inexact, by position. A slot record is kept as two streams: its E record, and its index and
+/// ingest key (IW). `r` holds the E slots of every bucket, then (from line `rio`) the IW slots.
+/// Each bucket stages one line of each stream in `wc` (WKE records of E, WK of IW; in L2) and a
+/// stream's staged lines go to `r` with streaming stores once full, so the scattered slots are
+/// written as whole lines and never read in; cap is a multiple of WK and `r` is line-aligned, so
+/// every copy covers whole lines.
 struct Dz<E> {
     on: bool,
     key: u64,
@@ -1286,6 +1295,7 @@ struct Dz<E> {
     ndb: usize,
     cap: usize,
     r: Vec<MaybeUninit<Line>>,
+    rio: usize,
     wc: Vec<MaybeUninit<Line>>,
     _e: std::marker::PhantomData<E>,
     dn: Vec<u32>,
@@ -1296,9 +1306,14 @@ struct Dz<E> {
 }
 
 impl<E: Ev> Dz<E> {
+    /// E records staged per bucket: whole lines, and a divisor of WK
+    const WKE: usize = if 64 % std::mem::size_of::<E>() == 0 { 64 / std::mem::size_of::<E>() } else { WK };
+    /// staging lines per bucket: the E lines, then the IW line
+    const SL: usize = Self::WKE * std::mem::size_of::<E>() / 64 + 1;
+    const OK: () = assert!((Self::WKE * std::mem::size_of::<E>()) % 64 == 0 && WK % Self::WKE == 0 && std::mem::size_of::<IW>() * WK == 64);
     /// takes no record: every line keeps the event_id hash path
     fn off() -> Self {
-        Dz { on: false, key: 0, lim: 0, sh: 0, ndb: 0, cap: 0, r: vec![], wc: vec![], _e: std::marker::PhantomData, dn: vec![], ov: vec![], ovb: vec![], ovoff: vec![], dside: vec![] }
+        Dz { on: false, key: 0, lim: 0, sh: 0, ndb: 0, cap: 0, r: vec![], rio: 0, wc: vec![], _e: std::marker::PhantomData, dn: vec![], ov: vec![], ovb: vec![], ovoff: vec![], dside: vec![] }
     }
     /// for a chunk of `len` bytes: room for the expected bucket size plus a margin (the rest
     /// overflows)
@@ -1307,19 +1322,22 @@ impl<E: Ev> Dz<E> {
         let lines = len as f64 * c.lpb;
         let mean = lines * (1u64 << c.sh) as f64 / ((c.lim - 64) as f64 / 1.3).max(1.0) * 1.04;
         let cap = ((mean + 1.5 * mean.sqrt() + 1.0) as usize).min(lines as usize + 16).next_multiple_of(WK);
-        let sz = std::mem::size_of::<DR<E>>();
-        let nl = (c.ndb * cap * sz).div_ceil(64);
+        #[allow(clippy::let_unit_value)]
+        let () = Self::OK;
+        // whole lines: cap is a multiple of WK, and WK records of E or of IW are whole lines
+        let rio = c.ndb * cap * std::mem::size_of::<E>() / 64;
+        let nl = rio + c.ndb * cap * std::mem::size_of::<IW>() / 64;
         let mut r = Vec::with_capacity(nl);
         // SAFETY: MaybeUninit needs no initialization
         unsafe { r.set_len(nl) };
-        let wl = (c.ndb * WK * sz).div_ceil(64);
+        let wl = c.ndb * Self::SL;
         let mut wc = WCP.with(|p| p.take());
         if wc.len() < wl {
             wc = Vec::with_capacity(wl);
             // SAFETY: as above
             unsafe { wc.set_len(wl) };
         }
-        Dz { on: true, key: c.key, lim: c.lim, sh: c.sh, ndb: c.ndb, cap, r, wc, _e: std::marker::PhantomData, dn: vec![0; c.ndb], ov: vec![], ovb: vec![], ovoff: vec![], dside: vec![] }
+        Dz { on: true, key: c.key, lim: c.lim, sh: c.sh, ndb: c.ndb, cap, r, rio, wc, _e: std::marker::PhantomData, dn: vec![0; c.ndb], ov: vec![], ovb: vec![], ovoff: vec![], dside: vec![] }
     }
     /// the dense index of a packed event_id, if it has one
     #[inline(always)]
@@ -1371,24 +1389,31 @@ impl<E: Ev> Dz<E> {
     #[inline(always)]
     fn put(&mut self, i: u64, ing: u32, e: E, exact: bool, ingest: i64) {
         let b = (i >> self.sh) as usize;
-        let x = DR { i: i as u32, ing, e };
-        // SAFETY: i < lim, so b < ndb; a slot below cap lies in b's stretch of r
+        // SAFETY: i < lim, so b < ndb; a slot below cap lies in b's stretches of r
         let n = unsafe { *self.dn.get_unchecked(b) } as usize;
         let pos = if n < self.cap {
-            // SAFETY: b < ndb, so b's WK staging records lie in wc; n + 1 - WK is a multiple of
-            // WK below cap, so the copied slots lie in b's stretch of r
+            // SAFETY: b < ndb, so b's SL staging lines lie in wc; n + 1 - WKE and n + 1 - WK are
+            // multiples of WKE and WK below cap, so the copied slots lie in b's stretches of r
             unsafe {
-                let w = (self.wc.as_mut_ptr() as *mut DR<E>).add(b * WK);
-                w.add(n % WK).write(x);
+                let s = self.wc.as_mut_ptr().add(b * Self::SL);
+                let se = s as *mut E;
+                let si = s.add(Self::SL - 1) as *mut IW;
+                se.add(n % Self::WKE).write(e);
+                si.add(n % WK).write(IW { i: i as u32, ing });
                 *self.dn.get_unchecked_mut(b) = n as u32 + 1;
-                if (n + 1) % WK == 0 {
-                    let d = (self.r.as_mut_ptr() as *mut DR<E>).add(b * self.cap + n + 1 - WK);
-                    stream_lines(w as *const Line, d as *mut Line, WK * std::mem::size_of::<DR<E>>() / 64);
+                let m = n + 1;
+                if m % Self::WKE == 0 {
+                    let d = (self.r.as_mut_ptr() as *mut E).add(b * self.cap + m - Self::WKE);
+                    stream_lines(se as *const Line, d as *mut Line, Self::SL - 1);
+                    if m % WK == 0 {
+                        let d = (self.r.as_mut_ptr().add(self.rio) as *mut IW).add(b * self.cap + m - WK);
+                        stream_lines(si as *const Line, d as *mut Line, 1);
+                    }
                 }
             }
             b * self.cap + n
         } else {
-            self.ov_put(b, x)
+            self.ov_put(b, DR { i: i as u32, ing, e })
         };
         if !exact {
             self.dside.push((pos as u32, ingest));
@@ -1407,12 +1432,15 @@ impl<E: Ev> Dz<E> {
         if self.on {
             for b in 0..self.ndb {
                 let n = self.dn[b] as usize;
-                let t = n % WK;
-                // SAFETY: the t records staged last for b are its slots n - t .. n
+                let (te, ti) = (n % Self::WKE, n % WK);
+                // SAFETY: the te E records and ti IW records staged last for b are its slots
+                // n - te .. n and n - ti .. n
                 unsafe {
-                    let w = (self.wc.as_ptr() as *const DR<E>).add(b * WK);
-                    let d = (self.r.as_mut_ptr() as *mut DR<E>).add(b * self.cap + n - t);
-                    std::ptr::copy_nonoverlapping(w, d, t);
+                    let s = self.wc.as_ptr().add(b * Self::SL);
+                    let d = (self.r.as_mut_ptr() as *mut E).add(b * self.cap + n - te);
+                    std::ptr::copy_nonoverlapping(s as *const E, d, te);
+                    let d = (self.r.as_mut_ptr().add(self.rio) as *mut IW).add(b * self.cap + n - ti);
+                    std::ptr::copy_nonoverlapping(s.add(Self::SL - 1) as *const IW, d, ti);
                 }
             }
             sfence();
@@ -1450,22 +1478,35 @@ impl<E: Ev> Dz<E> {
     fn len(&self) -> usize {
         self.dn.iter().map(|&n| n as usize).sum::<usize>() + self.ov.len()
     }
-    /// bucket b's records: its slots and the position of the first, then its overflow records and
-    /// the position of the first
+    /// bucket b's records: the IW and E streams of its slots and the position of the first, then
+    /// its overflow records and the position of the first
     #[inline]
-    fn seg(&self, b: usize) -> (&[DR<E>], usize, &[DR<E>], usize) {
+    #[allow(clippy::type_complexity)]
+    fn seg(&self, b: usize) -> (&[IW], &[E], usize, &[DR<E>], usize) {
         if b >= self.dn.len() {
-            return (&[], 0, &[], 0);
+            return (&[], &[], 0, &[], 0);
         }
-        // SAFETY: put wrote the first dn[b] slots of b's stretch
-        let s = unsafe { std::slice::from_raw_parts((self.r.as_ptr() as *const DR<E>).add(b * self.cap), self.dn[b] as usize) };
+        let n = self.dn[b] as usize;
+        // SAFETY: put wrote the first dn[b] slots of b's stretches
+        let (si, se) = unsafe {
+            (
+                std::slice::from_raw_parts((self.r.as_ptr().add(self.rio) as *const IW).add(b * self.cap), n),
+                std::slice::from_raw_parts((self.r.as_ptr() as *const E).add(b * self.cap), n),
+            )
+        };
         let (o, p) = if self.ovoff.is_empty() {
             (&self.ov[..0], 0)
         } else {
             let (a, z) = (self.ovoff[b] as usize, self.ovoff[b + 1] as usize);
             (&self.ov[a..z], self.ndb * self.cap + a)
         };
-        (s, b * self.cap, o, p)
+        (si, se, b * self.cap, o, p)
+    }
+    /// the starts of bucket b's IW and E slots (for prefetching; b < ndb)
+    #[inline(always)]
+    fn seg_ptr(&self, b: usize) -> (*const u8, *const u8) {
+        let s = self.r.as_ptr();
+        ((s.wrapping_add(self.rio) as *const IW).wrapping_add(b * self.cap) as *const u8, (s as *const E).wrapping_add(b * self.cap) as *const u8)
     }
     fn slots(&self) -> usize {
         self.ndb * self.cap
@@ -4325,8 +4366,8 @@ fn ev_after_idx<E: Ev>(
                                 ev_out
                                     .iter()
                                     .map(|c| {
-                                        let (sa, _, oa, _) = c.dz.seg(b);
-                                        sa.len() + oa.len()
+                                        let (si, _, _, oa, _) = c.dz.seg(b);
+                                        si.len() + oa.len()
                                     })
                                     .sum::<usize>()
                             })
@@ -4349,40 +4390,54 @@ fn ev_after_idx<E: Ev>(
                                 }
                                 if let Some(n) = ev_out.get(ci + 2) {
                                     if b < n.dz.dn.len() {
-                                        let p = (n.dz.r.as_ptr() as *const DR<E>).wrapping_add(b * n.dz.cap) as *const u8;
-                                        let len = n.dz.dn[b] as usize * std::mem::size_of::<DR<E>>();
-                                        for o in (0..len.min(1024)).step_by(64) {
-                                            prefetch(p.wrapping_add(o));
+                                        let (pi, pe) = n.dz.seg_ptr(b);
+                                        let m = (n.dz.dn[b] as usize).min(1024 / std::mem::size_of::<DR<E>>());
+                                        for o in (0..m * std::mem::size_of::<IW>()).step_by(64) {
+                                            prefetch(pi.wrapping_add(o));
+                                        }
+                                        for o in (0..m * std::mem::size_of::<E>()).step_by(64) {
+                                            prefetch(pe.wrapping_add(o));
                                         }
                                     }
                                 }
-                                let (sa, sp, oa, op) = c.dz.seg(b);
-                                for (part, p0) in [(sa, sp), (oa, op)] {
-                                    for (j, x) in part.iter().enumerate() {
-                                        if let Some(y) = part.get(j + 16) {
-                                            prefetch(t.as_ptr().wrapping_add((y.i as u64 & mask) as usize) as *const u8);
-                                        }
+                                let (si, se, sp, oa, op) = c.dz.seg(b);
+                                // one record (index, ingest key, E, position) into the table
+                                macro_rules! ins {
+                                    ($i:expr, $ing:expr, $e:expr, $p:expr) => {{
+                                        let (xi, xing): (u32, u32) = ($i, $ing);
                                         let q = lb.len() as u32;
-                                        lb.push(x.e);
+                                        lb.push($e);
                                         if dside_any {
-                                            lg.push(((ci as u64) << 32) | (p0 + j) as u64);
+                                            lg.push(((ci as u64) << 32) | $p as u64);
                                         }
-                                        let pk = ((x.ing as u64) << 32) | q as u64;
+                                        let pk = ((xing as u64) << 32) | q as u64;
                                         // SAFETY: the slot index is masked to span
-                                        let o = unsafe { t.get_unchecked_mut((x.i as u64 & mask) as usize) };
+                                        let o = unsafe { t.get_unchecked_mut((xi as u64 & mask) as usize) };
                                         if *o == u64::MAX {
                                             *o = pk;
-                                            continue;
+                                        } else {
+                                            let ok = (*o >> 32) as u32;
+                                            if xing < ok
+                                                || (xing == ok
+                                                    && dside_any
+                                                    && dexact(lg[q as usize], xing) < dexact(lg[*o as u32 as usize], ok))
+                                            {
+                                                *o = pk;
+                                            }
                                         }
-                                        let ok = (*o >> 32) as u32;
-                                        if x.ing < ok
-                                            || (x.ing == ok
-                                                && dside_any
-                                                && dexact(lg[q as usize], x.ing) < dexact(lg[*o as u32 as usize], ok))
-                                        {
-                                            *o = pk;
-                                        }
+                                    }};
+                                }
+                                for (j, (w, e)) in si.iter().zip(se).enumerate() {
+                                    if let Some(y) = si.get(j + 16) {
+                                        prefetch(t.as_ptr().wrapping_add((y.i as u64 & mask) as usize) as *const u8);
                                     }
+                                    ins!(w.i, w.ing, *e, sp + j);
+                                }
+                                for (j, x) in oa.iter().enumerate() {
+                                    if let Some(y) = oa.get(j + 16) {
+                                        prefetch(t.as_ptr().wrapping_add((y.i as u64 & mask) as usize) as *const u8);
+                                    }
+                                    ins!(x.i, x.ing, x.e, op + j);
                                 }
                             }
                             pt(2, &mut tm);
@@ -4979,15 +5034,21 @@ fn hash_chunk<E: Ev>(mut h: u64, r: &EvChunk<E>) -> u64 {
         add(x.0 as u64 ^ x.1 as u64);
     }
     for b in 0..r.dz.dn.len() {
-        let (sa, sp, oa, op) = r.dz.seg(b);
-        for (part, p0) in [(sa, sp), (oa, op)] {
-            add(part.len() as u64 ^ ((p0 as u64) << 32));
-            for x in part {
-                add(x.i as u64 ^ ((x.ing as u64) << 32));
-                add(x.e.key() ^ (x.e.rts() << 1));
-                if let Some((p, cat)) = x.e.pc() {
-                    add(p ^ ((cat as u64) << 32));
-                }
+        let (si, se, sp, oa, op) = r.dz.seg(b);
+        add(si.len() as u64 ^ ((sp as u64) << 32));
+        for (w, e) in si.iter().zip(se) {
+            add(w.i as u64 ^ ((w.ing as u64) << 32));
+            add(e.key() ^ (e.rts() << 1));
+            if let Some((p, cat)) = e.pc() {
+                add(p ^ ((cat as u64) << 32));
+            }
+        }
+        add(oa.len() as u64 ^ ((op as u64) << 32));
+        for x in oa {
+            add(x.i as u64 ^ ((x.ing as u64) << 32));
+            add(x.e.key() ^ (x.e.rts() << 1));
+            if let Some((p, cat)) = x.e.pc() {
+                add(p ^ ((cat as u64) << 32));
             }
         }
     }
@@ -5543,6 +5604,64 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dz keeps every slot record (both streams), every overflow record and the positions of the
+    /// inexact ones, for full, partial and overflowing buckets
+    #[test]
+    fn dz_streams_keep_records() {
+        fn run<E: Ev>() {
+            let cfg = IdxCfg { key: 0, lim: 384, sh: 4, ndb: 25, lpb: 0.1 };
+            let mut dz = Dz::<E>::new(Some(cfg), 1000);
+            let cap = dz.cap;
+            assert_eq!(cap % WK, 0);
+            let mut want: Vec<Vec<(u32, u32, E, bool, i64)>> = vec![vec![]; cfg.ndb];
+            for k in 0..600u64 {
+                // bucket b gets about b records, so some stay empty, some fill part of a line and
+                // some overflow
+                let b = (k * 7 + k / 11) % 25;
+                if want[b as usize].len() as u64 > 2 * b {
+                    continue;
+                }
+                let i = (b << 4) | (k % 16);
+                let ing = (k as u32).wrapping_mul(2654435761);
+                let e = E::mk(k + 1, k * 3, if k % 3 == 0 { k as u32 + 1 } else { 0 }, (k % 7) as u32);
+                let exact = k % 5 != 0;
+                dz.put(i, ing, e, exact, k as i64 * 1000 + 1);
+                want[b as usize].push((i as u32, ing, e, exact, k as i64 * 1000 + 1));
+            }
+            dz.finish();
+            let mut side = vec![];
+            let mut total = 0;
+            for b in 0..cfg.ndb {
+                let (si, se, sp, oa, op) = dz.seg(b);
+                assert_eq!(si.len(), want[b].len().min(cap));
+                assert_eq!(se.len(), si.len());
+                assert_eq!(sp, b * cap);
+                assert_eq!(si.len() + oa.len(), want[b].len());
+                let got: Vec<(u32, u32, E, usize)> = si
+                    .iter()
+                    .zip(se)
+                    .enumerate()
+                    .map(|(j, (w, e))| (w.i, w.ing, *e, sp + j))
+                    .chain(oa.iter().enumerate().map(|(j, x)| (x.i, x.ing, x.e, op + j)))
+                    .collect();
+                for (g, w) in got.iter().zip(&want[b]) {
+                    assert_eq!((g.0, g.1), (w.0, w.1));
+                    assert_eq!((g.2.key(), g.2.rts(), g.2.pc()), (w.2.key(), w.2.rts(), w.2.pc()));
+                    if !w.3 {
+                        side.push((g.3 as u32, w.4));
+                    }
+                }
+                total += want[b].len();
+            }
+            assert!(dz.ov.len() > 0 && dz.slots() == cfg.ndb * cap);
+            assert_eq!(dz.len(), total);
+            side.sort_unstable_by_key(|x| x.0);
+            assert_eq!(dz.dside, side);
+        }
+        run::<EvL>();
+        run::<EvW>();
+    }
 
     struct Rng(u64);
     impl Rng {
