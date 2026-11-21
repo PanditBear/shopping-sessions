@@ -31,7 +31,7 @@ fn mix(k: u64) -> u64 {
     k ^ (k >> 29)
 }
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 static TIMING: AtomicBool = AtomicBool::new(false);
 static PROF: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 const PROF_NAMES: [&str; 12] =
@@ -846,6 +846,33 @@ impl IdTab {
             if e[0] == 0 {
                 self.s[i] = [k, v];
                 return (v, true);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    #[inline(always)]
+    fn ak(&self, i: usize) -> &AtomicU64 {
+        unsafe { &*(self.s.as_ptr() as *const AtomicU64).add(2 * i) }
+    }
+    #[inline(always)]
+    fn av(&self, i: usize) -> &AtomicU64 {
+        unsafe { &*(self.s.as_ptr() as *const AtomicU64).add(2 * i + 1) }
+    }
+    /// Concurrent insert of a key: returns (slot, newly claimed). The value half is the caller's.
+    #[inline]
+    fn claim(&self, k: u64) -> (usize, bool) {
+        let mut i = self.slot(k);
+        loop {
+            let cur = self.ak(i).load(Relaxed);
+            if cur == k {
+                return (i, false);
+            }
+            if cur == 0 {
+                match self.ak(i).compare_exchange(0, k, Relaxed, Relaxed) {
+                    Ok(_) => return (i, true),
+                    Err(c) if c == k => return (i, false),
+                    Err(_) => {}
+                }
             }
             i = (i + 1) & self.mask;
         }
@@ -2116,70 +2143,132 @@ fn main() {
         .collect();
     tick("links parsed");
     // links (serial union-find) overlaps the parallel event parse; events do not need the id table
-    let ((tab, mut names_map), ev_out) = rayon::join(
+    let ((tab, mut names_map), (ev_out, click_raw)) = rayon::join(
         || {
             let occ: usize = link_pairs.iter().map(|v| v.len()).sum::<usize>() * 2;
             let mut names_map: AHashMap<u64, u64> = AHashMap::new();
             let tab = {
-                let mut t = IdTab::with_cap(occ);
-                let mut idx_key: Vec<u64> = vec![];
-                let mut idx_ref: Vec<u64> = vec![];
-                let mut parent: Vec<u32> = vec![];
-                fn find(p: &mut [u32], mut x: u32) -> u32 {
-                    while p[x as usize] != x {
-                        let g = p[p[x as usize] as usize];
-                        p[x as usize] = g;
-                        x = g;
+                // slot index = node id; parent links are stored xor the slot index so zeroed memory
+                // means "own parent"
+                let t = IdTab::with_cap(occ);
+                let cap = t.s.len();
+                let par: Vec<AtomicU32> = unsafe {
+                    let mut v = std::mem::ManuallyDrop::new(vec![0u32; cap]);
+                    Vec::from_raw_parts(v.as_mut_ptr() as *mut AtomicU32, cap, cap)
+                };
+                let best: Vec<AtomicU32> = unsafe {
+                    let mut v = std::mem::ManuallyDrop::new(vec![0u32; cap]);
+                    Vec::from_raw_parts(v.as_mut_ptr() as *mut AtomicU32, cap, cap)
+                };
+                let find = |mut x: usize| -> usize {
+                    loop {
+                        let p = (par[x].load(Relaxed) as usize) ^ x;
+                        if p == x {
+                            return x;
+                        }
+                        let gp = (par[p].load(Relaxed) as usize) ^ p;
+                        if gp != p {
+                            let _ = par[x].compare_exchange(
+                                (p ^ x) as u32,
+                                (gp ^ x) as u32,
+                                Relaxed,
+                                Relaxed,
+                            );
+                        }
+                        x = gp;
                     }
-                    x
-                }
-                let mut edges: Vec<(u32, u32)> = Vec::with_capacity(occ / 2);
-                for v in &link_pairs {
+                };
+                let union = |a: usize, b: usize| {
+                    let (mut a, mut b) = (a, b);
+                    loop {
+                        a = find(a);
+                        b = find(b);
+                        if a == b {
+                            return;
+                        }
+                        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+                        if par[hi].compare_exchange(0, (lo ^ hi) as u32, Relaxed, Relaxed).is_ok() {
+                            return;
+                        }
+                    }
+                };
+                let nl_acc = AtomicUsize::new(0);
+                link_pairs.par_iter().for_each(|v| {
+                    let mut cnt = 0usize;
                     for (n, e) in v.iter().enumerate() {
                         if n + PFD / 2 < v.len() {
                             t.pf(v[n + PFD / 2][0]);
                             t.pf(v[n + PFD / 2][2]);
                         }
-                        let mut g = |k: u64, r: u64| -> u32 {
-                            let (id, new) = t.get_or_insert(k, idx_key.len() as u64);
+                        let mut g = |k: u64, r: u64| -> usize {
+                            let (i, new) = t.claim(k);
                             if new {
-                                idx_key.push(k);
-                                idx_ref.push(r);
-                                parent.push(id as u32);
+                                t.av(i).store(r, Relaxed);
+                                cnt += 1;
                             }
-                            id as u32
+                            i
                         };
                         let a = g(e[0], e[1]);
                         let b = g(e[2], e[3]);
-                        edges.push((a, b));
+                        union(a, b);
                     }
-                }
-                tick(&format!("links inserted {}", idx_key.len()));
-                for (a, b) in edges {
-                    let ra = find(&mut parent, a);
-                    let rb = find(&mut parent, b);
-                    if ra != rb {
-                        parent[ra as usize] = rb;
+                    nl_acc.fetch_add(cnt, Relaxed);
+                });
+                let nl = nl_acc.load(Relaxed);
+                tick(&format!("links inserted {}", nl));
+                const BLK: usize = 1 << 12;
+                let nblk = cap.div_ceil(BLK);
+                // best representative per component: the smallest by the original comparison
+                (0..nblk).into_par_iter().for_each(|bi| {
+                    for g in bi * BLK..((bi + 1) * BLK).min(cap) {
+                        let kg = t.ak(g).load(Relaxed);
+                        if kg == 0 {
+                            continue;
+                        }
+                        let r = find(g);
+                        let rg = t.av(g).load(Relaxed);
+                        loop {
+                            let cur = best[r].load(Relaxed);
+                            if cur != 0 {
+                                let b = cur as usize - 1;
+                                let kb = t.ak(b).load(Relaxed);
+                                let less = if kg & HBIT == 0 && kb & HBIT == 0 {
+                                    kg < kb
+                                } else {
+                                    unpack(rg) < unpack(t.av(b).load(Relaxed))
+                                };
+                                if !less {
+                                    break;
+                                }
+                            }
+                            if best[r].compare_exchange(cur, g as u32 + 1, Relaxed, Relaxed).is_ok() {
+                                break;
+                            }
+                        }
                     }
-                }
-                let nl = idx_key.len();
-                let mut best: Vec<u32> = (0..nl as u32).collect();
-                for g in 0..nl {
-                    let r = find(&mut parent, g as u32) as usize;
-                    let (kg, kb) = (idx_key[g], idx_key[best[r] as usize]);
-                    let less = if kg & HBIT == 0 && kb & HBIT == 0 { kg < kb } else { unpack(idx_ref[g]) < unpack(idx_ref[best[r] as usize]) };
-                    if less {
-                        best[r] = g as u32;
-                    }
-                }
-                let mut ft = IdTab::with_cap(nl);
-                for g in 0..nl {
-                    let b = best[find(&mut parent, g as u32) as usize] as usize;
-                    let pk = idx_key[b];
-                    ft.get_or_insert(idx_key[g], pk);
-                    if pk & HBIT != 0 && b == g {
-                        names_map.insert(pk, idx_ref[b]);
-                    }
+                });
+                let ft = IdTab::with_cap(nl);
+                let named: Vec<Vec<(u64, u64)>> = (0..nblk)
+                    .into_par_iter()
+                    .fold(Vec::new, |mut out: Vec<(u64, u64)>, bi| {
+                        for g in bi * BLK..((bi + 1) * BLK).min(cap) {
+                            let kg = t.ak(g).load(Relaxed);
+                            if kg == 0 {
+                                continue;
+                            }
+                            let b = best[find(g)].load(Relaxed) as usize - 1;
+                            let pk = t.ak(b).load(Relaxed);
+                            let (i, _) = ft.claim(kg);
+                            ft.av(i).store(pk, Relaxed);
+                            if pk & HBIT != 0 && b == g {
+                                out.push((pk, t.av(b).load(Relaxed)));
+                            }
+                        }
+                        out
+                    })
+                    .collect();
+                for (pk, r) in named.into_iter().flatten() {
+                    names_map.insert(pk, r);
                 }
                 ft
             };
@@ -2187,6 +2276,7 @@ fn main() {
             tick("links done");
             (tab, names_map)
         },
+        || rayon::join(
         || {
             let ev_files = csv_files(&data.join("events"));
             let ev_chunks = all_chunks(&ev_files, ev_chunk(&ev_files));
@@ -2282,28 +2372,40 @@ fn main() {
             tick("events parsed");
             ev_out
         },
+        || {
+            let click_chunks = all_chunks(&csv_files(&data.join("clicks")), CHUNK);
+            let r: Vec<Vec<ClickRec>> = click_chunks
+                .par_iter()
+                .map(|&c| {
+                    let mut tmp: Vec<ClickRec> = Vec::with_capacity(c.len() / 40);
+                    let mut tc = TsCache::new();
+                    let mut tm = now();
+                    scan::<4>(c, |&[cid, uid, cmp, ts]| {
+                        if cid.is_empty() || uid.is_empty() {
+                            return;
+                        }
+                        let Some(ci) = camp.get(cmp) else { return };
+                        let Some(t) = parse_ts_c(ts, &mut tc) else { return };
+                        if t < ws - WEEK || t >= we {
+                            return;
+                        }
+                        tmp.push(ClickRec { key: ukey(&rs, uid), ts: t, cid: pack(cid), camp: ci });
+                    });
+                    pt(9, &mut tm);
+                    tmp
+                })
+                .collect();
+            tick("clicks scanned");
+            r
+        },
+        ),
     );
 
-    // clicks
-    let click_chunks = all_chunks(&csv_files(&data.join("clicks")), CHUNK);
-    let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_chunks
-        .par_iter()
-        .map(|&c| {
-            let mut tmp: Vec<ClickRec> = Vec::with_capacity(c.len() / 40);
-            let mut tc = TsCache::new();
+    // clicks: map keys through the identity table
+    let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_raw
+        .into_par_iter()
+        .map(|mut tmp| {
             let mut tm = now();
-            scan::<4>(c, |&[cid, uid, cmp, ts]| {
-                if cid.is_empty() || uid.is_empty() {
-                    return;
-                }
-                let Some(ci) = camp.get(cmp) else { return };
-                let Some(t) = parse_ts_c(ts, &mut tc) else { return };
-                if t < ws - WEEK || t >= we {
-                    return;
-                }
-                tmp.push(ClickRec { key: ukey(&rs, uid), ts: t, cid: pack(cid), camp: ci });
-            });
-            pt(9, &mut tm);
             let n = tmp.len();
             for i in 0..n {
                 if i + PFD < n {
