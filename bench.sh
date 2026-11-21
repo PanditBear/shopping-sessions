@@ -4,6 +4,7 @@
 # A ref may carry image ENV lines: REF@VAR=val@VAR2=val (same binary, different environment).
 # Env: RUNS (timed runs per ref), CPUS, MEM, EVENTS, CLICKS, SEED, PROBE=1 (one SHOP_PROBE run per image),
 #      PERF=1 (profile the first image's binary on the host with perf),
+#      EXITPROBE=2 (exit time of the first image under different docker cpu and memory limits),
 #      EXITPROBE=1 (split the time after the binary's last tick: process teardown vs docker, plus a native run).
 set -euo pipefail
 RUNS=${RUNS:-5}; CPUS=${CPUS:-4}; MEM=${MEM:-14g}
@@ -162,5 +163,35 @@ if [ "${EXITPROBE:-}" = 1 ]; then
     sudo $P report -i $W/xperf.data --stdio --no-children --comms shop --sort sym --percent-limit 0.5 2>/dev/null | grep -v '^#' | grep -v '^$' | head -45
     sudo rm -rf $o $s2
   else echo "perf unavailable"; fi
+  set -e
+fi
+
+if [ "${EXITPROBE:-}" = 2 ]; then
+  echo "== exit probe 2: end>finished (s) per docker limit variant, first image"
+  set +e
+  ep() { date -d "$1" +%s.%N; }
+  free -g | head -2
+  for v in base nomem mem24 cpuset plain; do
+    case $v in
+      base) lim="--cpus $CPUS --memory $MEM --memory-swap $MEM";;
+      nomem) lim="--cpus $CPUS";;
+      mem24) lim="--cpus $CPUS --memory 24g --memory-swap 24g";;
+      cpuset) lim="--cpuset-cpus 0-$((CPUS-1)) --memory $MEM --memory-swap $MEM";;
+      plain) lim="";;
+    esac
+    for k in 1 2 3; do
+      out=$(mktemp -d); scr=$(mktemp -d); chmod 777 $out $scr; nm=xq-$v-$k
+      docker run --name $nm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 \
+        --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 $lim --user 1000:1000 \
+        -v $W/data:/data:ro -v $out:/output -v $scr:/scratch \
+        -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
+        -e NCPU=$CPUS -e SHOP_TIMING=1 ${IMGS[0]} 2>$W/xerr.txt
+      st=$(ep "$(docker inspect -f '{{.State.StartedAt}}' $nm)"); fa=$(ep "$(docker inspect -f '{{.State.FinishedAt}}' $nm)")
+      docker rm $nm >/dev/null
+      em=$(grep -o 'main=[0-9.]*' $W/xerr.txt | cut -d= -f2); ee=$(grep -o 'end=[0-9.]*' $W/xerr.txt | cut -d= -f2)
+      printf 'xq %s internal %.3f exit %.3f\n' $v "$(echo "$ee - $em" | bc)" "$(echo "$fa - $ee" | bc)"
+      sudo rm -rf $out $scr
+    done
+  done
   set -e
 fi
