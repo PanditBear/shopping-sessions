@@ -11,3 +11,4 @@ time,event,ticket,branch,dev,holdout,runtime_s,board,commit,note
 2026-11-20 19:20:51,land,D-v3,cpu-v3,1.0,1.0,49.919,,65694143b8,
 2026-11-20 19:24:17,board,,,,,,1.40,af124c1225,sub-2 af124c1 speed round 2 + x86-64-v3; board top 1.17
 2026-11-20 19:58:27,land,D-dd2,dd2,1.0,1.0,47.87,,7cc9a36b81,
+2026-11-20 20:11:06,board,,,,,,1.40,1698b09f45,dd2 no change on scorer (BB-0B99C34F)
