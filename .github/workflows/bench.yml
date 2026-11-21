@@ -82,7 +82,7 @@ jobs:
           SIZES: ${{ github.event.inputs.perfsizes }}
           CPUS: 4
         run: |
-          set -uo pipefail
+          set +e; set -uo pipefail
           W=/tmp/pf; mkdir -p $W
           echo "== machine"; lscpu | grep -E 'Model name|^CPU\(s\)|Thread|L1d|L2|L3|Hypervisor' | cut -c1-200; free -g | head -2; uname -r
           P=$(command -v perf || ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1 || true); echo "perf=$P"; $P --version
@@ -112,8 +112,6 @@ jobs:
             sudo env $E $P stat -e task-clock,cycles,instructions,branches,branch-misses,cache-references,cache-misses $W/shop-ship 2>&1 | grep -v '^\[' | tail -18
             echo "== stat: LLC and dTLB"
             sudo env $E $P stat -e LLC-loads,LLC-load-misses,dTLB-loads,dTLB-load-misses,L1-dcache-load-misses,page-faults $W/shop-ship 2>&1 | grep -v '^\[' | tail -14
-            echo "== stat: raw mem_load_retired (if supported)"
-            sudo env $E $P stat -e mem_load_retired.l3_miss,mem_load_retired.l2_miss,mem_load_retired.l1_miss $W/shop-ship 2>&1 | grep -v '^\[' | tail -8
             echo "== record (try cycles, fall back to cpu-clock)"
             EV=cycles; R=$W/perf$n.data
             sudo env $E $P record -q -F 4999 -e cycles -g -o $R $W/shop-prof >/dev/null 2>$W/rec.err || true
