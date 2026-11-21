@@ -9,6 +9,35 @@ use std::sync::Arc;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+// mimalloc's arenas are already 2 MiB-aligned with MADV_HUGEPAGE, but by default freed memory is
+// purged (MADV_DONTNEED in 64 KiB slices) about a second later. That splits the huge pages, and the
+// memory is faulted and zeroed again when the next phase reuses it. Peak RSS is reached before the
+// big frees, so keeping freed memory committed costs almost nothing. SHOP_PURGE=1 restores the default.
+mod hpa {
+    extern "C" {
+        fn mi_option_set(option: i32, value: std::ffi::c_long);
+    }
+    const MI_OPTION_PURGE_DELAY: i32 = 15; // index in mimalloc v3's mi_option_t
+
+    pub fn init() {
+        if std::env::var_os("SHOP_PURGE").is_none() {
+            unsafe { mi_option_set(MI_OPTION_PURGE_DELAY, -1) }
+        }
+    }
+
+    // SHOP_THP=1: anonymous and huge-page memory of the process after each phase (Linux only)
+    pub fn diag(label: &str) {
+        if !cfg!(target_os = "linux") || std::env::var_os("SHOP_THP").is_none() {
+            return;
+        }
+        let r = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
+        let f = |k: &str| {
+            r.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
+        };
+        eprintln!("thp {label}: anon {} MB, anonhuge {} MB, rss {} MB", f("Anonymous:") >> 10, f("AnonHugePages:") >> 10, f("Rss:") >> 10);
+    }
+}
+
 type B = &'static [u8];
 
 const DAY: i64 = 86_400_000;
@@ -2556,6 +2585,7 @@ enum Evs {
 }
 
 fn main() {
+    hpa::init();
     let ep = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
     let ep0 = ep();
     let data = std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into());
@@ -2575,6 +2605,7 @@ fn main() {
         if timing {
             eprintln!("[{:.2}s] {}", t0.elapsed().as_secs_f64(), s);
         }
+        hpa::diag(s);
     };
 
     let mf = std::fs::read_to_string(data.join("manifest.json")).unwrap_or_default();
