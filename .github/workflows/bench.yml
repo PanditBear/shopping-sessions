@@ -75,6 +75,11 @@ jobs:
           st tlb -e dtlb_load_misses.walk_completed,dtlb_store_misses.walk_completed,dtlb_load_misses.stlb_hit,dtlb_store_misses.stlb_hit
           st stall -e cycle_activity.stalls_l1d_miss,cycle_activity.stalls_l2_miss,cycle_activity.stalls_l3_miss,cycle_activity.stalls_total
           st stall2 -e cycle_activity.cycles_l1d_miss,cycle_activity.cycles_mem_any,resource_stalls.sb,cycles
+          $P list > $W/pl.txt 2>&1; grep -E 'resource_stalls|exe_activity|l1d_pend_miss|dtlb_store|mem_inst_retired' $W/pl.txt | head -60 | tee $R/perflist.store.txt
+          sx() { nm=$1; shift; L=""; for e in "$@"; do if grep -qw -- "$e" $W/pl.txt; then L="$L,$e"; else echo "skip $e (not in perf list)" | tee -a $R/topdown.txt; fi; done; L=${L#,}; [ -n "$L" ] && st $nm -e $L,cycles; }
+          sx sx1 resource_stalls.sb exe_activity.bound_on_stores mem_inst_retired.all_stores
+          sx sx2 l1d_pend_miss.fb_full l1d_pend_miss.fb_full_periods
+          sx sx3 dtlb_store_misses.walk_completed dtlb_store_misses.walk_active
           cp $R/topdown.txt $R/topdown.keep
           rec() { nm=$1; EVT=$2; c=$(grep -E "$EVT" $R/st.$3.txt | grep -vE 'not supported|not counted' | awk '{gsub(",","",$1); print $1}' | head -1)
             case "$c" in ''|*[!0-9]*) echo "rec $nm: no count for $EVT" | tee -a $R/machine.txt; return;; esac
@@ -95,6 +100,9 @@ jobs:
           rec l1m mem_load_retired.l1_miss ml
           rec tlbs dtlb_store_misses.walk_completed tlb
           rec l3m mem_load_retired.l3_miss ml
+          rec sbs resource_stalls.sb sx1
+          rec sts mem_inst_retired.all_stores sx1
+          rec fbf l1d_pend_miss.fb_full sx2
           echo "== done"; ls -l $R; head -20 $R/top.*.txt || true
       - uses: actions/upload-artifact@v4
         if: always()
