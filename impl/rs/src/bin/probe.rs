@@ -1,15 +1,20 @@
-// Phase share profile. Runs ./shop_t (the program with 5-decimal phase ticks) once as warm-up and 5 times with
-// SHOP_TIMING=1, then ./shop last so the real outputs stay. Per run (T = whole process wall):
-//   E = t(events parsed)/T, D = (t(dedup done) - t(clicks parsed))/T, S = (t(sessionized) - t(dedup done))/T
-// Medians are quantized: iE = clamp(floor((E-0.10)/0.05),0,7), iD = clamp(floor((D-0.05)/0.05),0,7),
-// iS = clamp(floor((S-0.05)/0.05),0,7); k = iE*64 + iD*8 + iS. Finish = 35 + 0.1*k + 0.05 s (99 s on any failure).
+// Machine and exit-cost profile. Runs ./shop_t (same program, timing output) once as warm-up and 5 times with
+// SHOP_TIMING=1, then ./shop last so the real outputs stay. Encoded fields:
+//   thp: /sys/kernel/mm/transparent_hugepage/enabled  [always]=0 [madvise]=1 [never]=2 unreadable=3
+//   mf:  median minor faults per run (getrusage children delta) < 131072 -> 0, else 1
+//   ex:  median post-exit cost = wall clock after wait - the run's "end=" epoch (s), bucket upper bounds
+//        0.010 0.020 0.035 0.050 0.075 0.100 0.150 -> 0..6, else 7
+//   cpu: /proc/cpuinfo first processor: Intel fam 6 model 85 -> 0, 106/108 -> 1, 143 -> 2, 207 -> 3, other Intel -> 4,
+//        AMD fam 25 model < 16 -> 5, AMD fam 25 model >= 16 -> 6, anything else -> 7
+// k = thp*128 + mf*64 + ex*8 + cpu. Finish = 35 + 0.1*k + 0.05 s (99 s on any failure).
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BASE: f64 = 35.0;
 const ST: f64 = 0.1;
 const OVERRUN: f64 = 99.0;
+const EX_BOUNDS: [f64; 7] = [0.010, 0.020, 0.035, 0.050, 0.075, 0.100, 0.150];
 
 fn clear(dir: &str) {
     if let Ok(rd) = std::fs::read_dir(dir) {
@@ -20,43 +25,61 @@ fn clear(dir: &str) {
     }
 }
 
-fn run_plain(exe: &Path, outd: &str) -> f64 {
+fn now_epoch() -> f64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
+
+#[cfg(unix)]
+fn child_minflt() -> i64 {
+    // struct rusage on x86_64: 2 timevals (4 x i64), then maxrss, ixrss, idrss, isrss, minflt, ...
+    #[repr(C)]
+    struct Ru {
+        v: [i64; 64],
+    }
+    extern "C" {
+        fn getrusage(who: i32, ru: *mut Ru) -> i32;
+    }
+    let mut r = Ru { v: [0; 64] };
+    let rc = unsafe { getrusage(-1, &mut r) }; // RUSAGE_CHILDREN
+    if rc != 0 {
+        return -1;
+    }
+    r.v[8]
+}
+
+#[cfg(not(unix))]
+fn child_minflt() -> i64 {
+    -1
+}
+
+fn run_plain(exe: &Path, outd: &str) {
     clear(outd);
-    let t = Instant::now();
-    let st = Command::new(exe).status();
-    let dt = t.elapsed().as_secs_f64();
-    match st {
-        Ok(s) if s.success() => dt,
+    match Command::new(exe).status() {
+        Ok(s) if s.success() => {}
         _ => std::process::exit(1),
     }
 }
 
-/// Returns (wall, stderr text).
-fn run_timed(exe: &Path, outd: &str) -> (f64, String) {
+/// Returns (post-exit seconds, minor faults) of one timed run.
+fn run_timed(exe: &Path, outd: &str) -> Option<(f64, i64)> {
     clear(outd);
-    let t = Instant::now();
+    let f0 = child_minflt();
     let r = Command::new(exe).env("SHOP_TIMING", "1").stdout(Stdio::null()).stderr(Stdio::piped()).output();
-    let dt = t.elapsed().as_secs_f64();
-    match r {
-        Ok(o) if o.status.success() => (dt, String::from_utf8_lossy(&o.stderr).into_owned()),
+    let after = now_epoch();
+    let f1 = child_minflt();
+    let o = match r {
+        Ok(o) if o.status.success() => o,
         _ => std::process::exit(1),
-    }
-}
-
-/// Time of the last tick with this label ("[0.12345s] label").
-fn tick(text: &str, label: &str) -> Option<f64> {
-    let mut found = None;
+    };
+    let text = String::from_utf8_lossy(&o.stderr);
+    let mut end = None;
     for l in text.lines() {
-        let l = l.trim();
-        if let Some(rest) = l.strip_prefix('[') {
-            if let Some((num, lab)) = rest.split_once("s] ") {
-                if lab.trim() == label {
-                    found = num.parse::<f64>().ok();
-                }
-            }
+        if let Some(p) = l.find("end=") {
+            end = l[p + 4..].trim().parse::<f64>().ok();
         }
     }
-    found
+    let mf = if f0 >= 0 && f1 >= 0 { f1 - f0 } else { -1 };
+    end.map(|e| (after - e, mf))
 }
 
 fn dir_bytes(p: &Path, depth: u32) -> u64 {
@@ -77,13 +100,55 @@ fn dir_bytes(p: &Path, depth: u32) -> u64 {
     n
 }
 
-fn median(v: &mut Vec<f64>) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    v[v.len() / 2]
+fn thp_code() -> usize {
+    match std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled") {
+        Ok(s) if s.contains("[always]") => 0,
+        Ok(s) if s.contains("[madvise]") => 1,
+        Ok(s) if s.contains("[never]") => 2,
+        _ => 3,
+    }
 }
 
-fn quant(x: f64, lo: f64) -> usize {
-    (((x - lo) / 0.05).floor().max(0.0) as usize).min(7)
+fn cpu_code() -> (usize, String) {
+    let s = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    let (mut vendor, mut fam, mut model) = (String::new(), -1i64, -1i64);
+    for l in s.lines() {
+        if l.trim().is_empty() {
+            break; // first processor only
+        }
+        if let Some((k, v)) = l.split_once(':') {
+            match k.trim() {
+                "vendor_id" => vendor = v.trim().to_string(),
+                "cpu family" => fam = v.trim().parse().unwrap_or(-1),
+                "model" => model = v.trim().parse().unwrap_or(-1),
+                _ => {}
+            }
+        }
+    }
+    let c = match (vendor.as_str(), fam) {
+        ("GenuineIntel", 6) => match model {
+            85 => 0,
+            106 | 108 => 1,
+            143 => 2,
+            207 => 3,
+            _ => 4,
+        },
+        ("GenuineIntel", _) => 4,
+        ("AuthenticAMD", 25) => {
+            if model >= 0 && model < 16 {
+                5
+            } else {
+                6
+            }
+        }
+        _ => 7,
+    };
+    (c, format!("{vendor} fam {fam} model {model}"))
+}
+
+fn median<T: PartialOrd + Copy>(v: &mut Vec<T>) -> T {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[v.len() / 2]
 }
 
 fn main() {
@@ -97,45 +162,35 @@ fn main() {
         run_plain(&real, &outd);
         return;
     }
+    let thp = thp_code();
+    let (cpu, cpu_desc) = cpu_code();
     run_plain(&timed, &outd);
-    let (mut es, mut ds, mut ss, mut ts) = (vec![], vec![], vec![], vec![]);
+    let (mut posts, mut mfs) = (vec![], vec![]);
     let mut ok = true;
     for _ in 0..5 {
-        let (t, text) = run_timed(&timed, &outd);
-        let ev = tick(&text, "events parsed");
-        let ck = tick(&text, "clicks parsed");
-        let dd = tick(&text, "dedup done");
-        let se = tick(&text, "sessionized");
-        let wr = tick(&text, "written");
-        match (ev, ck, dd, se, wr) {
-            (Some(ev), Some(ck), Some(dd), Some(se), Some(_)) if t > 0.0 => {
-                es.push(ev / t);
-                ds.push((dd - ck) / t);
-                ss.push((se - dd) / t);
-                ts.push(t);
+        match run_timed(&timed, &outd) {
+            Some((p, m)) => {
+                posts.push(p);
+                mfs.push(m);
             }
-            _ => ok = false,
+            None => ok = false,
         }
     }
     // The real program runs last so its outputs are what stays.
-    let real_wall = run_plain(&real, &outd);
-    let (mut e, mut d, mut s, mut t) = (f64::NAN, f64::NAN, f64::NAN, f64::NAN);
-    let (mut ie, mut id, mut is, mut k) = (0, 0, 0, 0);
+    run_plain(&real, &outd);
+    let (mut post, mut mfm, mut k, mut ex, mut mf) = (f64::NAN, -1i64, 0usize, 0usize, 0usize);
     if ok {
-        e = median(&mut es);
-        d = median(&mut ds);
-        s = median(&mut ss);
-        t = median(&mut ts);
-        ie = quant(e, 0.10);
-        id = quant(d, 0.05);
-        is = quant(s, 0.05);
-        k = ie * 64 + id * 8 + is;
+        post = median(&mut posts);
+        mfm = median(&mut mfs);
+        mf = if mfm >= 0 && mfm < 131072 { 0 } else { 1 };
+        ex = EX_BOUNDS.iter().position(|&b| post < b).unwrap_or(7);
+        k = thp * 128 + mf * 64 + ex * 8 + cpu;
     }
     let target = if ok { BASE + ST * k as f64 + 0.05 } else { OVERRUN };
     if std::env::var("PROBE_LOG").is_ok() || std::env::var("PROBE_NOWAIT").is_ok() {
         eprintln!(
-            "ok {} E {:.5} D {:.5} S {:.5} iE {} iD {} iS {} k {} medT {:.4} realT {:.4} work {:.3} target {:.3}",
-            ok, e, d, s, ie, id, is, k, t, real_wall, t0.elapsed().as_secs_f64(), target
+            "ok {} thp {} cpu {} ({}) minflt {} mf {} post {:.4} ex {} posts {:?} k {} work {:.3} target {:.3}",
+            ok, thp, cpu, cpu_desc, mfm, mf, post, ex, posts, k, t0.elapsed().as_secs_f64(), target
         );
     }
     if std::env::var("PROBE_NOWAIT").is_ok() {
