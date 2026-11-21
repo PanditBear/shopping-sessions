@@ -30,11 +30,11 @@ fn unq(f: &'static [u8]) -> Option<B> {
             return None;
         }
         let inner = &f[1..f.len() - 1];
-        if memchr(b'"', inner).is_some() {
+        if inner.iter().any(|&c| c == b'"') {
             return None;
         }
         Some(inner)
-    } else if memchr(b'"', f).is_some() {
+    } else if f.iter().any(|&c| c == b'"') {
         None
     } else {
         Some(f)
@@ -43,21 +43,31 @@ fn unq(f: &'static [u8]) -> Option<B> {
 
 #[inline]
 fn split_fields<const N: usize>(line: &'static [u8]) -> Option<[B; N]> {
-    let mut out: [B; N] = [&[]; N];
-    let mut n = 0;
-    let mut start = 0;
-    for i in memchr_iter(b',', line) {
-        if n >= N - 1 {
-            return None;
+    let mut commas = [0usize; N];
+    let mut nc = 0;
+    let mut quote = false;
+    for (i, &c) in line.iter().enumerate() {
+        if c == b',' {
+            if nc >= N - 1 {
+                return None;
+            }
+            commas[nc] = i;
+            nc += 1;
+        } else if c == b'"' {
+            quote = true;
         }
-        out[n] = unq(&line[start..i])?;
-        n += 1;
-        start = i + 1;
     }
-    if n != N - 1 {
+    if nc != N - 1 {
         return None;
     }
-    out[n] = unq(&line[start..])?;
+    let mut out: [B; N] = [&[]; N];
+    let mut start = 0;
+    for k in 0..N {
+        let end = if k < N - 1 { commas[k] } else { line.len() };
+        let f = &line[start..end];
+        out[k] = if quote { unq(f)? } else { f };
+        start = end + 1;
+    }
     Some(out)
 }
 
@@ -703,6 +713,7 @@ fn main() {
     camp_names.push(b"organic");
     channels.push(b"organic");
 
+    tick("prod/camp loaded");
     let rs = hasher();
 
     // links
@@ -721,6 +732,7 @@ fn main() {
             v
         })
         .collect();
+    tick("links parsed");
     let occ: usize = link_pairs.iter().map(|v| v.len()).sum::<usize>() * 2;
     let cap = (occ.max(8) * 2).next_power_of_two();
     let mut tab = LinkTab { s: vec![0u64; cap * 3], mask: cap - 1 };
@@ -763,6 +775,7 @@ fn main() {
                 edges.push((a, b));
             }
         }
+        tick(&format!("links inserted {}", idx_h.len()));
         for (a, b) in edges {
             let ra = find(&mut parent, a);
             let rb = find(&mut parent, b);
@@ -771,6 +784,7 @@ fn main() {
             }
         }
     }
+    tick("links unioned");
     let nl = idx_h.len();
     let mut best: Vec<u32> = (0..nl as u32).collect();
     for g in 0..nl {
@@ -779,6 +793,7 @@ fn main() {
             best[r] = g as u32;
         }
     }
+    tick("links best");
     for i in 0..cap {
         if tab.s[i * 3] != 0 {
             let g = tab.s[i * 3 + 1] as u32;
@@ -824,7 +839,8 @@ fn main() {
     let ev_out: Vec<Vec<Vec<EvRec>>> = ev_chunks
         .par_iter()
         .map(|&c| {
-            let mut out: Vec<Vec<EvRec>> = (0..EB).map(|_| Vec::new()).collect();
+            let est = c.len() / 48 / EB + 16;
+            let mut out: Vec<Vec<EvRec>> = (0..EB).map(|_| Vec::with_capacity(est)).collect();
             let mut tc = TsCache { pre: [0; 10], days: 0, ok: false };
             lines(c, |l| {
                 let Some([eid, uid, ts, ing, et, pr, price]) = split_fields::<7>(l) else { return };
