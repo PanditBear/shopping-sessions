@@ -865,11 +865,12 @@ struct IdTab {
     s: Vec<[u64; 2]>,
     shift: u32,
     mask: usize,
+    len: usize,
 }
 impl IdTab {
     fn with_cap(n: usize) -> Self {
         let cap = (n + n / 2).max(16).next_power_of_two();
-        IdTab { s: vec![[0u64; 2]; cap], shift: 64 - cap.trailing_zeros(), mask: cap - 1 }
+        IdTab { s: vec![[0u64; 2]; cap], shift: 64 - cap.trailing_zeros(), mask: cap - 1, len: 0 }
     }
     #[inline(always)]
     fn slot(&self, k: u64) -> usize {
@@ -879,9 +880,26 @@ impl IdTab {
     fn pf(&self, k: u64) {
         prefetch(unsafe { self.s.as_ptr().add(self.slot(k)) });
     }
+    fn grow(&mut self) {
+        let mut n = IdTab::with_cap(self.s.len());
+        n.len = self.len;
+        for e in &self.s {
+            if e[0] != 0 {
+                let mut i = n.slot(e[0]);
+                while n.s[i][0] != 0 {
+                    i = (i + 1) & n.mask;
+                }
+                n.s[i] = *e;
+            }
+        }
+        *self = n;
+    }
     /// returns existing value or inserts v
     #[inline]
     fn get_or_insert(&mut self, k: u64, v: u64) -> (u64, bool) {
+        if self.len * 10 >= self.s.len() * 7 {
+            self.grow();
+        }
         let mut i = self.slot(k);
         loop {
             let e = self.s[i];
@@ -890,6 +908,7 @@ impl IdTab {
             }
             if e[0] == 0 {
                 self.s[i] = [k, v];
+                self.len += 1;
                 return (v, true);
             }
             i = (i + 1) & self.mask;
@@ -2092,7 +2111,7 @@ fn main() {
             let occ: usize = link_pairs.iter().map(|v| v.len()).sum::<usize>() * 2;
             let mut names_map: AHashMap<u64, u64> = AHashMap::new();
             let tab = {
-                let mut t = IdTab::with_cap(occ);
+                let mut t = IdTab::with_cap(occ / 2);
                 let mut idx_key: Vec<u64> = vec![];
                 let mut idx_ref: Vec<u64> = vec![];
                 let mut parent: Vec<u32> = vec![];
@@ -2143,16 +2162,22 @@ fn main() {
                         best[r] = g as u32;
                     }
                 }
-                let mut ft = IdTab::with_cap(nl);
+                // person key per id index, then rewrite the table's values in place
+                let mut pkv: Vec<u64> = Vec::with_capacity(nl);
                 for g in 0..nl {
                     let b = best[find(&mut parent, g as u32) as usize] as usize;
                     let pk = idx_key[b];
-                    ft.get_or_insert(idx_key[g], pk);
+                    pkv.push(pk);
                     if pk & HBIT != 0 && b == g {
                         names_map.insert(pk, idx_ref[b]);
                     }
                 }
-                ft
+                for e in t.s.iter_mut() {
+                    if e[0] != 0 {
+                        e[1] = pkv[e[1] as usize];
+                    }
+                }
+                t
             };
             drop(link_pairs);
             tick("links done");
