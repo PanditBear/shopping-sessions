@@ -8,3 +8,4 @@ time,event,ticket,branch,dev,holdout,runtime_s,board,commit,note
 2026-11-20 18:43:44,land,D-dock,D-dock,1.0,1.0,65.292,,3ce024ad99,
 2026-11-20 18:52:14,board,,,,,,2.85,98cdde8eae,"BB-5BA297E4 scored 2.85 s (Rust, musl scratch image)"
 2026-11-20 19:19:01,land,R-speed2,speed2,1.0,1.0,46.98,,0d6adbddb6,
+2026-11-20 19:20:51,land,D-v3,cpu-v3,1.0,1.0,49.919,,65694143b8,
