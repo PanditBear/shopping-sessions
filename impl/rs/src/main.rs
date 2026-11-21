@@ -2582,12 +2582,13 @@ impl Bp {
     }
     #[inline(always)]
     fn put(&mut self, v: u32) {
+        // nb < 32 and w <= 32 on entry, so acc never overflows
         self.acc |= (v as u64) << self.nb;
         self.nb += self.w;
-        while self.nb >= 8 {
-            self.o.push(self.acc as u8);
-            self.acc >>= 8;
-            self.nb -= 8;
+        if self.nb >= 32 {
+            self.o.extend_from_slice(&(self.acc as u32).to_le_bytes());
+            self.acc >>= 32;
+            self.nb -= 32;
         }
         self.n += 1;
     }
@@ -2595,6 +2596,9 @@ impl Bp {
         while self.n % 8 != 0 {
             self.put(0);
         }
+        // a whole number of 8-value groups is a whole number of bytes
+        let k = (self.nb / 8) as usize;
+        self.o.extend_from_slice(&self.acc.to_le_bytes()[..k]);
         self.o
     }
 }
@@ -2764,23 +2768,18 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
         cm(2, "revenue_cents"),
         cm(6, "top_category"),
     ];
-    let rawm: u32 = std::env::var("SHOP_RAWM").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    for k in 0..6 {
-        cols[k].raw = rawm >> k & 1 != 0;
-    }
     // int columns: range dictionary + bit-packed indices when the range is small
     let rng = [(dlo, dhi), (slo as i64, shi as i64), (elo as i64, ehi as i64)];
     let small: [bool; 3] = [0, 1, 2].map(|k| n > 0 && rng[k].1 - rng[k].0 < (1 << 16));
-    let mut bps: Vec<Bp> = (0..3)
-        .map(|k| {
-            if small[k] {
-                let w = bwid((rng[k].1 - rng[k].0) as u64);
-                Bp::new(w, n, &[w as u8])
-            } else {
-                Bp::new(1, 0, &[])
-            }
-        })
-        .collect();
+    let mk = |k: usize| {
+        if small[k] {
+            let w = bwid((rng[k].1 - rng[k].0) as u64);
+            Bp::new(w, n, &[w as u8])
+        } else {
+            Bp::new(1, 0, &[])
+        }
+    };
+    let (mut b0, mut b1, mut b2) = (mk(0), mk(1), mk(2));
     let (sd, ss, se) = (small[0], small[1], small[2]);
     // user_id: dictionary of the persons in row order, indices as one RLE run per person
     let uw = bwid(persons.saturating_sub(1) as u64);
@@ -2833,13 +2832,13 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
             }
             run += 1;
             if sd {
-                bps[0].put((r.day as i64 - dlo) as u32);
+                b0.put((r.day as i64 - dlo) as u32);
             }
             if ss {
-                bps[1].put((r.sessions as u64 - slo) as u32);
+                b1.put((r.sessions as u64 - slo) as u32);
             }
             if se {
-                bps[2].put((r.events as u64 - elo) as u32);
+                b2.put((r.events as u64 - elo) as u32);
             }
             if rdict {
                 if r.rev == 0 {
@@ -2879,9 +2878,9 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
     f.page(&mut cols[0], true, persons, 0, &udict);
     f.page(&mut cols[0], false, n, 8, &uidx);
     pt(15, &mut tm);
-    let mut bps = bps.into_iter();
+    let mut bps = [Some(b0), Some(b1), Some(b2)];
     for c in 1..4 {
-        let b = bps.next().unwrap();
+        let b = bps[c - 1].take().unwrap();
         let (lo, hi) = rng[c - 1];
         if small[c - 1] {
             int_range_dict(f, &mut cols[c], lo, hi);
