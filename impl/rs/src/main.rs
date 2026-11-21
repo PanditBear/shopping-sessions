@@ -1234,6 +1234,25 @@ impl<E: Ev> Dz<E> {
             None => None,
         }
     }
+    /// `idx(pack6(id))` for an ID of `n` bytes at `p` (None also when the ID does not pack)
+    /// SAFETY: the 9 bytes from `p` are readable
+    #[inline(always)]
+    unsafe fn idx_txt(&self, p: *const u8, n: usize) -> Option<u64> {
+        if !self.on {
+            return None;
+        }
+        match gen_val_txt(p, n, b'e') {
+            Some(v) => {
+                let i = gen_idx(v, self.key);
+                if i < self.lim {
+                    Some(i)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
+    }
     #[inline(always)]
     fn put(&mut self, i: u64, ing: u32, e: E, exact: bool, ingest: i64) {
         let b = (i >> self.sh) as usize;
@@ -3082,11 +3101,10 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
                 let key = if oku { ku } else { ev_key_slow(sl(pu, nu), cx.rs, fbn) };
                 r = E::mk(key, (t - ws) as u64, pv, cat);
             }
-            if oke {
-                if let Some(i) = dz.idx(ke) {
-                    dz.put(i, ik, r, iex, ingest);
-                    continue 'ln;
-                }
+            // SAFETY: 16 bytes from pe are readable (see pack6x2)
+            if let Some(i) = unsafe { dz.idx_txt(pe, ne) } {
+                dz.put(i, ik, r, iex, ingest);
+                continue 'ln;
             }
             let loc = m.len() as u32;
             m.push(r);
@@ -4008,6 +4026,40 @@ fn gen_val(k: u64, pre: u64) -> Option<u64> {
         return None;
     }
     let v = y - (h8(1) & lm) - ((low >> 7) & lm) * 27;
+    let t = ((v >> 8) & 0x00FF_00FF_00FF_00FF) * 36 + (v & 0x00FF_00FF_00FF_00FF);
+    let t = ((t >> 16) & 0x0000_FFFF_0000_FFFF) * 1296 + (t & 0x0000_FFFF_0000_FFFF);
+    let val = (t >> 32) * 1_679_616 + (t & 0xFFFF_FFFF);
+    if val > GM {
+        None
+    } else {
+        Some(val)
+    }
+}
+
+/// `gen_val(pack6(id), CODE[pre])` straight from the ID's bytes, without packing: the ID is
+/// `pre` then a base-36 body of 1-8 chars [0-9a-z] with no leading '0', worth at most GM.
+/// SAFETY: the 9 bytes from `p` are readable (bytes past `n` are ignored).
+#[inline(always)]
+unsafe fn gen_val_txt(p: *const u8, n: usize, pre: u8) -> Option<u64> {
+    let l = n.wrapping_sub(2);
+    if l >= 8 || *p != pre {
+        return None;
+    }
+    // the body's l + 1 bytes right-aligned, its first char in the top byte
+    let sh = 8 * (7 - l) as u32;
+    let y = (p.add(1) as *const u64).read_unaligned().swap_bytes() >> sh;
+    let lm = u64::MAX >> sh;
+    let hi = h8(0x80);
+    if (y & hi) != 0 {
+        return None;
+    }
+    let ge = |c: u8| y.wrapping_add(h8(0x80 - c)) & hi;
+    let low = ge(b'a');
+    let ok = (ge(b'0') & !ge(b'9' + 1)) | (low & !ge(b'z' + 1));
+    if (ok & lm) != (hi & lm) || (y >> (8 * l)) == b'0' as u64 {
+        return None;
+    }
+    let v = y - (h8(b'0') & lm) - ((low >> 7) & lm) * (b'a' - 10 - b'0') as u64;
     let t = ((v >> 8) & 0x00FF_00FF_00FF_00FF) * 36 + (v & 0x00FF_00FF_00FF_00FF);
     let t = ((t >> 16) & 0x0000_FFFF_0000_FFFF) * 1296 + (t & 0x0000_FFFF_0000_FFFF);
     let val = (t >> 32) * 1_679_616 + (t & 0xFFFF_FFFF);
@@ -5153,6 +5205,70 @@ mod pack_simd_tests {
                 Some(e) => assert!(ok && k == e, "pack6x2 differs on {:?}", x),
                 None => assert!(!ok, "pack6x2 accepts {:?}", x),
             }
+        }
+    }
+
+    fn chk_txt(a: &[u8], pad: u8) {
+        let mut buf = [pad; 32];
+        buf[..a.len()].copy_from_slice(a);
+        let want = pack6(a).and_then(|k| gen_val(k, 42));
+        let got = unsafe { gen_val_txt(buf.as_ptr(), a.len(), b'e') };
+        assert_eq!(got, want, "gen_val_txt differs on {:?}", String::from_utf8_lossy(a));
+    }
+
+    #[test]
+    fn gen_val_txt_matches_gen_val() {
+        let body: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        let mut nok = 0usize;
+        for n in 0..=12usize {
+            for pos in 0..n {
+                for v in 0..=255u8 {
+                    let mut a: Vec<u8> = (0..n).map(|i| if i == 0 { b'e' } else { body[(i * 7 + n) % 36] }).collect();
+                    a[pos] = v;
+                    for pad in [b',', b'0', b'z', 0xFF, 0] {
+                        chk_txt(&a, pad);
+                    }
+                    nok += pack6(&a).and_then(|k| gen_val(k, 42)).is_some() as usize;
+                }
+            }
+        }
+        assert!(nok > 1000);
+        // edges: GM and GM + 1 in base 36, leading zeros, every length
+        let b36 = |mut x: u64| {
+            let mut d = vec![];
+            while x > 0 {
+                d.push(body[(x % 36) as usize]);
+                x /= 36;
+            }
+            d.reverse();
+            let mut s = vec![b'e'];
+            s.extend(d);
+            s
+        };
+        for x in [0, 1, 35, 36, GM - 1, GM, GM + 1, GM + 36, 36u64.pow(8) - 1] {
+            for pad in [b',', b'z'] {
+                chk_txt(&b36(x), pad);
+            }
+        }
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let alpha: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCZ_e,\"";
+        for _ in 0..3_000_000 {
+            let r = rnd();
+            let n = (r % 12) as usize;
+            let mut a: Vec<u8> = (0..n).map(|i| {
+                let q = rnd();
+                if i == 0 && q % 8 != 0 { b'e' } else if q % 4 != 0 { body[(q >> 8) as usize % 36] } else { alpha[(q >> 8) as usize % alpha.len()] }
+            }).collect();
+            if n > 1 && r & 0x100 != 0 {
+                a[1] = body[1 + (r >> 9) as usize % 35];
+            }
+            chk_txt(&a, (r >> 32) as u8);
         }
     }
 
