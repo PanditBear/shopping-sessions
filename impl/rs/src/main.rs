@@ -1104,41 +1104,31 @@ struct MoverF {
     g: Option<GpTab>,
 }
 impl MoverF {
-    /// zeroed filter words, per-person words and the person count for a table of nslots slots
-    /// holding mov movers
-    fn alloc(nslots: usize, mov: usize, ukey: Option<u64>) -> (Vec<AtomicU64>, Vec<u64>, usize) {
-        let nw = (nslots / 16).max(1);
-        let w: Vec<AtomicU64> = (0..nw).map(|_| AtomicU64::new(0)).collect();
-        let gn = if ukey.is_some() { 2 * mov + (1 << 16) } else { 0 };
-        (w, vec![0u64; 2 * gn], gn)
+    fn build(tab: &IdTab) -> Self {
+        Self::build_with(tab, UKEYC.get().copied().flatten())
     }
-    /// records mover k (person key p != k); ga is the per-person words of alloc as atomics
-    #[inline(always)]
-    fn add(w: &[AtomicU64], ga: &[AtomicU64], gn: usize, ukey: Option<u64>, k: u64, p: u64) {
-        let h = mix(k);
-        w[h as usize & (w.len() - 1)].fetch_or(Self::bits(h), Relaxed);
-        if let Some(key) = ukey {
-            GpTab::add(ga, gn, key, k, p);
-        }
-    }
-    fn finish(w: Vec<AtomicU64>, ge: Vec<u64>, gn: usize, ukey: Option<u64>) -> Self {
-        let mask = w.len() - 1;
-        MoverF { w, mask, g: ukey.map(|key| GpTab { key, n: gn, e: ge }) }
-    }
-    #[cfg_attr(not(test), allow(dead_code))]
     fn build_with(tab: &IdTab, ukey: Option<u64>) -> Self {
-        let (w, mut ge, gn) = Self::alloc(tab.s.len(), tab.mov, ukey);
+        let nw = (tab.s.len() / 16).max(1);
+        let w: Vec<AtomicU64> = (0..nw).map(|_| AtomicU64::new(0)).collect();
+        let gn = if ukey.is_some() { 2 * tab.mov + (1 << 16) } else { 0 };
+        let mut ge = vec![0u64; 2 * gn];
         {
-            let ga = atomic_words(&mut ge);
+            // SAFETY: AtomicU64 has the same in-memory representation as u64
+            let ga = unsafe { &*(ge.as_mut_slice() as *mut [u64] as *const [AtomicU64]) };
             tab.s.par_chunks(1 << 15).for_each(|c| {
                 for e in c {
                     if e[0] != 0 && e[0] != e[1] {
-                        Self::add(&w, ga, gn, ukey, e[0], e[1]);
+                        let h = mix(e[0]);
+                        w[h as usize & (nw - 1)].fetch_or(Self::bits(h), Relaxed);
+                        if let Some(key) = ukey {
+                            GpTab::add(ga, gn, key, e[0], e[1]);
+                        }
                     }
                 }
             });
         }
-        Self::finish(w, ge, gn, ukey)
+        let g = ukey.map(|key| GpTab { key, n: gn, e: ge });
+        MoverF { w, mask: nw - 1, g }
     }
     /// person key of user key k
     #[inline(always)]
@@ -1218,12 +1208,6 @@ impl GpTab {
 }
 
 static UKEYC: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-
-/// the words of v as atomics, for parallel fetch_or and compare_exchange
-fn atomic_words(v: &mut [u64]) -> &[AtomicU64] {
-    // SAFETY: AtomicU64 has the same in-memory representation as u64, and v stays borrowed
-    unsafe { &*(v as *mut [u64] as *const [AtomicU64]) }
-}
 
 const PFD: usize = 12;
 /// prefetch distance of the user -> person passes (mover filter, then table), sized for DRAM latency
@@ -4792,16 +4776,9 @@ fn main() {
         },
     );
 
-    // the insert table becomes the id table in place (a slot's index turns into its person key), with the whole pool;
-    // the same pass fills the mover filter and the per-person mover table
-    tab.mov = nl - nroot;
-    let mut tm = now();
-    let gkey = UKEYC.get().copied().flatten();
-    let (mw, mut ge, gn) = MoverF::alloc(tab.s.len(), tab.mov, gkey);
+    // the insert table becomes the id table in place (a slot's index turns into its person key), with the whole pool
     {
         let (root, bk) = (&root[..], &bk[..]);
-        let w = &mw[..];
-        let ga = atomic_words(&mut ge);
         tab.s.par_chunks_mut(1 << 14).for_each(|c| {
             let n = c.len();
             for i in 0..n {
@@ -4816,22 +4793,20 @@ fn main() {
                 }
                 let e = &mut c[i];
                 if e[0] != 0 {
-                    let p = bk[root[e[1] as usize] as usize][0];
-                    e[1] = p;
-                    if p != e[0] {
-                        MoverF::add(w, ga, gn, gkey, e[0], p);
-                    }
+                    e[1] = bk[root[e[1] as usize] as usize][0];
                 }
             }
         });
     }
-    let mf = MoverF::finish(mw, ge, gn, gkey);
-    pt(4, &mut tm);
+    tab.mov = nl - nroot;
     drop((root, bk));
     tick(&format!("links table movers {}", tab.mov));
 
     // clicks
     let click_chunks = all_chunks(&csv_files(&data.join("clicks")), CHUNK);
+    let mut tm = now();
+    let mf = MoverF::build(&tab);
+    pt(4, &mut tm);
     let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_chunks
         .par_iter()
         .map(|&c| {
