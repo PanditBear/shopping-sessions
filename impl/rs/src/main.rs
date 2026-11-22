@@ -4167,7 +4167,7 @@ impl<E: Ev> SsW<E> {
                     }
                     _ => runs.push(Run { d: r.d, k: r.k, s: s as u32, l: n as u32, ok }),
                 }
-                evs.extend_from_slice(v);
+                copy_run(evs, v);
             } else {
                 let v = &rest.0[off..off + n];
                 match runs.last_mut() {
@@ -4203,6 +4203,39 @@ impl RunD {
     fn new(k: u64, off: usize, len: usize, ok: bool) -> Self {
         RunD { k, off: off as u32, lk: Self::lk(len, ok) }
     }
+}
+
+/// Appends `v` to `evs`. Short runs (a few hundred bytes) are copied with an inline 16-byte
+/// loop: `rep movsq` behind memcpy has a high startup cost at this size.
+#[inline(always)]
+fn copy_run<T: Copy>(evs: &mut Vec<T>, v: &[T]) {
+    let bytes = std::mem::size_of_val(v);
+    #[cfg(target_arch = "x86_64")]
+    if v.len() <= 64 && bytes % 8 == 0 {
+        use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
+        evs.reserve(v.len());
+        let len = evs.len();
+        // SAFETY: capacity >= len + v.len() after reserve, so every store below lies inside the
+        // allocation (bytes of destination = bytes of source); source and destination are
+        // distinct allocations; the u64 tail is only touched when bytes % 16 == 8; T is Copy, so
+        // the elements are initialized by the byte copy before set_len.
+        unsafe {
+            let mut s = v.as_ptr() as *const u8;
+            let mut d = evs.as_mut_ptr().add(len) as *mut u8;
+            let end = s.add(bytes & !15);
+            while s < end {
+                _mm_storeu_si128(d as *mut __m128i, _mm_loadu_si128(s as *const __m128i));
+                s = s.add(16);
+                d = d.add(16);
+            }
+            if bytes & 8 != 0 {
+                (d as *mut u64).write_unaligned((s as *const u64).read_unaligned());
+            }
+            evs.set_len(len + v.len());
+        }
+        return;
+    }
+    evs.extend_from_slice(v);
 }
 
 /// A descriptor in gather_rd: digit, person key, part << 32 | offset (its sort key) and lk.
