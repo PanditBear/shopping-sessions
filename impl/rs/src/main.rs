@@ -4299,15 +4299,27 @@ fn parse_events_sol<E: Ev, const DZ: bool>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: 
             if !iex {
                 side.push((loc, ingest));
             }
-            // SAFETY: 16 bytes from pe are readable (see pack6x2's callers above), and when ne == 33
-            // idk_x reads the 33 id bytes themselves
-            let (ke, full, cls) = if DZ {
-                unsafe { idk_x(pe, ne) }
-            } else if oke6 {
-                (ke6, 0, 0)
-            } else {
-                unsafe { idk_hex(pe, ne) }
-            };
+            if !DZ {
+                if oke6 {
+                    d.push(DRec { eid: ke6, ing: ik, loc });
+                    continue 'ln;
+                }
+                // A long Hex record only needs its suffix and prefix; no assembled key.
+                if ne == 33 && loc <= DX_LOC {
+                    let prefix = CODE[unsafe { *pe } as usize];
+                    if prefix != 0 {
+                        let (full, valid) = unsafe { hex32(pe.add(1)) };
+                        if valid {
+                            fb.x.push(DX::new(full, prefix, ik, loc));
+                            continue 'ln;
+                        }
+                    }
+                }
+                fb_put_other(cx.rs, d, fb, sl(pe, ne), ingest, ik, loc);
+                continue 'ln;
+            }
+            // SAFETY: the id is inside the validated line buffer.
+            let (ke, full, cls) = unsafe { idk_x(pe, ne) };
             if cls == 0 {
                 d.push(DRec { eid: ke, ing: ik, loc });
             } else if cls == 1 && loc <= DX_LOC {
