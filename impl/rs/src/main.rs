@@ -4900,28 +4900,43 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
     let a: Vec<(Vec<E>, Vec<u32>, Vec<Vec<E>>)> = lpt_map(ev_out, &ccost, |ci, c: EvChunk<E>| {
         let mut tm = now();
         let mb = mbase[ci] as usize;
-        let mut m = c.m;
+        let m = c.m;
         let n = m.len();
         let mut cnt = vec![0u32; PB + 1];
-        let mut h: Vec<Vec<E>> = (0..nr).map(|_| Vec::with_capacity(n / 2 / nr + 8)).collect();
-        for i in 0..n {
-            if i + RPD < n {
-                mf.pf(m[i + RPD].key());
-            }
-            let g = mb + i;
-            let k = m[i].key();
-            if k != 0 && dead[g >> 6].load(Relaxed) & (1u64 << (g & 63)) == 0 {
-                if mf.hit(k) {
-                    // SAFETY: reg(k) < nr = h.len()
-                    unsafe { h.get_unchecked_mut(reg(k)) }.push(m[i]);
-                    m[i].set_key(0);
-                } else {
-                    cnt[pbk(k) + 1] += 1;
+        // Without data-dependent branches: a live line (key set, not a dedup loser) that misses
+        // the filter sets its bit in `km` and counts in its person bucket; a live line that hits
+        // it lists its index in `hi`. Every other line adds 0 to a count and lists nothing. m is
+        // only read.
+        let mut km = vec![0u64; n.div_ceil(64)];
+        let mut hi: Vec<u32> = Vec::with_capacity(n);
+        {
+            let hs = hi.spare_capacity_mut();
+            let mut nh = 0usize;
+            for i in 0..n {
+                if i + RPD < n {
+                    mf.pf(m[i + RPD].key());
                 }
-            } else {
-                m[i].set_key(0);
+                let g = mb + i;
+                let k = m[i].key();
+                let live = (k != 0) & (dead[g >> 6].load(Relaxed) & (1u64 << (g & 63)) == 0);
+                let hit = mf.hit(k);
+                let keep = live & !hit;
+                cnt[pbk(k) + 1] += keep as u32;
+                km[i >> 6] |= (keep as u64) << (i & 63);
+                // SAFETY: nh <= i < n = hs.len()
+                unsafe { hs.get_unchecked_mut(nh) }.write(i as u32);
+                nh += (live & hit) as usize;
             }
+            // SAFETY: the first nh slots were written
+            unsafe { hi.set_len(nh) };
         }
+        let mut h: Vec<Vec<E>> = (0..nr).map(|_| Vec::with_capacity(hi.len() / nr + hi.len() / (4 * nr) + 8)).collect();
+        for &i in &hi {
+            let e = m[i as usize];
+            // SAFETY: reg(k) < nr = h.len()
+            unsafe { h.get_unchecked_mut(reg(e.key())) }.push(e);
+        }
+        drop(hi);
         pt(4, &mut tm);
         for p in 0..PB {
             cnt[p + 1] += cnt[p];
@@ -4931,11 +4946,14 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
         {
             let mut w = cnt.clone();
             let sp = out.spare_capacity_mut();
-            for e in &m {
-                let k = e.key();
-                if k != 0 {
-                    let p = pbk(k);
-                    sp[w[p] as usize].write(*e);
+            for (wi, &b0) in km.iter().enumerate() {
+                let mut b = b0;
+                while b != 0 {
+                    let i = wi * 64 + b.trailing_zeros() as usize;
+                    b &= b - 1;
+                    let e = m[i];
+                    let p = pbk(e.key());
+                    sp[w[p] as usize].write(e);
                     w[p] += 1;
                 }
             }
