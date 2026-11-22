@@ -4834,8 +4834,9 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
             (mix(k) >> (64 - rb)) as usize
         }
     };
-    // (filter misses by person bucket, their offsets, filter hits by region, their offsets)
-    let a: Vec<(Vec<E>, Vec<u32>, Vec<E>, Vec<u32>)> = ev_out
+    // (filter misses by person bucket, their offsets, filter hits split by region: one list per
+    // region, filled in line order during the filter pass, so no second pass over the hits)
+    let a: Vec<(Vec<E>, Vec<u32>, Vec<Vec<E>>)> = ev_out
         .into_par_iter()
         .enumerate()
         .map(|(ci, c)| {
@@ -4844,7 +4845,7 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
             let mut m = c.m;
             let n = m.len();
             let mut cnt = vec![0u32; PB + 1];
-            let mut h: Vec<E> = Vec::with_capacity(n / 2);
+            let mut h: Vec<Vec<E>> = (0..nr).map(|_| Vec::with_capacity(n / 2 / nr + 8)).collect();
             for i in 0..n {
                 if i + RPD < n {
                     mf.pf(m[i + RPD].key());
@@ -4853,7 +4854,8 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
                 let k = m[i].key();
                 if k != 0 && dead[g >> 6].load(Relaxed) & (1u64 << (g & 63)) == 0 {
                     if mf.hit(k) {
-                        h.push(m[i]);
+                        // SAFETY: reg(k) < nr = h.len()
+                        unsafe { h.get_unchecked_mut(reg(k)) }.push(m[i]);
                         m[i].set_key(0);
                     } else {
                         cnt[pbk(k) + 1] += 1;
@@ -4862,7 +4864,6 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
                     m[i].set_key(0);
                 }
             }
-            let (hk, ho) = bucketize(&h, nr, |e| reg(e.key()));
             pt(4, &mut tm);
             for p in 0..PB {
                 cnt[p + 1] += cnt[p];
@@ -4883,27 +4884,36 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
             }
             unsafe { out.set_len(tot) };
             pt(5, &mut tm);
-            (out, cnt, hk, ho)
+            (out, cnt, h)
         })
         .collect();
-    let hp: Vec<(Vec<E>, Vec<u32>)> = (0..nr)
+    // regroup the hit lists by region (chunk order kept inside a region)
+    let mut a0: Vec<(Vec<E>, Vec<u32>)> = Vec::with_capacity(a.len() + nr);
+    let mut regs: Vec<Vec<Vec<E>>> = (0..nr).map(|_| Vec::with_capacity(a.len())).collect();
+    for (out, cnt, h) in a {
+        a0.push((out, cnt));
+        for (r, v) in h.into_iter().enumerate() {
+            regs[r].push(v);
+        }
+    }
+    let hp: Vec<(Vec<E>, Vec<u32>)> = regs
         .into_par_iter()
         .with_max_len(1)
-        .map(|r| {
+        .map(|mut rl| {
             const PD: usize = 16;
             let mut tm = now();
-            let mut pk: Vec<u64> = Vec::new();
             let mut cnt = vec![0u32; PB + 1];
-            for x in &a {
-                let s = &x.2[x.3[r] as usize..x.3[r + 1] as usize];
+            // person keys set in place: same lookups as a line-by-line pass, with this region of
+            // the table in cache
+            for s in rl.iter_mut() {
                 let l = s.len();
                 for j in 0..l {
                     if j + PD < l {
                         tab.pf(s[j + PD].key());
                     }
                     let p = tab.get(s[j].key());
+                    s[j].set_key(p);
                     cnt[pbk(p) + 1] += 1;
-                    pk.push(p);
                 }
             }
             pt(4, &mut tm);
@@ -4915,25 +4925,22 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
             {
                 let mut w = cnt.clone();
                 let sp = out.spare_capacity_mut();
-                let mut q = 0usize;
-                for x in &a {
-                    for e in &x.2[x.3[r] as usize..x.3[r + 1] as usize] {
-                        let mut e = *e;
-                        let p = pk[q];
-                        q += 1;
-                        e.set_key(p);
-                        let b = pbk(p);
-                        sp[w[b] as usize].write(e);
+                for s in &rl {
+                    for e in s {
+                        let b = pbk(e.key());
+                        sp[w[b] as usize].write(*e);
                         w[b] += 1;
                     }
                 }
             }
             unsafe { out.set_len(tot) };
+            drop(rl);
             pt(5, &mut tm);
             (out, cnt)
         })
         .collect();
-    a.into_iter().map(|x| (x.0, x.1)).chain(hp).collect()
+    a0.extend(hp);
+    a0
 }
 
 /// Last few (user key, person key) pairs: lines in index order mostly repeat a user.
@@ -6254,50 +6261,56 @@ fn main() {
     let mut tm = now();
     let mf = MoverF::build(&tab);
     pt(4, &mut tm);
-    let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_chunks
-        .par_iter()
-        .map(|&c| {
-            let mut tmp: Vec<ClickRec> = Vec::with_capacity(c.len() / 40);
-            let mut tm = now();
-            parse_clicks(c, &camp, &rs, ws, we, &mut tmp);
-            pt(9, &mut tm);
-            // keys that miss the mover filter map to themselves without a table lookup. The
-            // filter pass lists the hits without branching on them, the table pass resolves only
-            // those, and both count the person buckets of the final keys on the way.
-            let n = tmp.len();
-            let mut hit = vec![0u32; n + 1];
-            let mut cnt = vec![0u32; PB + 1];
-            let mut m = 0usize;
-            for i in 0..n {
-                if i + RPD < n {
-                    mf.pf(tmp[i + RPD].key);
+    // the names of hashed user keys (one map insert per such line, serial) merge on one thread
+    // while the others parse the clicks; the map is read only by the writers
+    let (click_out, ()) = rayon::join(
+        || -> Vec<(Vec<ClickRec>, Vec<u32>)> {
+            click_chunks
+            .par_iter()
+            .map(|&c| {
+                let mut tmp: Vec<ClickRec> = Vec::with_capacity(c.len() / 40);
+                let mut tm = now();
+                parse_clicks(c, &camp, &rs, ws, we, &mut tmp);
+                pt(9, &mut tm);
+                // keys that miss the mover filter map to themselves without a table lookup. The
+                // filter pass lists the hits without branching on them, the table pass resolves only
+                // those, and both count the person buckets of the final keys on the way.
+                let n = tmp.len();
+                let mut hit = vec![0u32; n + 1];
+                let mut cnt = vec![0u32; PB + 1];
+                let mut m = 0usize;
+                for i in 0..n {
+                    if i + RPD < n {
+                        mf.pf(tmp[i + RPD].key);
+                    }
+                    let k = tmp[i].key;
+                    let h = mf.hit(k);
+                    hit[m] = i as u32;
+                    m += h as usize;
+                    cnt[pbk(k) + 1] += (!h) as u32;
                 }
-                let k = tmp[i].key;
-                let h = mf.hit(k);
-                hit[m] = i as u32;
-                m += h as usize;
-                cnt[pbk(k) + 1] += (!h) as u32;
-            }
-            for j in 0..m {
-                if j + RPD < m {
-                    tab.pf(tmp[hit[j + RPD] as usize].key);
+                for j in 0..m {
+                    if j + RPD < m {
+                        tab.pf(tmp[hit[j + RPD] as usize].key);
+                    }
+                    let i = hit[j] as usize;
+                    let k = tab.get(tmp[i].key);
+                    tmp[i].key = k;
+                    cnt[pbk(k) + 1] += 1;
                 }
-                let i = hit[j] as usize;
-                let k = tab.get(tmp[i].key);
-                tmp[i].key = k;
-                cnt[pbk(k) + 1] += 1;
-            }
-            drop(hit);
-            let r = scatter_counted(&tmp, cnt, |x| pbk(x.key));
-            pt(10, &mut tm);
-            r
-        })
-        .collect();
+                drop(hit);
+                let r = scatter_counted(&tmp, cnt, |x| pbk(x.key));
+                pt(10, &mut tm);
+                r
+            })
+            .collect()
+        },
+        || match &ev_out {
+            Evs::L(v) => fbn_merge(v, &mut names_map),
+            Evs::W(v) => fbn_merge(v, &mut names_map),
+        },
+    );
     tick("clicks parsed");
-    match &ev_out {
-        Evs::L(v) => fbn_merge(v, &mut names_map),
-        Evs::W(v) => fbn_merge(v, &mut names_map),
-    }
 
     // person buckets
     let d0 = ws.div_euclid(DAY);
