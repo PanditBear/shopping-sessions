@@ -2207,8 +2207,10 @@ const TSB: u32 = 22;
 /// order the u64s by quantized ts, and one counting scatter by dg moves the records. Each dg
 /// range is then ts-ordered up to the quantum: a one-key range gets an insertion fixup on rts,
 /// a multi-key range a stable split by key and the same fixup. Returns false when the fields do
-/// not fit in 64 bits.
-fn sort_evs_ts<E: Ev>(evs: &mut Vec<E>, tmp: &mut Vec<E>, h: &mut Vec<u32>, span: i64) -> bool {
+/// not fit in 64 bits. Bin mode (`bins` and fewer than 2048 bins of GAP in the span): the
+/// quantized ts is the bin rts / GAP, so one LSD pass orders it, and the ranges get no rts fixup
+/// (a multi-key range only the stable split by key): each key's records come out in bin order.
+fn sort_evs_ts<E: Ev>(evs: &mut Vec<E>, tmp: &mut Vec<E>, h: &mut Vec<u32>, span: i64, bins: bool) -> bool {
     let n = evs.len();
     if span < 0 {
         return false;
@@ -2219,6 +2221,7 @@ fn sort_evs_ts<E: Ev>(evs: &mut Vec<E>, tmp: &mut Vec<E>, h: &mut Vec<u32>, span
         return false;
     }
     let q = sb.saturating_sub(TSB);
+    let bm = bins && span / GAP < 2048;
     let ds = ib + TSB;
     let im = (1u64 << ib) - 1;
     TS_KEYS.with(|c| {
@@ -2236,15 +2239,30 @@ fn sort_evs_ts<E: Ev>(evs: &mut Vec<E>, tmp: &mut Vec<E>, h: &mut Vec<u32>, span
             ka.set_len(n);
             kb.set_len(n);
         }
-        for (i, e) in evs.iter().enumerate() {
-            let t = e.rts() >> q;
-            let d = dg(e.key()) as u64;
-            // SAFETY: i < n = ka.len(); the indexes are masked below the histogram sizes.
-            unsafe {
-                *ka.get_unchecked_mut(i) = (d << ds) | (t << ib) | i as u64;
-                *h.get_unchecked_mut((t & 2047) as usize) += 1;
-                *h.get_unchecked_mut(2048 + ((t >> 11) & 2047) as usize) += 1;
-                *h.get_unchecked_mut(4096 + d as usize) += 1;
+        if bm {
+            // bins < 2048: the high digit is 0 for every record, so its pass is skipped
+            h[2048] = n as u32;
+            for (i, e) in evs.iter().enumerate() {
+                let t = e.rts() / GAP as u64;
+                let d = dg(e.key()) as u64;
+                // SAFETY: i < n = ka.len(); t < 2048 and d < 2^NBK.
+                unsafe {
+                    *ka.get_unchecked_mut(i) = (d << ds) | (t << ib) | i as u64;
+                    *h.get_unchecked_mut(t as usize) += 1;
+                    *h.get_unchecked_mut(4096 + d as usize) += 1;
+                }
+            }
+        } else {
+            for (i, e) in evs.iter().enumerate() {
+                let t = e.rts() >> q;
+                let d = dg(e.key()) as u64;
+                // SAFETY: i < n = ka.len(); the indexes are masked below the histogram sizes.
+                unsafe {
+                    *ka.get_unchecked_mut(i) = (d << ds) | (t << ib) | i as u64;
+                    *h.get_unchecked_mut((t & 2047) as usize) += 1;
+                    *h.get_unchecked_mut(2048 + ((t >> 11) & 2047) as usize) += 1;
+                    *h.get_unchecked_mut(4096 + d as usize) += 1;
+                }
             }
         }
         let (mut src, mut dst) = (&mut ka[..], &mut kb[..]);
@@ -2295,7 +2313,15 @@ fn sort_evs_ts<E: Ev>(evs: &mut Vec<E>, tmp: &mut Vec<E>, h: &mut Vec<u32>, span
         let mut s = 0usize;
         for &e in hj.iter() {
             let e = e as usize;
-            if e - s > 1 {
+            if bm {
+                if e - s > 1 {
+                    let r = &mut evs[s..e];
+                    let k0 = r[0].key();
+                    if r.iter().any(|x| x.key() != k0) {
+                        fix_multi(r, false);
+                    }
+                }
+            } else if e - s > 1 {
                 let r = &mut evs[s..e];
                 let k0 = r[0].key();
                 let mut mk = false;
@@ -2305,7 +2331,7 @@ fn sort_evs_ts<E: Ev>(evs: &mut Vec<E>, tmp: &mut Vec<E>, h: &mut Vec<u32>, span
                     ok &= r[w].rts() >= r[w - 1].rts();
                 }
                 if mk {
-                    fix_multi(r);
+                    fix_multi(r, true);
                 } else if !ok {
                     isort_by(r, |a, b| a.rts() < b.rts());
                 }
@@ -2318,7 +2344,7 @@ fn sort_evs_ts<E: Ev>(evs: &mut Vec<E>, tmp: &mut Vec<E>, h: &mut Vec<u32>, span
 
 /// Range whose records are nearly ts-ordered but hold several keys: stable split by key rank,
 /// then an insertion fixup on rts per key. More than 16 keys or 4096 records: `sort_small`.
-fn fix_multi<E: Ev>(r: &mut [E]) {
+fn fix_multi<E: Ev>(r: &mut [E], ts: bool) {
     let m = r.len();
     let mut uk = [0u64; 16];
     let mut nk = 0usize;
@@ -2354,6 +2380,9 @@ fn fix_multi<E: Ev>(r: &mut [E]) {
         // SAFETY: the split wrote each of the first m slots exactly once (the counts sum to m).
         *o = unsafe { b.assume_init() };
     }
+    if !ts {
+        return;
+    }
     for i in 0..nk {
         let g = &mut r[c[i]..c[i + 1]];
         if g.windows(2).any(|w| w[1].rts() < w[0].rts()) {
@@ -2365,13 +2394,15 @@ fn fix_multi<E: Ev>(r: &mut [E]) {
 /// Sort by (dg(key), key, ts); equal (key, ts) pairs may end up in any order. `span` bounds
 /// every rts. A counting pass on the digit, then per range: a range shorter than RADIX_MIN with
 /// few keys is ordered as packed u64s (`pack_sort`), a long one-key range with `radix_rts`.
-fn sort_evs<E: Ev>(evs: &mut Vec<E>, tmp: &mut Vec<E>, cnt: &mut Vec<u32>, span: i64) {
+/// With `bins`, the caller accepts each key's records ordered only by 30-minute time bin
+/// (rts / GAP) instead of by rts; every path but `sort_evs_ts` still orders fully by rts.
+fn sort_evs<E: Ev>(evs: &mut Vec<E>, tmp: &mut Vec<E>, cnt: &mut Vec<u32>, span: i64, bins: bool) {
     let n = evs.len();
     if n < 256 {
         evs.sort_unstable_by_key(|e| (dg(e.key()), k128(e)));
         return;
     }
-    if sort_evs_ts(evs, tmp, cnt, span) {
+    if sort_evs_ts(evs, tmp, cnt, span, bins) {
         return;
     }
     hk_scatter(evs, tmp, cnt, |e| e.key());
@@ -2708,7 +2739,7 @@ fn process_bucket<E: Ev>(
     span: i64,
 ) {
     let mut tm = now();
-    sort_evs(evs, tmp, cnt, span);
+    sort_evs(evs, tmp, cnt, span, true);
     pt(7, &mut tm);
     sort_clicks(clicks, ctmp, cnt);
     pt(11, &mut tm);
@@ -2740,8 +2771,27 @@ fn process_bucket<E: Ev>(
         let mut s_rev = 0u64;
         let mut s_purch = false;
         let mut in_sess = false;
-        for e in &evs[i..j] {
-            let et = e.rts() as i64 + base;
+        // The person's events are ordered by 30-minute bin (rts / GAP) only, not by rts within a
+        // bin. Two events in one bin are less than GAP apart, so a session can only break between
+        // bins: the ts-ordered sequence breaks before a bin's earliest event iff it lies more than
+        // GAP after the previous bin's latest one. Each bin's run is one step of the original rule.
+        let pe = &evs[i..j];
+        let mut a = 0usize;
+        while a < pe.len() {
+            let r0 = pe[a].rts();
+            let b0 = r0 / GAP as u64;
+            let (mut mn, mut mx) = (r0, r0);
+            let mut b = a + 1;
+            while b < pe.len() {
+                let r = pe[b].rts();
+                if r / GAP as u64 != b0 {
+                    break;
+                }
+                mn = mn.min(r);
+                mx = mx.max(r);
+                b += 1;
+            }
+            let et = mn as i64 + base;
             if first || et - prev > GAP {
                 if in_sess {
                     cm.sess(s_camp, s_day, s_purch, s_rev);
@@ -2786,17 +2836,20 @@ fn process_bucket<E: Ev>(
                 }
                 day.sessions += 1;
             }
-            prev = et;
-            day.events += 1;
-            if let Some((p, ecat)) = e.pc() {
-                day.rev += p;
-                s_rev += p;
-                s_purch = true;
-                match day.cats.iter_mut().find(|x| x.0 == ecat) {
-                    Some(x) => x.1 += p,
-                    None => day.cats.push((ecat, p)),
+            prev = mx as i64 + base;
+            day.events += (b - a) as u32;
+            for e in &pe[a..b] {
+                if let Some((p, ecat)) = e.pc() {
+                    day.rev += p;
+                    s_rev += p;
+                    s_purch = true;
+                    match day.cats.iter_mut().find(|x| x.0 == ecat) {
+                        Some(x) => x.1 += p,
+                        None => day.cats.push((ecat, p)),
+                    }
                 }
             }
+            a = b;
         }
         if in_sess {
             cm.sess(s_camp, s_day, s_purch, s_rev);
@@ -7979,7 +8032,7 @@ mod ev_sort_tests {
             full(&mut want);
             let (mut tmp, mut cnt) = (vec![], vec![]);
             let mut a = v.clone();
-            sort_evs(&mut a, &mut tmp, &mut cnt, span as i64);
+            sort_evs(&mut a, &mut tmp, &mut cnt, span as i64, false);
             assert!(a.windows(2).all(|w| (dg(w[0].key()), w[0].key(), w[0].rts()) <= (dg(w[1].key()), w[1].key(), w[1].rts())), "order n={n} nk={nk}");
             full(&mut a);
             assert!(a.iter().zip(&want).all(|(x, y)| x.key() == y.key() && x.rts() == y.rts() && x.meta == y.meta), "perm n={n} nk={nk}");
