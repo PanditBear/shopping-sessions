@@ -4195,6 +4195,11 @@ fn parse_events_sol<E: Ev, const DZ: bool>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: 
             let (oke, val, ku, oku, ke6, oke6) = if DZ {
                 let (oke, val, ku, oku) = unsafe { fuse_eu(pe, ne, pu, nu) };
                 (oke, val, ku, oku, 0, false)
+            } else if (ne > 10) | (nu > 10) {
+                // Length alone excludes pack6 on long ids. Only classify a short peer.
+                let (ke6, oke6) = if ne <= 10 { unsafe { pack6x1(pe, ne) } } else { (0, false) };
+                let (ku, oku) = if nu <= 10 { unsafe { pack6x1(pu, nu) } } else { (0, false) };
+                (false, 0, ku, oku, ke6, oke6)
             } else {
                 let (ke6, oke6, ku, oku) = unsafe { pack6x2(pe, ne, pu, nu) };
                 (false, 0, ku, oku, ke6, oke6)
