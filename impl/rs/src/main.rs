@@ -3001,16 +3001,24 @@ impl Bp {
     fn put(&mut self, v: u32) {
         self.acc |= (v as u64) << self.nb;
         self.nb += self.w;
-        while self.nb >= 8 {
-            self.o.push(self.acc as u8);
-            self.acc >>= 8;
-            self.nb -= 8;
+        if self.nb >= 32 {
+            self.o.extend_from_slice(&(self.acc as u32).to_le_bytes());
+            self.acc >>= 32;
+            self.nb -= 32;
         }
         self.n += 1;
     }
     fn finish(mut self) -> Vec<u8> {
         while self.n % 8 != 0 {
             self.put(0);
+        }
+        // the width times a multiple of 8 values is whole bytes
+        let mut nb = self.nb;
+        let mut acc = self.acc;
+        while nb > 0 {
+            self.o.push(acc as u8);
+            acc >>= 8;
+            nb = nb.saturating_sub(8);
         }
         self.o
     }
@@ -3140,7 +3148,7 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
     // pass 1: ranges and counts
     let (mut dlo, mut dhi) = (i64::MAX, i64::MIN);
     let (mut slo, mut shi, mut elo, mut ehi) = (u64::MAX, 0u64, u64::MAX, 0u64);
-    let mut persons = 0usize;
+    let mut pkeys: Vec<u64> = Vec::new();
     let mut nn = 0usize;
     let mut last = None;
     for g in rows {
@@ -3153,11 +3161,15 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
             ehi = ehi.max(r.events as u64);
             nn += (r.top != u32::MAX) as usize;
             if last != Some(r.key) {
-                persons += 1;
+                pkeys.push(r.key);
                 last = Some(r.key);
             }
         }
     }
+    let persons = pkeys.len();
+    // hashed-key names resolved in one tight loop so the table misses overlap
+    let nmv: Vec<u64> = pkeys.iter().map(|&k| if k & HBIT != 0 { *names.get(k).expect("name for hashed key") } else { 0 }).collect();
+    drop(pkeys);
     let mut cols = vec![
         cm(6, "user_id"),
         cm(1, "day"),
@@ -3198,12 +3210,12 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
                         let ln = if kk == 0 { 0 } else { 10 - (kk.trailing_zeros() as usize) / 6 };
                         let mut cb = [0u8; 14];
                         cb[..4].copy_from_slice(&(ln as u32).to_le_bytes());
-                        for i in 0..10 {
+                        for i in 0..ln {
                             cb[4 + i] = DECODE[((kk >> (54 - 6 * i)) & 63) as usize];
                         }
                         dict.extend_from_slice(&cb[..4 + ln]);
                     } else {
-                        let s = unpack(*names.get(r.key).expect("name for hashed key"));
+                        let s = unpack(nmv[k as usize - 1]);
                         dict.extend_from_slice(&(s.len() as u32).to_le_bytes());
                         dict.extend_from_slice(s);
                     }
