@@ -4335,6 +4335,435 @@ impl<E: Ev> EvBufs<E> {
     }
 }
 
+// ---------- clean-line event kernel (SHOP_EVK) ----------
+//
+// One pass per line: four 32-byte compares give the comma, quote and newline masks of the 128
+// bytes at the line start; the six commas give the seven fields; a field is unquoted when it
+// starts and ends with a quote, and the line is clean when its quotes are exactly those pairs.
+// Dates go through a table of the real calendar days around the window (keyed by year parity,
+// month and day, checked against the stored bytes), times and offsets are SWAR, epoch ms is
+// SIMD, and both ids are packed together in one 256-bit pass. A line that is not the clean shape
+// (no newline in 128 bytes, field count, quotes, a timestamp form or date the fast path does not
+// take, a byte outside [0-9a-z] in a short id) goes through `scan7_line` + `ev_line` unchanged.
+
+/// One calendar day: "YYYY-MM-" as 8 bytes, "DD" as 2 bytes, and the day number.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct EvkDay {
+    a: u64,
+    dd: u16,
+    _p: u16,
+    day: i32,
+}
+
+/// Days near the window, at index (year & 1) << 9 | month << 5 | day.
+struct EvkTab {
+    e: Vec<EvkDay>,
+}
+
+fn evk_tab(ws: i64) -> &'static EvkTab {
+    static T: std::sync::OnceLock<(i64, EvkTab)> = std::sync::OnceLock::new();
+    let t = T.get_or_init(|| (ws, evk_mk(ws)));
+    if t.0 == ws {
+        &t.1
+    } else {
+        Box::leak(Box::new(evk_mk(ws)))
+    }
+}
+
+fn evk_mk(ws: i64) -> EvkTab {
+    let mut e = vec![EvkDay { a: u64::MAX, dd: u16::MAX, _p: 0, day: 0 }; 1024];
+    let d0 = ws.div_euclid(86_400_000);
+    // fewer than 730 days, so no two days share an index
+    for day in d0 - 350..d0 + 364 {
+        let z = day + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let dd = doy - (153 * mp + 2) / 5 + 1;
+        let mm = if mp < 10 { mp + 3 } else { mp - 9 };
+        let yy = yoe + era * 400 + if mm <= 2 { 1 } else { 0 };
+        if !(0..=9999).contains(&yy) || days_from_civil(yy, mm, dd) != day {
+            continue;
+        }
+        let s = format!("{:04}-{:02}-{:02}", yy, mm, dd);
+        let b = s.as_bytes();
+        let a = u64::from_le_bytes(b[0..8].try_into().unwrap());
+        let d2 = u16::from_le_bytes([b[8], b[9]]);
+        let i = (((yy & 1) as usize) << 9) | ((mm as usize) << 5) | dd as usize;
+        e[i] = EvkDay { a, dd: d2, _p: 0, day: day as i32 };
+    }
+    EvkTab { e }
+}
+
+#[inline(always)]
+unsafe fn evk_ld8(p: *const u8) -> u64 {
+    (p as *const u64).read_unaligned()
+}
+#[inline(always)]
+unsafe fn evk_ld4(p: *const u8) -> u64 {
+    (p as *const u32).read_unaligned() as u64
+}
+
+/// `YYYY-MM-DDTHH:MM:SS` at q: (local ms, real date in the table and real time, byte q[19]).
+#[inline(always)]
+unsafe fn evk_dt(q: *const u8, t: &EvkTab) -> (i64, bool, u64) {
+    let a = evk_ld8(q);
+    let b = evk_ld8(q.add(8));
+    let c = evk_ld4(q.add(16));
+    let mo = (((a >> 40) & 0xF) * 10 + ((a >> 48) & 0xF)) & 15;
+    let dy = ((b & 0xF) * 10 + ((b >> 8) & 0xF)) & 31;
+    let i = ((((a >> 24) & 1) << 9) | (mo << 5) | dy) as usize;
+    let e = *t.e.get_unchecked(i);
+    let date_ok = (e.a == a) & (e.dd == b as u16);
+    // H1 H0 M1 M0 S1 S0 '0' '0'
+    let x = ((b >> 24) & 0xFFFF) | (((b >> 48) & 0xFFFF) << 16) | (((c >> 8) & 0xFFFF) << 32) | (0x3030u64 << 48);
+    let sep_ok = ((b & 0xFF00_00FF_0000) == (((b':' as u64) << 40) | ((b'T' as u64) << 16))) & ((c & 0xFF) == b':' as u64);
+    let dd = x.wrapping_sub(h8(0x30));
+    let dig_ok = ((x.wrapping_add(h8(0x46)) | dd | x) & h8(0x80)) == 0;
+    let v = dd.wrapping_mul(10).wrapping_add(dd >> 8);
+    let (hh, mi, ss) = (v & 0xFF, (v >> 16) & 0xFF, (v >> 32) & 0xFF);
+    let ok = date_ok & sep_ok & dig_ok & (hh < 24) & (mi < 60) & (ss < 60);
+    let ms = e.day as i64 * 86_400_000 + ((hh * 3600 + mi * 60 + ss) * 1000) as i64;
+    (ms, ok, c >> 24)
+}
+
+/// `+HH:MM` / `-HH:MM` at q: (offset in ms to subtract, valid).
+#[inline(always)]
+unsafe fn evk_off(q: *const u8) -> (i64, bool) {
+    let y = evk_ld8(q);
+    let sg = y & 0xFF;
+    let x = ((y >> 8) & 0xFFFF) | (((y >> 32) & 0xFFFF) << 16) | (0x3030_3030u64 << 32);
+    let dd = x.wrapping_sub(h8(0x30));
+    let dig_ok = ((x.wrapping_add(h8(0x46)) | dd | x) & h8(0x80)) == 0;
+    let v = dd.wrapping_mul(10).wrapping_add(dd >> 8);
+    let (oh, om) = (v & 0xFF, (v >> 16) & 0xFF);
+    let ok = dig_ok & (((y >> 24) & 0xFF) == b':' as u64) & (oh < 24) & (om < 60) & ((sg == b'+' as u64) | (sg == b'-' as u64));
+    let o = ((oh * 60 + om) * 60_000) as i64;
+    (if sg == b'-' as u64 { -o } else { o }, ok)
+}
+
+/// 13 digits at q: (value, all 13 are digits).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn evk_d13(q: *const u8) -> (i64, bool) {
+    use core::arch::x86_64::*;
+    let v = _mm_loadu_si128(q as *const __m128i);
+    let d = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
+    let ok = (_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d)) & 0x1FFF) == 0x1FFF;
+    let x = _mm_slli_si128(d, 3);
+    let t1 = _mm_maddubs_epi16(x, _mm_set1_epi16(0x010A));
+    let t2 = _mm_madd_epi16(t1, _mm_set1_epi32(0x0001_0064));
+    let t3 = _mm_packus_epi32(t2, t2);
+    let t4 = _mm_madd_epi16(t3, _mm_set1_epi32(0x0001_2710));
+    let w = _mm_cvtsi128_si64(t4) as u64;
+    ((w & 0xFFFF_FFFF) as i64 * 100_000_000 + (w >> 32) as i64, ok)
+}
+
+/// pack6 of two ids at pa (na bytes) and pb (nb bytes), for 1..=10 bytes of [0-9a-z]:
+/// (key a, a ok, key b, b ok). A key means nothing unless its ok is set.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn evk_pack2(pa: *const u8, na: usize, pb: *const u8, nb: usize) -> (u64, bool, u64, bool) {
+    use core::arch::x86_64::*;
+    let v = _mm256_loadu2_m128i(pb as *const __m128i, pa as *const __m128i);
+    let iota = _mm256_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let lens = _mm256_set_m128i(_mm_set1_epi8(nb.min(16) as i8), _mm_set1_epi8(na.min(16) as i8));
+    let inl = _mm256_cmpgt_epi8(lens, iota);
+    let d = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
+    let isd = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+    let l = _mm256_sub_epi8(v, _mm256_set1_epi8(b'a' as i8));
+    let isl = _mm256_cmpeq_epi8(_mm256_min_epu8(l, _mm256_set1_epi8(25)), l);
+    let code = _mm256_blendv_epi8(_mm256_add_epi8(l, _mm256_set1_epi8(38)), _mm256_add_epi8(d, _mm256_set1_epi8(1)), isd);
+    let code = _mm256_and_si256(code, inl);
+    let bad = _mm256_movemask_epi8(_mm256_andnot_si256(_mm256_or_si256(isd, isl), inl)) as u32;
+    let u = _mm256_maddubs_epi16(code, _mm256_set1_epi16(0x0140));
+    let w = _mm256_madd_epi16(u, _mm256_set1_epi32(0x0001_1000));
+    let lo = _mm256_castsi256_si128(w);
+    let hi = _mm256_extracti128_si256(w, 1);
+    let qa = _mm_cvtsi128_si64(lo) as u64;
+    let ra = _mm_extract_epi32(lo, 2) as u32 as u64;
+    let qb = _mm_cvtsi128_si64(hi) as u64;
+    let rb = _mm_extract_epi32(hi, 2) as u32 as u64;
+    let ka = ((qa & 0xFF_FFFF) << 36) | ((qa >> 32) << 12) | (ra >> 12);
+    let kb = ((qb & 0xFF_FFFF) << 36) | ((qb >> 32) << 12) | (rb >> 12);
+    let oka = ((bad & 0xFFFF) == 0) & (na >= 1) & (na <= 10);
+    let okb = ((bad >> 16) == 0) & (nb >= 1) & (nb <= 10);
+    (ka, oka, kb, okb)
+}
+
+/// The one line at `pos` through the existing splitter and `ev_line`; returns the next line start.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn evk_slow<E: Ev>(c: B, pos: usize, cx: &EvCtx, sb: &mut Vec<[B; 7]>, tci: &mut TsCache, tct: &mut TsCache, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Fb, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) -> usize {
+    sb.clear();
+    let np = scan7_line(c, pos, sb);
+    let c0 = c.as_ptr() as usize;
+    for f in sb.iter() {
+        ev_line(f, cx, c0, tci, tct, m, d, fb, fbn, side, dz);
+    }
+    np
+}
+
+/// Event lines of one chunk, same outputs as `parse_events_sol`: clean lines in one pass, the
+/// rest through `ev_line`, the last 192 bytes through `parse_events_sol`.
+///
+/// The text goes in batches of up to 4 KB: each 64-byte block is classified once into a
+/// separator mask (comma or newline), a quote mask and a newline mask; the separator positions
+/// go into a flat index, and running quote and newline counts per block give the count of either
+/// in any range. A line is then seven consecutive index entries: clean when the seventh is its
+/// newline, no other newline lies inside, and its quotes are exactly the pairs around fields.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn parse_ev_clean<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Fb, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
+    use core::arch::x86_64::*;
+    if dz.on {
+        parse_events_sol::<E, true>(c, cx, m, d, fb, fbn, side, dz);
+        return;
+    }
+    const NB: usize = 64;
+    let tab = evk_tab(cx.ws);
+    let n = c.len();
+    let p = c.as_ptr();
+    let c0 = p as usize;
+    let lim = n.saturating_sub(192);
+    let (ws, we, ibase) = (cx.ws, cx.we, cx.ibase);
+    let mut sb: Vec<[B; 7]> = Vec::new();
+    let mut tci = TsCache::new();
+    let mut tct = TsCache::new();
+    let mut si = vec![0u32; NB * 64 + 64];
+    // per block: quotes before it in the batch (low half) and newlines before it (high half)
+    let mut qn = [0u64; NB + 1];
+    let mut qmk = [0u64; NB + 1];
+    let mut nmk = [0u64; NB + 1];
+    let mut pos = 0usize;
+    // SAFETY: blocks are read only while inside `c`; a line takes the fast path only when its
+    // newline is before `lim`, so every field read (at most 32 bytes past a field start) is in `c`.
+    unsafe {
+        let vc = _mm256_set1_epi8(b',' as i8);
+        let vq = _mm256_set1_epi8(b'"' as i8);
+        let vn = _mm256_set1_epi8(b'\n' as i8);
+        'batch: while pos < lim {
+            let b0 = pos;
+            let nb = ((n - b0) / 64).min(NB);
+            let mut ns = 0usize;
+            let mut acc = 0u64;
+            for i in 0..nb {
+                let b = p.add(b0 + 64 * i);
+                let v0 = _mm256_loadu_si256(b as *const __m256i);
+                let v1 = _mm256_loadu_si256(b.add(32) as *const __m256i);
+                let n0 = _mm256_cmpeq_epi8(v0, vn);
+                let n1 = _mm256_cmpeq_epi8(v1, vn);
+                let s0 = _mm256_or_si256(_mm256_cmpeq_epi8(v0, vc), n0);
+                let s1 = _mm256_or_si256(_mm256_cmpeq_epi8(v1, vc), n1);
+                let sm = (_mm256_movemask_epi8(s0) as u32 as u64) | ((_mm256_movemask_epi8(s1) as u32 as u64) << 32);
+                let qm = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, vq)) as u32 as u64) | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, vq)) as u32 as u64) << 32);
+                let nm = (_mm256_movemask_epi8(n0) as u32 as u64) | ((_mm256_movemask_epi8(n1) as u32 as u64) << 32);
+                *qn.get_unchecked_mut(i) = acc;
+                *qmk.get_unchecked_mut(i) = qm;
+                *nmk.get_unchecked_mut(i) = nm;
+                acc += qm.count_ones() as u64 + ((nm.count_ones() as u64) << 32);
+                let base = (64 * i) as u32;
+                let end = ns + sm.count_ones() as usize;
+                let mut x = sm;
+                loop {
+                    for j in 0..8 {
+                        *si.get_unchecked_mut(ns + j) = base + x.trailing_zeros();
+                        x &= x.wrapping_sub(1);
+                    }
+                    ns += 8;
+                    if ns >= end {
+                        break;
+                    }
+                }
+                ns = end;
+            }
+            *qn.get_unchecked_mut(nb) = acc;
+            *qmk.get_unchecked_mut(nb) = 0;
+            *nmk.get_unchecked_mut(nb) = 0;
+            let cnt = |r: usize| -> u64 {
+                let bi = r >> 6;
+                let sh = (r & 63) as u32;
+                *qn.get_unchecked(bi) + _bzhi_u64(*qmk.get_unchecked(bi), sh).count_ones() as u64 + ((_bzhi_u64(*nmk.get_unchecked(bi), sh).count_ones() as u64) << 32)
+            };
+            let q = p.add(b0);
+            let mut j = 0usize;
+            while j + 7 <= ns {
+                let ps = pos - b0;
+                let e0 = *si.get_unchecked(j) as usize;
+                let e1 = *si.get_unchecked(j + 1) as usize;
+                let e2 = *si.get_unchecked(j + 2) as usize;
+                let e3 = *si.get_unchecked(j + 3) as usize;
+                let e4 = *si.get_unchecked(j + 4) as usize;
+                let e5 = *si.get_unchecked(j + 5) as usize;
+                let le = *si.get_unchecked(j + 6) as usize;
+                if b0 + le >= lim {
+                    break 'batch;
+                }
+                let qc = cnt(le).wrapping_sub(cnt(ps));
+                if (*q.add(le) != b'\n') | (qc >> 32 != 0) {
+                    pos = evk_slow(c, pos, cx, &mut sb, &mut tci, &mut tct, m, d, fb, fbn, side, dz);
+                    let r = pos - b0;
+                    while j < ns && (*si.get_unchecked(j) as usize) < r {
+                        j += 1;
+                    }
+                    continue;
+                }
+                let qc = qc as u32;
+                if e0 == ps && qc == 0 {
+                    // well-formed line with an empty event_id: nothing
+                    pos = b0 + le + 1;
+                    j += 7;
+                    continue;
+                }
+                // field [s, e) unquoted: (start, len); a quote at one end only clears `ok`
+                let mut ok = true;
+                let mut nq = 0u32;
+                let mut fq = |s: usize, e: usize| -> (usize, usize) {
+                    let qs = *q.add(s) == b'"';
+                    let qe = *q.add(e.max(s + 1) - 1) == b'"';
+                    ok &= qs == qe;
+                    let u = qs as usize;
+                    nq += 2 * u as u32;
+                    (s + u, e.max(s + 2 * u) - 2 * u - s)
+                };
+                let (s0, l0) = fq(ps, e0);
+                let (s1, l1) = fq(e0 + 1, e1);
+                let (s2, l2) = fq(e1 + 1, e2);
+                let (s3, l3) = fq(e2 + 1, e3);
+                let (s4, l4) = fq(e3 + 1, e4);
+                let (s5, l5) = fq(e4 + 1, e5);
+                let (s6, l6) = fq(e5 + 1, le);
+                ok &= qc == nq;
+                let (ke, oke, ku, oku) = evk_pack2(q.add(s0), l0, q.add(s1), l1);
+                // a short id with a byte outside [0-9a-z], or an empty event_id, takes the slow path
+                ok &= (oke | (l0 > 10)) & (oku | (l1 > 10) | (l1 == 0));
+                // ts: 20 bytes ...Z, 25 bytes ...+HH:MM, 13 digits
+                let (lt, dok, z) = evk_dt(q.add(s2), tab);
+                let (off, ook) = evk_off(q.add(s2 + 19));
+                let (t3, ok3) = evk_d13(q.add(s2));
+                let is2 = l2 == 25;
+                let is3 = l2 == 13;
+                let t = if is3 { t3 } else if is2 { lt - off } else { lt };
+                let tok = ((l2 == 20) & dok & (z == b'Z' as u64)) | (is2 & dok & ook) | (is3 & ok3);
+                // ingest: 20 bytes ...Z
+                let (ing, iok, iz) = evk_dt(q.add(s3), tab);
+                ok &= tok & iok & (iz == b'Z' as u64) & (l3 == 20);
+                if !ok {
+                    pos = evk_slow(c, pos, cx, &mut sb, &mut tci, &mut tct, m, d, fb, fbn, side, dz);
+                    j += 7;
+                    continue;
+                }
+                let w4 = evk_ld8(q.add(s4));
+                let w4l = w4 & 0xFFFF_FFFF;
+                let et = (((l4 == 4) & ((w4l == u32::from_le_bytes(*b"view") as u64) | (w4l == u32::from_le_bytes(*b"cart") as u64))) as u32) | ((((l4 == 8) & (w4 == u64::from_le_bytes(*b"purchase"))) as u32) << 1);
+                let mut valid = (l1 != 0) & (l5 != 0) & (t >= ws) & (t < we) & (et != 0) & (ing.wrapping_sub(t) <= 86_400_000);
+                let (mut price, mut cat) = (0u32, 0u32);
+                if et == 2 && valid {
+                    match parse_price(std::slice::from_raw_parts(q.add(s6), l6)) {
+                        Some(pv) => {
+                            price = pv;
+                            cat = cx.prod.get_fast(std::slice::from_raw_parts(q.add(s5), l5), c0).unwrap_or(cx.unknown_cat);
+                        }
+                        None => valid = false,
+                    }
+                }
+                let loc = m.len();
+                let r = if valid {
+                    let key = if oku { ku } else { ev_key(std::slice::from_raw_parts(q.add(s1), l1), cx.rs, fbn) };
+                    E::mk(key, (t - ws) as u64, price, cat)
+                } else {
+                    E::nil()
+                };
+                m.push(r);
+                let (ik, exact) = ing32(ing, ibase);
+                if !exact {
+                    side.push((loc as u32, ing));
+                }
+                if oke {
+                    d.push(DRec { eid: ke, ing: ik, loc: loc as u32 });
+                } else {
+                    fb_put(cx.rs, d, fb, std::slice::from_raw_parts(q.add(s0), l0), ing, ik, loc as u32);
+                }
+                pos = b0 + le + 1;
+                j += 7;
+            }
+            if pos == b0 {
+                // one line longer than a batch
+                pos = evk_slow(c, pos, cx, &mut sb, &mut tci, &mut tct, m, d, fb, fbn, side, dz);
+            }
+        }
+    }
+    if pos < n {
+        parse_events_sol::<E, false>(&c[pos..], cx, m, d, fb, fbn, side, dz);
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
+#[allow(clippy::too_many_arguments)]
+fn parse_ev_clean<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Fb, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
+    if dz.on {
+        parse_events_sol::<E, true>(c, cx, m, d, fb, fbn, side, dz);
+    } else {
+        parse_events_sol::<E, false>(c, cx, m, d, fb, fbn, side, dz);
+    }
+}
+
+/// check and measurement aid (SHOP_EVK_CHK=<reps>): every chunk through `parse_events_sol` and
+/// `parse_ev_clean`, serial, into reused buffers (so neither input nor output pages fault after
+/// rep 0), alternating which runs first per chunk. Rep 0 diffs the outputs and is not timed; the
+/// other reps print thread cycles per record of each and the paired difference.
+fn evk_check<E: Ev>(ev_chunks: &[B], cx: &EvCtx) {
+    let reps: usize = std::env::var("SHOP_EVK_CHK").ok().and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
+    let (mut a, mut b) = (EvBufs::<E>::new(), EvBufs::<E>::new());
+    let mut diffs = vec![];
+    for rep in 0..reps {
+        let (mut bad, mut recs, mut ca, mut cb) = (0usize, 0usize, 0u64, 0u64);
+        for (ci, &c) in ev_chunks.iter().enumerate() {
+            a.clear();
+            b.clear();
+            let mut run_a = |a: &mut EvBufs<E>| {
+                let t = thread_cycles();
+                parse_events_sol::<E, false>(c, cx, &mut a.m, &mut a.d, &mut a.fb, &mut a.fbn, &mut a.side, &mut Dz::off());
+                ca += thread_cycles() - t;
+            };
+            if (ci + rep) % 2 == 0 {
+                run_a(&mut a);
+            }
+            let t = thread_cycles();
+            parse_ev_clean(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side, &mut Dz::off());
+            cb += thread_cycles() - t;
+            if (ci + rep) % 2 == 1 {
+                run_a(&mut a);
+            }
+            recs += a.m.len();
+            if rep == 0 {
+                if let Some(s) = a.diff(&b) {
+                    bad += 1;
+                    if bad <= 10 {
+                        eprintln!("evk chunk {ci}: {s}");
+                    }
+                }
+            }
+        }
+        if rep == 0 {
+            eprintln!("evk check: {} chunks, {} records, {} chunks differ", ev_chunks.len(), recs, bad);
+        } else {
+            let (pa, pb) = (ca as f64 / recs as f64, cb as f64 / recs as f64);
+            diffs.push(pa - pb);
+            eprintln!("evk rep{rep}: sol {pa:.1} evk {pb:.1} cyc/rec diff {:.1}", pa - pb);
+        }
+    }
+    if !diffs.is_empty() {
+        diffs.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        eprintln!("evk diff min {:.1} median {:.1} max {:.1} (sol - evk, cyc/rec, {} reps)", diffs[0], diffs[diffs.len() / 2], diffs[diffs.len() - 1], diffs.len());
+    }
+}
+
 /// measurement aid (SHOP_SOLBENCH): `parse_events` and `parse_events_sol`, serial, alternating
 /// which runs first per chunk; prints ns per record for each and checks the outputs agree.
 fn sol_bench<E: Ev>(ev_chunks: &[B], cx: &EvCtx) {
@@ -5793,8 +6222,11 @@ fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
     let (mut fb, mut fbn, mut side) = (Fb::default(), vec![], vec![]);
     let mut tm = now();
     static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static EVK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *OLD.get_or_init(|| std::env::var_os("SHOP_EVOLD").is_some()) {
         parse_events(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
+    } else if *EVK.get_or_init(|| std::env::var_os("SHOP_EVK").is_some_and(|v| v == "1")) {
+        parse_ev_clean(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side, &mut dz);
     } else {
         if dz.on {
             parse_events_sol::<E, true>(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side, &mut dz);
@@ -6185,6 +6617,14 @@ fn main() {
                     parse_aid::<EvL>(&ev_chunks, &cx);
                 } else {
                     parse_aid::<EvW>(&ev_chunks, &cx);
+                }
+                std::process::exit(0);
+            }
+            if std::env::var_os("SHOP_EVK_CHK").is_some() {
+                if lean {
+                    evk_check::<EvL>(&ev_chunks, &cx);
+                } else {
+                    evk_check::<EvW>(&ev_chunks, &cx);
                 }
                 std::process::exit(0);
             }
