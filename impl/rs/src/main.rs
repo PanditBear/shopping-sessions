@@ -1916,6 +1916,9 @@ fn parse_clicks(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: 
     let mut pos = 0usize;
     let mut sbuf: Vec<[B; 4]> = Vec::new();
     let pfd = pf_dist();
+    // fast-path records are written at wp, in out's spare capacity up to wend; out's length is
+    // set from wp before any other use of out
+    let (mut wp, mut wend) = click_cur(out);
     'ln: while pos + 64 <= len {
         if pfd != 0 {
             // a prefetch never faults, so the address may lie past the chunk
@@ -2010,18 +2013,53 @@ fn parse_clicks(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: 
                 (k, true) => k,
                 _ => ukey(rs, uid),
             };
-            out.push(ClickRec { key, ts: t, cid: pack(sl(pc, nc)), camp: ci });
+            if wp == wend {
+                (wp, wend) = click_grow(out, wp);
+            }
+            // SAFETY: wp < wend, so wp is inside out's allocation and past its length
+            unsafe {
+                wp.write(ClickRec { key, ts: t, cid: pack(sl(pc, nc)), camp: ci });
+                wp = wp.add(1);
+            }
             continue 'ln;
         }
+        click_sync(out, wp);
         sbuf.clear();
         pos = scan4_line(c, pos, &mut sbuf);
         for f in &sbuf {
             click_line(f, camp, rs, ws, we, lo, &mut tc, out);
         }
+        (wp, wend) = click_cur(out);
     }
+    click_sync(out, wp);
     if pos < len {
         scan::<4>(&c[pos..], |f| click_line(f, camp, rs, ws, we, lo, &mut tc, out));
     }
+}
+
+/// The write cursor of `parse_clicks`: the end of `out`'s records and of its capacity.
+#[inline(always)]
+fn click_cur(out: &mut Vec<ClickRec>) -> (*mut ClickRec, *mut ClickRec) {
+    let b = out.as_mut_ptr();
+    // SAFETY: len <= capacity, both inside (or one past) the allocation
+    unsafe { (b.add(out.len()), b.add(out.capacity())) }
+}
+
+/// Sets `out`'s length to the cursor `wp` (every record before it is written).
+#[inline(always)]
+fn click_sync(out: &mut Vec<ClickRec>, wp: *mut ClickRec) {
+    // SAFETY: wp lies in out's allocation between its length and capacity, and every record
+    // before wp has been written
+    unsafe { out.set_len(wp.offset_from(out.as_ptr()) as usize) }
+}
+
+/// A full `out` at the cursor `wp`: sync, grow, and return the new cursor.
+#[cold]
+#[inline(never)]
+fn click_grow(out: &mut Vec<ClickRec>, wp: *mut ClickRec) -> (*mut ClickRec, *mut ClickRec) {
+    click_sync(out, wp);
+    out.reserve(1);
+    click_cur(out)
 }
 
 struct UD {
