@@ -62,6 +62,10 @@ fn mix(k: u64) -> u64 {
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 static TIMING: AtomicBool = AtomicBool::new(false);
+static PKX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static PKACC: AtomicU64 = AtomicU64::new(0);
+static PKCYC: AtomicU64 = AtomicU64::new(0);
+static PKN: AtomicU64 = AtomicU64::new(0);
 static PROF: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 const PROF_NAMES: [&str; 13] =
     ["ev.scan", "ev.bucket", "dd.table", "dd.collect", "dd.resolve", "dd.bucket", "ss.gather", "ss.sort", "ss.proc", "ck.scan", "ck.res", "ss.csort", "wr.ud"];
@@ -3538,6 +3542,9 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
     let base = c.as_ptr();
     let mut pos = 0usize;
     let mut sbuf: Vec<[B; 7]> = Vec::new();
+    let pkx = PKX.load(Relaxed);
+    let mut acc = 0u64;
+    let mut pkn = 0u64;
     'ln: while pos + 128 <= len {
         // SAFETY: pos + 128 <= len, and the second window starts at most 64 bytes in
         let p = unsafe { base.add(pos) };
@@ -3581,9 +3588,18 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
             let (pet, net) = fld(pb, xb, e3 + 1, e4);
             let (pp, np) = fld(pb, xb, e4 + 1, e5);
             let (ppr, npr) = fld(pb, xb, e5 + 1, l);
+            if pkx == 1 {
+                pkn += 1;
+                acc = acc.wrapping_add((nu + nt + ni + net + np + npr) as u64 ^ (pe as u64) ^ (ppr as u64));
+                continue 'ln;
+            }
             // SAFETY: both ids start in the first window, so 16 bytes from each stay inside
             // the 128 readable bytes at p
             let (oke, val, ku, oku) = unsafe { fuse_eu(pe, ne, pu, nu) };
+            if pkx == 5 {
+                acc = acc.wrapping_add(val ^ ku ^ ((oke as u64) << 1) ^ (oku as u64) ^ (nt + ni + net + np + npr) as u64 ^ (ppr as u64));
+                continue 'ln;
+            }
             // SAFETY (ldp, hms): a 20-byte field lies inside its window. (ra, rb, rd): the
             // ingest's date key and day start when it is a valid F1 date, else 2000-01-01's.
             let (mut ra, mut rb, mut rd) = (D0_A, D0_B, D0_S);
@@ -3612,6 +3628,10 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
                     (ingest, k, x)
                 }
             };
+            if pkx == 6 {
+                acc = acc.wrapping_add(val ^ ku ^ ((oke as u64) << 1) ^ (oku as u64) ^ (nt + net + np + npr) as u64 ^ (ppr as u64) ^ (ingest as u64) ^ ik as u64 ^ iex as u64);
+                continue 'ln;
+            }
             let mut r = E::nil();
             'v: {
                 if (nu == 0) | (np == 0) {
@@ -3666,6 +3686,10 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
                 let key = if oku { ku } else { ev_key_slow(sl(pu, nu), cx.rs, fbn) };
                 r = E::mk(key, (t - ws) as u64, pv, cat);
             }
+            if pkx == 2 {
+                acc = acc.wrapping_add(r.key() ^ (ik as u64) ^ val ^ (oke as u64));
+                continue 'ln;
+            }
             if oke {
                 if let Some(i) = dz.idx_val(val) {
                     dz.put(i, ik, r, iex, ingest);
@@ -3695,6 +3719,8 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
     if pos < len {
         scan::<7>(&c[pos..], |f| ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side, dz));
     }
+    PKACC.fetch_add(acc, Relaxed);
+    PKN.fetch_add(pkn, Relaxed);
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
@@ -5074,6 +5100,142 @@ fn ukey_find(ev_chunks: &[B], ekey: u64) -> Option<u64> {
 
 /// Parses one chunk: dense records go straight to their buckets, the rest are grouped by event_id
 /// hash bucket.
+/// measurement aid (SHOP_PKX=3): block-wise structural pass over a chunk. Masks are built once
+/// per 64-byte block, separators and line ends are flattened into position lists per batch,
+/// quotes are checked block-wise with carries, and each line is cut into its 7 fields with
+/// quotes stripped. Returns the same sum as the SHOP_PKX=1 cut of the fused kernel.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+fn pk_struct(c: B, lines: bool) -> u64 {
+    const BAT: usize = 64 * 64;
+    let len = c.len();
+    let base = c.as_ptr();
+    let mut sp: Vec<u32> = vec![0; 2 * BAT + 128];
+    let mut nl: Vec<u32> = vec![0; BAT + 128];
+    let mut bd: Vec<u32> = vec![0; BAT + 128];
+    let mut ns = 0usize;
+    let mut acc = 0u64;
+    let (mut cs, mut cq, mut cx, mut bor) = (1u64, 0u64, 0u64, false);
+    let mut ls = 0usize;
+    let mut pos = 0usize;
+    let mut pkn = 0u64;
+    let mut tmp = [0u8; 64];
+    while pos < len {
+        let bend = (pos + BAT).min(len);
+        let (mut nn, mut nb) = (0usize, 0usize);
+        let spp = sp.as_mut_ptr();
+        let nlp = nl.as_mut_ptr();
+        while pos < bend {
+            let p = if pos + 64 <= len {
+                unsafe { base.add(pos) }
+            } else {
+                tmp = [0u8; 64];
+                tmp[..len - pos].copy_from_slice(&c[pos..]);
+                tmp.as_ptr()
+            };
+            let (cm, qm, nm) = masks64(p);
+            let sm = cm | nm;
+            let x = qm & ((sm << 1) | cs);
+            let (d1, b1) = sm.overflowing_sub(x);
+            let (d2, b2) = d1.overflowing_sub(bor as u64);
+            bor = b1 | b2;
+            let e = sm & !d2;
+            let badm = ((qm << 1) | cq) ^ ((x << 1) | cx) ^ e;
+            cs = sm >> 63;
+            cq = qm >> 63;
+            cx = x >> 63;
+            let pb = pos as u32;
+            // SAFETY: the lists hold a batch of bits plus 64 slack entries
+            unsafe {
+                let mut b = sm;
+                let cnt = b.count_ones() as usize;
+                let mut w = ns;
+                let wend = ns + cnt;
+                while w < wend {
+                    for i in 0..8 {
+                        *spp.add(w + i) = pb + b.trailing_zeros();
+                        b &= b.wrapping_sub(1);
+                    }
+                    w += 8;
+                }
+                ns = wend;
+                let mut b = nm;
+                let cn = b.count_ones() as usize;
+                *nlp.add(nn) = pb + b.trailing_zeros();
+                b &= b.wrapping_sub(1);
+                *nlp.add(nn + 1) = pb + b.trailing_zeros();
+                b &= b.wrapping_sub(1);
+                let mut w = nn + 2;
+                while w < nn + cn {
+                    *nlp.add(w) = pb + b.trailing_zeros();
+                    b &= b.wrapping_sub(1);
+                    w += 1;
+                }
+                nn += cn;
+                let mut b = badm;
+                while b != 0 {
+                    *bd.as_mut_ptr().add(nb) = (pb + b.trailing_zeros()).wrapping_sub(1);
+                    nb += 1;
+                    b &= b.wrapping_sub(1);
+                }
+            }
+            pos += 64;
+        }
+        bd[nb] = u32::MAX;
+        if !lines {
+            acc = acc.wrapping_add((ns + nn + nb) as u64 + sp[ns / 2] as u64);
+            ns = 0;
+            continue;
+        }
+        let mut bi = 0usize;
+        let mut k = 0usize;
+        let sp = &mut sp;
+        let g = |sp: &Vec<u32>, i: usize| unsafe { *sp.get_unchecked(i) };
+        for j in 0..nn {
+            let le = unsafe { *nl.get_unchecked(j) };
+            let ok = k + 6 < ns && g(sp, k + 6) == le && unsafe { *bd.get_unchecked(bi) } > le;
+            if ok {
+                // SAFETY: every field lies inside the chunk
+                unsafe {
+                    let f = |s: usize, e: u32| {
+                        let q = (*base.add(s) == b'"') as usize;
+                        (base.add(s + q), e as usize - s - 2 * q)
+                    };
+                    let s = sp.as_ptr().add(k);
+                    let (pe, ne) = f(ls, *s);
+                    if ne != 0 {
+                        pkn += 1;
+                        let (_, nu) = f(*s as usize + 1, *s.add(1));
+                        let (_, nt) = f(*s.add(1) as usize + 1, *s.add(2));
+                        let (_, ni) = f(*s.add(2) as usize + 1, *s.add(3));
+                        let (_, net) = f(*s.add(3) as usize + 1, *s.add(4));
+                        let (_, np) = f(*s.add(4) as usize + 1, *s.add(5));
+                        let (ppr, npr) = f(*s.add(5) as usize + 1, le);
+                        acc = acc.wrapping_add((nu + nt + ni + net + np + npr) as u64 ^ (pe as u64) ^ (ppr as u64));
+                    }
+                }
+                k += 7;
+            } else {
+                while sp[k] != le {
+                    k += 1;
+                }
+                k += 1;
+                while bd[bi] <= le {
+                    bi += 1;
+                }
+            }
+            ls = le as usize + 1;
+        }
+        sp.copy_within(k..ns, 0);
+        ns -= k;
+    }
+    PKN.fetch_add(pkn, Relaxed);
+    acc
+}
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
+fn pk_struct(_c: B, _lines: bool) -> u64 {
+    0
+}
+
 fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
     let mut dz = Dz::new(idx_cfg(), c.len());
     let cap = if dz.on { c.len() / 4096 } else { c.len() / 64 };
@@ -5085,7 +5247,22 @@ fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
     if *OLD.get_or_init(|| std::env::var_os("SHOP_EVOLD").is_some()) {
         parse_events(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
     } else {
-        parse_events_sol(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side, &mut dz);
+        let cy = thread_cycles();
+        if PKX.load(Relaxed) == 3 || PKX.load(Relaxed) == 7 {
+            PKACC.fetch_add(pk_struct(c, PKX.load(Relaxed) == 3), Relaxed);
+        } else if PKX.load(Relaxed) == 4 {
+            let mut a = 0u64;
+            let mut p = 0usize;
+            while p + 64 <= c.len() {
+                let (cm, qm, nm) = masks64(unsafe { c.as_ptr().add(p) });
+                a = a.wrapping_add(((cm | nm).count_ones() + qm.count_ones()) as u64);
+                p += 64;
+            }
+            PKACC.fetch_add(a, Relaxed);
+        } else {
+            parse_events_sol(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side, &mut dz);
+        }
+        PKCYC.fetch_add(thread_cycles() - cy, Relaxed);
     }
     pt(0, &mut tm);
     let (d, doff) = bucketize(&d, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize);
@@ -5180,21 +5357,25 @@ fn parse_aid<E: Ev>(ev_chunks: &[B], cx: &EvCtx) {
         eprintln!("parse best 0s sum 0 gcyc {:.4}", bc as f64 / 1e9);
         return;
     }
+    PKX.store(std::env::var("SHOP_PKX").ok().and_then(|s| s.parse().ok()).unwrap_or(0), Relaxed);
     let mut best = f64::MAX;
     let mut sum = 0u64;
     let mut bc = u64::MAX;
+    let mut bpc = u64::MAX;
     for rep in 0..reps {
         let t = std::time::Instant::now();
         let c0 = thread_cycles();
+        PKCYC.store(0, Relaxed);
         let all: Vec<EvChunk<E>> = ev_chunks.iter().map(|&c| ev_chunk_parse(c, cx)).collect();
         bc = bc.min(thread_cycles() - c0);
+        bpc = bpc.min(PKCYC.load(Relaxed));
         let el = t.elapsed().as_secs_f64();
         let h = all.iter().fold(0u64, |h, r| hash_chunk(h, r));
         best = best.min(el);
         sum = h;
         eprintln!("parse rep{} {:.3}s", rep, el);
     }
-    eprintln!("parse best {:.3}s sum {:016x} gcyc {:.4}", best, sum, bc as f64 / 1e9);
+    eprintln!("parse best {:.3}s sum {:016x} gcyc {:.4} kernel gcyc {:.4} acc {:x} n {}", best, sum, bc as f64 / 1e9, bpc as f64 / 1e9, PKACC.load(Relaxed), PKN.load(Relaxed) / reps as u64);
 }
 
 fn fbn_merge<E: Ev>(v: &[EvChunk<E>], names_map: &mut AHashMap<u64, u64>) {
