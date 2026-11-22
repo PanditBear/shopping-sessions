@@ -47,7 +47,7 @@ const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 1_800_000;
 const CHUNK: usize = 4 << 20;
 const EBB: u32 = 11; // event dedup buckets (by event_id): 1 << ebb(), at least 1 << EBB
-const DDG: usize = 4; // event_id buckets per dedup task
+const DDG: usize = 8; // event_id buckets per dedup task
 const PBB: u32 = 10;
 const PB: usize = 1 << PBB; // person buckets
 
@@ -71,7 +71,7 @@ fn ebb() -> u32 {
 /// event_id bucket bits for `bytes` of event files: EBB up to ~24M lines (88 bytes a line), above
 /// that the fewest bits that keep a bucket at most EBP lines
 fn ebb_for(bytes: usize) -> u32 {
-    const EBP: usize = 166_000;
+    const EBP: usize = 41_500;
     let est = bytes / 88;
     if est <= 24_000_000 {
         return EBB;
