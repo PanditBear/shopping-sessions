@@ -93,7 +93,7 @@ fn prefetch<T>(p: *const T) {
 }
 
 /// Input prefetch distance in bytes for the event and click line kernels. SHOP_PFD overrides
-/// (0 off). Otherwise 4096 on GenuineIntel CPUs, where it shortens the scan, and 0 elsewhere.
+/// (0 off). Otherwise 2048 on GenuineIntel CPUs, where it shortens the scan, and 0 elsewhere.
 /// Read once.
 fn pf_dist() -> usize {
     static D: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -106,7 +106,7 @@ fn pf_dist() -> usize {
             // SAFETY: cpuid is available on every x86_64 CPU
             let r = unsafe { core::arch::x86_64::__cpuid(0) };
             if r.ebx == 0x756e_6547 && r.edx == 0x4965_6e69 && r.ecx == 0x6c65_746e {
-                return 4096;
+                return 2048;
             }
         }
         0
