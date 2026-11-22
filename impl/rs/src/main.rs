@@ -4120,8 +4120,12 @@ fn parse_events_sol<E: Ev, const DZ: bool>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: 
         'slow: {
             // e0..e2: the first three commas; xq: whether fields 0-2 open with a quote
             let (e0, e1, e2, xq, bad_a) = if (c2 != 0) & (bzhi(na, e2) == 0) {
-                let (xa, bad_a) = quote_bad(bzhi(qa, e2), ca);
-                (e0, e1, e2, [xa & 1, (xa >> (e0 + 1)) & 1, (xa >> (e1 + 1)) & 1], bad_a)
+                if bzhi(qa, e2) == 0 {
+                    (e0, e1, e2, [0, 0, 0], 0)
+                } else {
+                    let (xa, bad_a) = quote_bad(bzhi(qa, e2), ca);
+                    (e0, e1, e2, [xa & 1, (xa >> (e0 + 1)) & 1, (xa >> (e1 + 1)) & 1], bad_a)
+                }
             } else if (na == 0) & (pos + 192 <= len) {
                 // fields 0-2 run past the first window (long ids): the same rule on 128 bytes
                 // SAFETY: pos + 192 <= len
@@ -4142,7 +4146,11 @@ fn parse_events_sol<E: Ev, const DZ: bool>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: 
             let d2 = blsr(d1);
             let e5 = d2.trailing_zeros();
             let d3 = blsr(d2);
-            let (xb, bad_b) = quote_bad(bzhi(qb, l), cb | nb);
+            let (xb, bad_b) = if bzhi(qb, l) == 0 {
+                (0, 0)
+            } else {
+                quote_bad(bzhi(qb, l), cb | nb)
+            };
             if !((nb != 0) & (e5 < l) & (bzhi(d3, l) == 0) & ((bad_a | bad_b) == 0)) {
                 break 'slow;
             }
