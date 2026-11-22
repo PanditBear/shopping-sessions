@@ -2,3 +2,5 @@
 !impl/rs/Cargo.toml
 !impl/rs/Cargo.lock
 !impl/rs/src
+!impl/rs/build.sh
+!impl/rs/pgo
