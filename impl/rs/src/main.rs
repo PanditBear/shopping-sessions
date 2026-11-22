@@ -3797,6 +3797,13 @@ unsafe fn idk_x(p: *const u8, n: usize) -> (u64, u128, u8) {
     if ok {
         return (k, 0, 0);
     }
+    idk_hex(p, n)
+}
+
+/// `idk_x` of an id whose `pack6` is None: the hex32 key (class 1) or class 2.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn idk_hex(p: *const u8, n: usize) -> (u64, u128, u8) {
     if n == 33 {
         let c0 = CODE[*p as usize];
         let (f, okh) = hex32(p.add(1));
@@ -4057,9 +4064,11 @@ unsafe fn ts25h(p: *const u8, ra: u64, rb: u64, rd: i64, c: &mut DayCache, hs: i
 /// that the category of a record with no price is 0 (no product lookup for views and carts;
 /// `Ev::pc` never reads it). One fused pass: the `scan7` line classifier with the fields kept
 /// as pointer and length, both ids packed in one vector, ISO times straight to seconds.
+/// `DZ` must equal `dz.on`: without dense ids the event id is only needed as its pack6 key, so
+/// both ids take one `pack6x2` pass and the base-36 value is never formed.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
 #[inline(never)]
-fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Fb, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
+fn parse_events_sol<E: Ev, const DZ: bool>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Fb, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
     use core::arch::x86_64::_bzhi_u64;
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
@@ -4140,7 +4149,13 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
             let (ppr, npr) = fld(pb, xb, e5 + 1, l);
             // SAFETY: both ids start before byte 128 (e1 < e2 < 128), so 16 bytes from each stay
             // inside the readable bytes at p (128 when e2 < 64, else 192)
-            let (oke, val, ku, oku) = unsafe { fuse_eu(pe, ne, pu, nu) };
+            let (oke, val, ku, oku, ke6, oke6) = if DZ {
+                let (oke, val, ku, oku) = unsafe { fuse_eu(pe, ne, pu, nu) };
+                (oke, val, ku, oku, 0, false)
+            } else {
+                let (ke6, oke6, ku, oku) = unsafe { pack6x2(pe, ne, pu, nu) };
+                (false, 0, ku, oku, ke6, oke6)
+            };
             // SAFETY (ldp, hms): a 20-byte field lies inside its window. (ra, rb, rd): the
             // ingest's date key and day start when it is a valid F1 date, else 2000-01-01's.
             let (mut ra, mut rb, mut rd) = (D0_A, D0_B, D0_S);
@@ -4225,7 +4240,7 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
                 let key = if oku { ku } else { ev_key_slow(sl(pu, nu), cx.rs, fbn) };
                 r = E::mk(key, (t - ws) as u64, pv, cat);
             }
-            if oke {
+            if DZ && oke {
                 if let Some(i) = dz.idx_val(val) {
                     dz.put(i, ik, r, iex, ingest);
                     continue 'ln;
@@ -4238,7 +4253,13 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
             }
             // SAFETY: 16 bytes from pe are readable (see pack6x2's callers above), and when ne == 33
             // idk_x reads the 33 id bytes themselves
-            let (ke, full, cls) = unsafe { idk_x(pe, ne) };
+            let (ke, full, cls) = if DZ {
+                unsafe { idk_x(pe, ne) }
+            } else if oke6 {
+                (ke6, 0, 0)
+            } else {
+                unsafe { idk_hex(pe, ne) }
+            };
             if cls == 0 {
                 d.push(DRec { eid: ke, ing: ik, loc });
             } else if cls == 1 && loc <= DX_LOC {
@@ -4260,7 +4281,7 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
-fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Fb, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
+fn parse_events_sol<E: Ev, const DZ: bool>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Fb, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
     let c0 = c.as_ptr() as usize;
@@ -4332,7 +4353,7 @@ fn sol_bench<E: Ev>(ev_chunks: &[B], cx: &EvCtx) {
             };
             let new = |b: &mut EvBufs<E>| {
                 let t = std::time::Instant::now();
-                parse_events_sol(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side, &mut Dz::off());
+                parse_events_sol::<E, false>(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side, &mut Dz::off());
                 t.elapsed().as_secs_f64()
             };
             if i % 2 == 0 {
@@ -5722,7 +5743,11 @@ fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
     if *OLD.get_or_init(|| std::env::var_os("SHOP_EVOLD").is_some()) {
         parse_events(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
     } else {
-        parse_events_sol(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side, &mut dz);
+        if dz.on {
+            parse_events_sol::<E, true>(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side, &mut dz);
+        } else {
+            parse_events_sol::<E, false>(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side, &mut dz);
+        }
     }
     pt(0, &mut tm);
     let (d, doff) = bucketize(&d, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize);
@@ -6826,7 +6851,7 @@ mod tests {
     fn sol_cmp<E: Ev>(c: B, cx: &EvCtx) -> Result<(usize, usize), String> {
         let (mut a, mut b) = (EvBufs::<E>::new(), EvBufs::<E>::new());
         parse_events(c, cx, &mut a.m, &mut a.d, &mut a.fb, &mut a.fbn, &mut a.side);
-        parse_events_sol(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side, &mut Dz::off());
+        parse_events_sol::<E, false>(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side, &mut Dz::off());
         match a.diff(&b) {
             Some(e) => Err(e),
             None => Ok((a.m.len(), a.m.iter().filter(|e| e.pc().is_some()).count())),
