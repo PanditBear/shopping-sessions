@@ -13,4 +13,4 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - run: bash r1/job2.sh
+      - run: bash r1/job3.sh
