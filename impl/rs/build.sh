@@ -97,8 +97,8 @@ grep -v 'no profile data available for function' "$L" | grep -v '^ *Compiling ' 
 nmiss=$(grep -c 'no profile data available for function' "$L" || true)
 nbad=$(grep -v 'no profile data available for function' "$L" | grep -Eic 'out of date|mismatch|inconsistent|malformed' || true)
 grep 'no profile data available for function' "$L" | sed -n '1,10p'
-say "pgo warnings: mismatch $nbad, missing $nmiss; share of functions with profile" \
-  "$(awk -v f="$nfun" -v m="$nmiss" 'BEGIN { printf "%.1f%%", f + m > 0 ? 100 * f / (f + m) : 0 }')"
+pct() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.1f%%", (b > 0 ? 100 * a / b : 0) }'; }
+say "pgo warnings: mismatch $nbad, missing $nmiss; share of functions with profile $(pct "$nfun" $((nfun + nmiss)));"   "executed in training $nrun of $nfun ($(pct "$nrun" "$nfun"))"
 cp "$TD/$T/release/shop" "$OUT"
 step final
 say "total $(($(date +%s) - tall)) s"
