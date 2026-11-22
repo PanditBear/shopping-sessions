@@ -885,6 +885,15 @@ fn leak_file(p: &Path) -> Option<B> {
             }
             unsafe { madvise(m.as_ptr() as *mut _, m.len(), 22) };
         }
+        // SHOP_MAPHP=1: MADV_HUGEPAGE on the input mapping (PMD-map large page-cache folios), print alignment once
+        if std::env::var_os("SHOP_MAPHP").is_some() {
+            extern "C" {
+                fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+            }
+            let r = unsafe { madvise(m.as_ptr() as *mut _, m.len(), 14) };
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| eprintln!("maphp rc {r} addr%2M {} len {}", m.as_ptr() as usize & ((2 << 20) - 1), m.len()));
+        }
     }
     let m: &'static memmap2::Mmap = Box::leak(Box::new(m));
     #[cfg(target_os = "linux")]
