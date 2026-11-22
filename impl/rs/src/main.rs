@@ -2250,6 +2250,11 @@ fn sort_evs_ts<E: Ev>(evs: &mut Vec<E>, tmp: &mut Vec<E>, h: &mut Vec<u32>, span
         return false;
     }
     let q = sb.saturating_sub(TSB);
+    if n > TS_SPLIT {
+        let xb = ((n / TS_SUB).next_power_of_two().trailing_zeros()).clamp(1, 3);
+        sort_evs_ts_split(evs, tmp, h, q, ib, xb);
+        return true;
+    }
     let ds = ib + TSB;
     let im = (1u64 << ib) - 1;
     TS_KEYS.with(|c| {
@@ -2345,6 +2350,138 @@ fn sort_evs_ts<E: Ev>(evs: &mut Vec<E>, tmp: &mut Vec<E>, h: &mut Vec<u32>, span
         }
     });
     true
+}
+
+/// Buckets above this many events take `sort_evs_ts_split`.
+const TS_SPLIT: usize = 32768;
+/// Target events per sub-range of `sort_evs_ts_split`.
+const TS_SUB: usize = 16384;
+
+/// `sort_evs_ts` for a large bucket. A count pass sizes 1 << xb sub-ranges by the top xb bits
+/// of dg; the pack pass also moves every record (stable) into its sub-range of tmp. Each
+/// sub-range is then ordered on its own, with a cache-sized working set: two 11-bit LSD
+/// passes on its keys, a counting scatter on the low dg bits from tmp back into the same
+/// sub-range of evs, and the per-range fixup. The sub-ranges, in digit order, concatenate to
+/// the (dg, quantized ts, index) order the one-range path produces.
+fn sort_evs_ts_split<E: Ev>(evs: &mut Vec<E>, tmp: &mut Vec<E>, h: &mut Vec<u32>, q: u32, ib: u32, xb: u32) {
+    let n = evs.len();
+    let ns = 1usize << xb;
+    let lb = NBK - xb;
+    let nl = 1usize << lb;
+    let hs = 4096 + nl;
+    let ds = ib + TSB;
+    let im = (1u64 << ib) - 1;
+    let mut off = [0usize; 9];
+    for e in evs.iter() {
+        off[(dg(e.key()) >> lb) + 1] += 1;
+    }
+    for j in 0..ns {
+        off[j + 1] += off[j];
+    }
+    TS_KEYS.with(|c| {
+        let (ka, kb) = &mut *c.borrow_mut();
+        h.clear();
+        h.resize(hs * ns, 0);
+        let h = &mut h[..];
+        ka.clear();
+        ka.reserve(n);
+        kb.clear();
+        kb.reserve(n);
+        tmp.clear();
+        tmp.reserve(n);
+        // SAFETY: the pack pass writes every slot of ka and tmp (the sub-range counts sum to n);
+        // kb is written by a pass before it is read.
+        unsafe {
+            ka.set_len(n);
+            kb.set_len(n);
+            tmp.set_len(n);
+        }
+        let mut pos = off;
+        for e in evs.iter() {
+            let t = e.rts() >> q;
+            let d = dg(e.key());
+            let j = d >> lb;
+            let hb = j * hs;
+            // SAFETY: j < ns <= 8; pos[j] < off[j + 1] <= n; histogram indexes are masked below hs.
+            unsafe {
+                let p = *pos.get_unchecked(j);
+                *pos.get_unchecked_mut(j) = p + 1;
+                *tmp.get_unchecked_mut(p) = *e;
+                *ka.get_unchecked_mut(p) = ((d as u64) << ds) | (t << ib) | p as u64;
+                *h.get_unchecked_mut(hb + (t & 2047) as usize) += 1;
+                *h.get_unchecked_mut(hb + 2048 + ((t >> 11) & 2047) as usize) += 1;
+                *h.get_unchecked_mut(hb + 4096 + (d & (nl - 1))) += 1;
+            }
+        }
+        for j in 0..ns {
+            let (lo, hi) = (off[j], off[j + 1]);
+            let m = hi - lo;
+            if m == 0 {
+                continue;
+            }
+            let hsub = &mut h[j * hs..(j + 1) * hs];
+            let (mut src, mut dst) = (&mut ka[lo..hi], &mut kb[lo..hi]);
+            for (o, sh) in [(0usize, ib), (2048, ib + 11)] {
+                let hj = &mut hsub[o..o + 2048];
+                if hj.iter().any(|&c| c as usize == m) {
+                    continue;
+                }
+                let mut s = 0u32;
+                for x in hj.iter_mut() {
+                    let c = *x;
+                    *x = s;
+                    s += c;
+                }
+                for &k in src.iter() {
+                    let d = ((k >> sh) & 2047) as usize;
+                    // SAFETY: d < 2048; the prefix sums keep every position below m.
+                    unsafe {
+                        let p = hj.get_unchecked_mut(d);
+                        *dst.get_unchecked_mut(*p as usize) = k;
+                        *p += 1;
+                    }
+                }
+                std::mem::swap(&mut src, &mut dst);
+            }
+            let hj = &mut hsub[4096..4096 + nl];
+            let mut s = lo as u32;
+            for x in hj.iter_mut() {
+                let c = *x;
+                *x = s;
+                s += c;
+            }
+            for &k in src.iter() {
+                let d = (k >> ds) as usize & (nl - 1);
+                // SAFETY: k & im < n; d < nl; positions stay in lo..hi.
+                unsafe {
+                    let e = *tmp.get_unchecked((k & im) as usize);
+                    let p = hj.get_unchecked_mut(d);
+                    *evs.get_unchecked_mut(*p as usize) = e;
+                    *p += 1;
+                }
+            }
+            let mut s = lo;
+            for &e in hj.iter() {
+                let e = e as usize;
+                if e - s > 1 {
+                    let r = &mut evs[s..e];
+                    let k0 = r[0].key();
+                    let mut mk = false;
+                    let mut ok = true;
+                    for w in 1..r.len() {
+                        mk |= r[w].key() != k0;
+                        ok &= r[w].rts() >= r[w - 1].rts();
+                    }
+                    if mk {
+                        fix_multi(r);
+                    } else if !ok {
+                        isort_by(r, |a, b| a.rts() < b.rts());
+                    }
+                }
+                s = e;
+            }
+        }
+    });
 }
 
 /// Range whose records are nearly ts-ordered but hold several keys: stable split by key rank,
