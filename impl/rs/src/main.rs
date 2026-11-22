@@ -13,6 +13,23 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 // purged (MADV_DONTNEED in 64 KiB slices) about a second later. That splits the huge pages, and the
 // memory is faulted and zeroed again when the next phase reuses it. Peak RSS is reached before the
 // big frees, so keeping freed memory committed costs almost nothing. SHOP_PURGE=1 restores the default.
+// process cpu seconds (user + sys) for the phase-window idle measurement
+fn ru_cpu() -> f64 {
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn getrusage(who: i32, r: *mut i64) -> i32;
+        }
+        let mut r = [0i64; 18];
+        unsafe { getrusage(0, r.as_mut_ptr()) };
+        (r[0] + r[2]) as f64 + (r[1] + r[3]) as f64 * 1e-6
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0.0
+    }
+}
+
 mod hpa {
     extern "C" {
         fn mi_option_set(option: i32, value: std::ffi::c_long);
@@ -5229,7 +5246,7 @@ fn main() {
     let t0 = std::time::Instant::now();
     let tick = |s: &str| {
         if timing {
-            eprintln!("[{:.2}s] {}", t0.elapsed().as_secs_f64(), s);
+            eprintln!("[{:.3}s] {} ru={:.4}", t0.elapsed().as_secs_f64(), s, ru_cpu());
         }
         hpa::diag(s);
     };
