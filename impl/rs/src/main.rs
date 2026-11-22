@@ -67,6 +67,11 @@ static TIMING: AtomicBool = AtomicBool::new(false);
 static PROF: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
 const PROF_NAMES: [&str; 17] =
     ["ev.scan", "ev.bucket", "dd.table", "dd.collect", "dd.resolve", "dd.bucket", "ss.gather", "ss.sort", "ss.proc", "ck.scan", "ck.res", "ss.csort", "wr.ud", "ud.idx", "ud.int", "ud.revtop", "ud.write"];
+fn utl(s: &str) {
+    if TIMING.load(Relaxed) {
+        eprintln!("utl {:.4} t{:?} {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0), rayon::current_thread_index(), s);
+    }
+}
 #[inline]
 fn now() -> Option<std::time::Instant> {
     if TIMING.load(Relaxed) {
@@ -4600,18 +4605,23 @@ fn ev_after<E: Ev>(
     let parts = resolve_parts(ev_out, &mbase, &dead, tab, mf);
     drop(dead);
     tick("dedup done");
+    utl("ss dedup-done");
 
     let offs: Vec<&[u32]> = parts.iter().map(|x| &x.1[..]).collect();
     let cost = pb_cost(&offs, click_out);
-    lpt_run(&cost, || SsW::new(ncamp, d0, nd), |p, w: &mut SsW<E>| {
+    utl("ss pb_cost done");
+    let utl_r = lpt_run(&cost, || SsW::new(ncamp, d0, nd), |p, w: &mut SsW<E>| {
         w.gather(p, &parts, click_out);
         let mut uds = Vec::new();
         process_bucket(&mut w.evs, &mut w.tmp, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut uds, &mut w.cm, ws, we.wrapping_sub(ws));
         w.out.push(uds);
-    })
-    .into_iter()
-    .map(|w| (w.out, w.cm))
-    .collect()
+    });
+    utl("ss lpt_run returned");
+    let utl_o: Vec<_> = utl_r.into_iter().map(|w| (w.out, w.cm)).collect();
+    utl("ss collected");
+    drop(parts);
+    utl("ss parts dropped");
+    utl_o
 }
 
 /// Scratch and accumulators of one sessionize worker.
@@ -6559,6 +6569,7 @@ fn main() {
         Evs::W(v) => ev_after(v, &tab, &mf, &click_out, ws, we, ncamp, d0, nd, &tick),
     };
     tick("sessionized");
+    utl("wr start");
 
     // outputs
     let ud_dir = outd.join("user_daily");
@@ -6571,7 +6582,9 @@ fn main() {
         ud_groups.extend(u.iter());
         cm.merge(m);
     }
+    utl("wr merged");
     let rows = cm.rows();
+    utl("wr rows");
     let nf = 16usize;
     let mut files: Vec<Vec<&Vec<UD>>> = (0..nf).map(|_| vec![]).collect();
     let mut load = vec![0usize; nf];
@@ -6581,18 +6594,27 @@ fn main() {
         load[k] += g.len();
         files[k].push(g);
     }
+    utl("wr files assigned");
     let any_rows = files.iter().any(|g| g.iter().any(|x| !x.is_empty()));
     // one revenue width for every file of the table, so all part files share a schema
     let rev32 = std::env::var_os("SHOP_REV64").is_none()
         && files.par_iter().all(|g| g.iter().all(|x| x.iter().all(|r| r.rev <= i32::MAX as u64)));
+    utl("wr rev32 done");
     rayon::join(
         || {
             files.par_iter().enumerate().filter(|(i, g)| g.iter().any(|x| !x.is_empty()) || (*i == 0 && !any_rows)).for_each(|(i, g)| {
+                utl(&format!("wr ud{i} begin rows={}", g.iter().map(|x| x.len()).sum::<usize>()));
                 write_user_daily(&ud_dir.join(format!("part-{i}.parquet")), g, &cat_names, &names, rev32);
+                utl(&format!("wr ud{i} end"));
             })
         },
-        || write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows, &camp_names, &channels),
+        || {
+            utl("wr cd begin");
+            write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows, &camp_names, &channels);
+            utl("wr cd end");
+        },
     );
+    utl("wr joined");
     tick("written");
     if timing {
         let v: Vec<String> = (0..PROF.len()).map(|i| format!("{}={:.2}", PROF_NAMES[i], PROF[i].load(Relaxed) as f64 / 1e9)).collect();
