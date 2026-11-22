@@ -978,6 +978,13 @@ fn leak_file(p: &Path) -> Option<B> {
 }
 
 fn csv_files(dir: &Path) -> Vec<B> {
+    csv_files_in(dir, true)
+}
+
+/// `par: false` maps the files on the calling thread only. Code inside a rayon::join branch that
+/// must not wait on the pool uses it: a pool thread that waits for a stolen job steals other work
+/// meanwhile and only comes back when that work is done.
+fn csv_files_in(dir: &Path, par: bool) -> Vec<B> {
     let mut v = vec![];
     if let Ok(rd) = std::fs::read_dir(dir) {
         let mut paths: Vec<_> = rd
@@ -986,7 +993,8 @@ fn csv_files(dir: &Path) -> Vec<B> {
             .filter(|p| p.extension().map(|x| x == "csv").unwrap_or(false) && p.is_file())
             .collect();
         paths.sort();
-        let r: Vec<Option<B>> = paths.par_iter().map(|p| leak_file(p)).collect();
+        let r: Vec<Option<B>> =
+            if par { paths.par_iter().map(|p| leak_file(p)).collect() } else { paths.iter().map(|p| leak_file(p)).collect() };
         v.extend(r.into_iter().flatten());
     }
     v
@@ -6038,9 +6046,12 @@ fn main() {
             camp_names.push(b"organic");
             channels.push(b"organic");
             tick("camp loaded");
-            let link_chunks = all_chunks(&csv_files(&data.join("links")), CHUNK);
+            // links load and parse stay on this thread, with no rayon call: if a links job were
+            // stolen, this thread would steal event chunks while it waits and could return only after
+            // the event parse, which leaves the serial insert/union/best below without overlap
+            let link_chunks = all_chunks(&csv_files_in(&data.join("links"), false), CHUNK);
             let link_pairs: Vec<Vec<[u64; 4]>> = link_chunks
-                .par_iter()
+                .iter()
                 .map(|&c| {
                     let mut v = vec![];
                     scan::<2>(c, |&[a, b]| {
