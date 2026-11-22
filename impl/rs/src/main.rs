@@ -3105,7 +3105,7 @@ fn int_col(f: &mut Pqf, c: &mut Cm, rows: &[&[UD]], n: usize, get: impl Fn(&UD) 
 }
 
 /// Writes one row group of `rows` (a list of row runs, n rows in all); returns its column chunks.
-fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names, rev32: bool) -> Vec<Cm> {
+fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names, rev32: bool, wide: &mut bool) -> Vec<Cm> {
     let mut t3 = now();
     // pass 1: ranges and counts
     let (mut dlo, mut dhi) = (i64::MAX, i64::MIN);
@@ -3199,6 +3199,7 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
         for g in rows {
             for r in g.iter() {
                 if rev32 {
+                    *wide |= r.rev > i32::MAX as u64;
                     b.extend_from_slice(&(r.rev as i32).to_le_bytes());
                 } else {
                     b.extend_from_slice(&(r.rev as i64).to_le_bytes());
@@ -3238,11 +3239,13 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
     cols
 }
 
-fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names, rev32: bool) {
+/// Returns false when rev32 is set and some revenue does not fit INT32 (the file is then wrong).
+fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names, rev32: bool) -> bool {
     let mut tm = now();
     const RG: usize = 1 << 20;
     let total: usize = groups.iter().map(|g| g.len()).sum();
     let mut f = Pqf::new(total * 6 + 4096);
+    let mut wide = false;
     // split the groups into row groups of at most RG rows
     let mut rgs: Vec<(Vec<Cm>, usize)> = vec![];
     let mut cur: Vec<&[UD]> = vec![];
@@ -3255,14 +3258,14 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names,
             n += k;
             s = &s[k..];
             if n == RG {
-                rgs.push((ud_row_group(&mut f, &cur, n, cats, names, rev32), n));
+                rgs.push((ud_row_group(&mut f, &cur, n, cats, names, rev32, &mut wide), n));
                 cur.clear();
                 n = 0;
             }
         }
     }
     if n > 0 {
-        rgs.push((ud_row_group(&mut f, &cur, n, cats, names, rev32), n));
+        rgs.push((ud_row_group(&mut f, &cur, n, cats, names, rev32, &mut wide), n));
     }
     // footer (FileMetaData)
     let mut t = Tc::new();
@@ -3338,6 +3341,7 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names,
     std::fs::write(path, &f.out).unwrap();
     out_kick(path);
     pt(16, &mut tm);
+    !wide
 }
 
 fn write_campaign_daily(path: &Path, rows: &[(u32, i32, [u64; 4])], names: &[B], channels: &[B]) {
@@ -5863,13 +5867,16 @@ fn names_build<E: Ev>(v: &[EvChunk<E>], pre: AHashMap<u64, u64>) -> Names {
     }
     let ng = (rayon::current_num_threads() * 4).clamp(1, v.len().max(1));
     let per = v.len().div_ceil(ng).max(1);
-    let parts: Vec<Vec<Vec<(u64, u64)>>> = v
+    // most ids repeat (a user has many events), so each group of chunks keeps the first location
+    // of every key in a small map per shard: far less to move and merge than the raw entries
+    let parts: Vec<Vec<AHashMap<u64, u64>>> = v
         .par_chunks(per)
         .map(|cs| {
-            let mut p: Vec<Vec<(u64, u64)>> = vec![vec![]; NSH];
+            let n: usize = cs.iter().map(|c| c.fbn.len()).sum();
+            let mut p: Vec<AHashMap<u64, u64>> = (0..NSH).map(|_| AHashMap::with_capacity(n / NSH / 2)).collect();
             for c in cs {
-                for &e in &c.fbn {
-                    p[nsh(e.0)].push(e);
+                for &(k, r) in &c.fbn {
+                    p[nsh(k)].entry(k).or_insert(r);
                 }
             }
             p
@@ -5880,8 +5887,9 @@ fn names_build<E: Ev>(v: &[EvChunk<E>], pre: AHashMap<u64, u64>) -> Names {
         .enumerate()
         .map(|(s, pre)| {
             let mut m: AHashMap<u64, u64> = pre.into_iter().collect();
+            m.reserve(parts.iter().map(|p| p[s].len()).max().unwrap_or(0));
             for p in &parts {
-                for &(k, r) in &p[s] {
+                for (&k, &r) in &p[s] {
                     m.entry(k).or_insert(r);
                 }
             }
@@ -6327,14 +6335,11 @@ fn main() {
     let cd_dir = outd.join("campaign_daily");
     std::fs::create_dir_all(&ud_dir).unwrap();
     std::fs::create_dir_all(&cd_dir).unwrap();
-    let mut cm = CampAcc::new(ncamp + 1, d0, nd);
     let mut ud_groups: Vec<&Vec<UD>> = vec![];
-    for (u, m) in &results {
+    for (u, _) in &results {
         ud_groups.extend(u.iter());
-        cm.merge(m);
     }
-    let rows = cm.rows();
-    let nf = 16usize;
+    let nf = std::env::var("SHOP_NF").ok().and_then(|s| s.parse().ok()).filter(|&n: &usize| n > 0).unwrap_or(16);
     let mut files: Vec<Vec<&Vec<UD>>> = (0..nf).map(|_| vec![]).collect();
     let mut load = vec![0usize; nf];
     ud_groups.sort_by_key(|g| std::cmp::Reverse(g.len()));
@@ -6343,18 +6348,35 @@ fn main() {
         load[k] += g.len();
         files[k].push(g);
     }
-    let any_rows = files.iter().any(|g| g.iter().any(|x| !x.is_empty()));
-    // one revenue width for every file of the table, so all part files share a schema
-    let rev32 = std::env::var_os("SHOP_REV64").is_none()
-        && files.par_iter().all(|g| g.iter().all(|x| x.iter().all(|r| r.rev <= i32::MAX as u64)));
-    rayon::join(
-        || {
-            files.par_iter().enumerate().filter(|(i, g)| g.iter().any(|x| !x.is_empty()) || (*i == 0 && !any_rows)).for_each(|(i, g)| {
-                write_user_daily(&ud_dir.join(format!("part-{i}.parquet")), g, &cat_names, &names, rev32);
-            })
-        },
-        || write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows, &camp_names, &channels),
-    );
+    let any_rows = load.iter().any(|&n| n > 0);
+    // tasks: campaign_daily (merges the campaign accumulators first) and the user_daily files,
+    // pulled by the pool threads campaign_daily first, then the files biggest first
+    let mut cost: Vec<u64> = load.iter().enumerate().map(|(i, &n)| if n > 0 || (i == 0 && !any_rows) { n as u64 + 1 } else { 0 }).collect();
+    cost.push(cost.iter().sum::<u64>() + 1);
+    let cd_task = |_: &mut bool| {
+        let mut cm = CampAcc::new(ncamp + 1, d0, nd);
+        for (_, m) in &results {
+            cm.merge(m);
+        }
+        write_campaign_daily(&cd_dir.join("part-0.parquet"), &cm.rows(), &camp_names, &channels);
+    };
+    // one revenue width for every file of the table, so all part files share a schema: the files
+    // are written as INT32 and, if any value does not fit, all are written again as INT64
+    let rev64 = std::env::var_os("SHOP_REV64").is_some();
+    let wide = lpt_run(&cost, || false, |i, wide: &mut bool| {
+        if i == nf {
+            cd_task(wide);
+        } else if cost[i] > 0 {
+            *wide |= !write_user_daily(&ud_dir.join(format!("part-{i}.parquet")), &files[i], &cat_names, &names, !rev64);
+        }
+    })
+    .into_iter()
+    .any(|w| w);
+    if wide {
+        files.par_iter().enumerate().filter(|&(i, _)| cost[i] > 0).for_each(|(i, g)| {
+            write_user_daily(&ud_dir.join(format!("part-{i}.parquet")), g, &cat_names, &names, false);
+        });
+    }
     tick("written");
     if timing {
         let v: Vec<String> = (0..PROF.len()).map(|i| format!("{}={:.2}", PROF_NAMES[i], PROF[i].load(Relaxed) as f64 / 1e9)).collect();
