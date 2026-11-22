@@ -54,7 +54,7 @@ const DDG: usize = 4; // event_id buckets per dedup task
 static PBM: AtomicUsize = AtomicUsize::new((1 << 10) - 1);
 /// Target events per person bucket on large inputs (a bucket's lines, runs and clicks stay
 /// cache-sized as the input grows).
-const PBT: usize = 19_500;
+const PBT: usize = 9_750;
 #[inline(always)]
 fn pb_n() -> usize {
     PBM.load(Relaxed) + 1
