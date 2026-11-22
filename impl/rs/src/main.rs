@@ -1966,20 +1966,37 @@ fn parse_clicks(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: 
             // SAFETY (ldp, day_get, hms, ts25): a 20- or 25-byte field lies inside the window.
             // ts13: the time is the fourth field and both ids are not empty, so the 3 bytes
             // before it and the 16 bytes from pt - 3 lie inside the window.
-            let f = if nt == 20 && unsafe { *pt.add(19) } == b'Z' {
-                let (ta, tb) = unsafe { (ldp(pt), ldp(pt.add(3))) };
-                match unsafe { (day_get(ta, tb, pt, &mut dc), hms(pt.add(11))) } {
-                    (Some(d), Some(h)) => Some((d + h) * 1000),
-                    _ => None,
+            // each fast form breaks out with its time; any None falls to the general parser
+            let t = 'ts: {
+                'fb: {
+                    if nt == 20 && unsafe { *pt.add(19) } == b'Z' {
+                        let (ta, tb, th) = unsafe { (ldp(pt), ldp(pt.add(3)), ldp(pt.add(11))) };
+                        // day_get, written out so a hit goes straight on to hms
+                        let e = &dc.ents[(tb.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize];
+                        let d = if (e.a == ta) & (e.b == tb) {
+                            e.ds
+                        } else {
+                            match day_miss_ab(ta, tb, &mut dc) {
+                                Some(d) => d,
+                                None => break 'fb,
+                            }
+                        };
+                        if let Some(h) = hmsv(th) {
+                            break 'ts (d + h) * 1000;
+                        }
+                    } else if nt == 13 {
+                        if let Some(t) = unsafe { ts13(pt) } {
+                            break 'ts t;
+                        }
+                    } else if nt == 25 {
+                        if let Some(t) = unsafe { ts25(pt, D0_A, D0_B, D0_S, &mut dc) } {
+                            break 'ts t;
+                        }
+                    }
                 }
-            } else if nt == 13 {
-                unsafe { ts13(pt) }
-            } else if nt == 25 {
-                unsafe { ts25(pt, D0_A, D0_B, D0_S, &mut dc) }
-            } else {
-                None
+                let Some(t) = parse_ts_c(sl(pt, nt), &mut tc) else { continue 'ln };
+                t
             };
-            let Some(t) = f.or_else(|| parse_ts_c(sl(pt, nt), &mut tc)) else { continue 'ln };
             if (t < tlo) | (t >= we) {
                 continue 'ln;
             }
@@ -4057,6 +4074,17 @@ unsafe fn day_get(a: u64, b: u64, p: *const u8, c: &mut DayCache) -> Option<i64>
     }
 }
 
+/// `day_miss` with the 11 bytes rebuilt from `a` (bytes 0..8) and `b` (bytes 3..11).
+#[cold]
+#[inline(never)]
+fn day_miss_ab(a: u64, b: u64, c: &mut DayCache) -> Option<i64> {
+    let mut s = [0u8; 11];
+    s[..8].copy_from_slice(&a.to_le_bytes());
+    s[8..].copy_from_slice(&b.to_le_bytes()[5..]);
+    // SAFETY: s holds the 11 bytes day_miss reads
+    unsafe { day_miss(a, b, s.as_ptr(), c) }
+}
+
 #[cold]
 #[inline(never)]
 unsafe fn day_miss(a: u64, b: u64, p: *const u8, c: &mut DayCache) -> Option<i64> {
@@ -4073,9 +4101,14 @@ unsafe fn day_miss(a: u64, b: u64, p: *const u8, c: &mut DayCache) -> Option<i64
 /// first digits up to 2, 5, 5, and the two colons), then the hour test.
 #[inline(always)]
 unsafe fn hms(p: *const u8) -> Option<i64> {
+    hmsv(ldp(p))
+}
+
+/// `hms` of the 8 bytes already loaded as `t`.
+#[inline(always)]
+fn hmsv(t: u64) -> Option<i64> {
     const LO: u64 = u64::from_le_bytes(*b"00:00:00");
     const HI: u64 = u64::from_le_bytes([0x7F - b'2', 0x7F - b'9', 0x7F - b':', 0x7F - b'5', 0x7F - b'9', 0x7F - b':', 0x7F - b'5', 0x7F - b'9']);
-    let t = ldp(p);
     let v = t.wrapping_sub(LO);
     if ((v | t.wrapping_add(HI)) & h8(0x80)) != 0 {
         return None;
