@@ -47,22 +47,37 @@ mod ru {
         fn getrusage(who: i32, ru: *mut [i64; 18]) -> i32;
     }
     #[cfg(target_os = "linux")]
-    pub fn snap() -> [f64; 5] {
+    pub fn snap() -> [f64; 7] {
         let mut r = [0i64; 18];
         unsafe { getrusage(0, &mut r) };
         let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
         let rss = s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
-        [r[0] as f64 + r[1] as f64 * 1e-6, r[2] as f64 + r[3] as f64 * 1e-6, r[8] as f64, r[9] as f64, rss / 1024.0]
+        [r[0] as f64 + r[1] as f64 * 1e-6, r[2] as f64 + r[3] as f64 * 1e-6, r[8] as f64, r[9] as f64, rss / 1024.0, r[16] as f64, r[17] as f64]
     }
     #[cfg(not(target_os = "linux"))]
-    pub fn snap() -> [f64; 5] {
-        [0.0; 5]
+    pub fn snap() -> [f64; 7] {
+        [0.0; 7]
     }
-    pub fn fmt(a: &[f64; 5], b: &[f64; 5]) -> String {
-        format!("RU u={:.3} s={:.3} minflt={} majflt={} rss={:.0}MB drss={:+.0}MB", b[0] - a[0], b[1] - a[1], b[2] - a[2], b[3] - a[3], b[4], b[4] - a[4])
+    // this thread: user s, sys s, voluntary switches
+    #[cfg(target_os = "linux")]
+    pub fn tsnap() -> [f64; 3] {
+        let mut r = [0i64; 18];
+        unsafe { getrusage(1, &mut r) };
+        [r[0] as f64 + r[1] as f64 * 1e-6, r[2] as f64 + r[3] as f64 * 1e-6, r[16] as f64]
+    }
+    #[cfg(not(target_os = "linux"))]
+    pub fn tsnap() -> [f64; 3] {
+        [0.0; 3]
+    }
+    pub static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    pub fn el() -> f64 {
+        T0.get().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0)
+    }
+    pub fn fmt(a: &[f64; 7], b: &[f64; 7]) -> String {
+        format!("RU u={:.3} s={:.3} minflt={} majflt={} rss={:.0}MB drss={:+.0}MB vcsw={} ivcsw={}", b[0] - a[0], b[1] - a[1], b[2] - a[2], b[3] - a[3], b[4], b[4] - a[4], b[5] - a[5], b[6] - a[6])
     }
     pub static LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    pub fn mark(t0: std::time::Instant, label: &str, prev: &[f64; 5]) -> [f64; 5] {
+    pub fn mark(t0: std::time::Instant, label: &str, prev: &[f64; 7]) -> [f64; 7] {
         let s = snap();
         LOG.lock().unwrap().push(format!("  ck [{:.3}s] {label} {}", t0.elapsed().as_secs_f64(), fmt(prev, &s)));
         s
@@ -3285,6 +3300,7 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
 }
 
 fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names, rev32: bool) {
+    let (w0, r0) = (ru::el(), ru::tsnap());
     let mut tm = now();
     const RG: usize = 1 << 20;
     let total: usize = groups.iter().map(|g| g.len()).sum();
@@ -3381,9 +3397,16 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names,
     f.out.extend_from_slice(&(t.b.len() as u32).to_le_bytes());
     f.out.extend_from_slice(b"PAR1");
     pt(12, &mut tm);
+    let (w1, r1) = (ru::el(), ru::tsnap());
     std::fs::write(path, &f.out).unwrap();
+    let w2 = ru::el();
     out_kick(path);
     pt(16, &mut tm);
+    let (w3, r3) = (ru::el(), ru::tsnap());
+    ru::LOG.lock().unwrap().push(format!(
+        "  wr {:?} rows={} bytes={} [{:.3}-{:.3}-{:.3}-{:.3}] enc u={:.3} s={:.3} vcsw={} | write+kick u={:.3} s={:.3} vcsw={}",
+        path.file_name().unwrap_or_default(), total, f.out.len(), w0, w1, w2, w3, r1[0] - r0[0], r1[1] - r0[1], r1[2] - r0[2], r3[0] - r1[0], r3[1] - r1[1], r3[2] - r1[2]
+    ));
 }
 
 fn write_campaign_daily(path: &Path, rows: &[(u32, i32, [u64; 4])], names: &[B], channels: &[B]) {
@@ -6107,6 +6130,7 @@ fn main() {
     let timing = std::env::var("SHOP_TIMING").is_ok();
     TIMING.store(timing, Relaxed);
     let t0 = std::time::Instant::now();
+    let _ = ru::T0.set(t0);
     let ru_prev = std::sync::Mutex::new(ru::snap());
     let tick = |s: &str| {
         if timing {
@@ -6598,6 +6622,9 @@ fn main() {
     );
     tick("written");
     if timing {
+        for l in ru::LOG.lock().unwrap().drain(..) {
+            eprintln!("{l}");
+        }
         let v: Vec<String> = (0..PROF.len()).map(|i| format!("{}={:.2}", PROF_NAMES[i], PROF[i].load(Relaxed) as f64 / 1e9)).collect();
         eprintln!("prof(cpu s): {}", v.join(" "));
     }
