@@ -2758,20 +2758,19 @@ fn process_bucket<E: Ev>(
         let (mut lo, mut hi) = (0usize, 0usize);
         day.key = pid;
         day.day = 0;
-        let mut prev = 0i64;
-        let mut first = true;
-        let mut s_camp = 0u32;
+        // no event precedes the first: et - prev exceeds GAP for any real ts, so it opens the first session
+    let mut prev = i64::MIN / 2;
+                let mut s_camp = 0u32;
         let mut s_day = 0i64;
         let mut s_rev = 0u64;
         let mut s_purch = false;
         let mut in_sess = false;
         for e in &evs[i..j] {
             let et = e.rts() as i64 + base;
-            if first || et - prev > GAP {
+            if et - prev > GAP {
                 if in_sess {
                     cm.sess(s_camp, s_day, s_purch, s_rev);
                 }
-                first = false;
                 in_sess = true;
                 let s = et;
                 let d = s.div_euclid(DAY);
@@ -5554,20 +5553,19 @@ fn person_sess<E: Tp>(
     let (mut lo, mut hi) = (0usize, 0usize);
     day.key = pid;
     day.day = 0;
-    let mut prev = 0i64;
-    let mut first = true;
-    let mut s_camp = 0u32;
+    // no event precedes the first: et - prev exceeds GAP for any real ts, so it opens the first session
+    let mut prev = i64::MIN / 2;
+        let mut s_camp = 0u32;
     let mut s_day = 0i64;
     let mut s_rev = 0u64;
     let mut s_purch = false;
     let mut in_sess = false;
     for e in pes {
         let et = e.rts() as i64 + base;
-        if first || et - prev > GAP {
+        if et - prev > GAP {
             if in_sess {
                 cm.sess(s_camp, s_day, s_purch, s_rev);
             }
-            first = false;
             in_sess = true;
             let s = et;
             let d = s.div_euclid(DAY);
