@@ -27,7 +27,7 @@ cargo_build() { # target-dir rustflags
 say "$(rustc -V)"
 t0=$(date +%s); tall=$t0
 
-if [ "${SHOP_PGO:-1}" = 0 ]; then
+if [ "${SHOP_PGO:-0}" = 0 ]; then
   cargo_build "$TD" "$FLAGS"
   cp "$TD/$T/release/shop" "$OUT"
   step plain
