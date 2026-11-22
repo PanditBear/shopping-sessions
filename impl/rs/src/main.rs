@@ -62,9 +62,9 @@ fn mix(k: u64) -> u64 {
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 static TIMING: AtomicBool = AtomicBool::new(false);
-static PROF: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
-const PROF_NAMES: [&str; 13] =
-    ["ev.scan", "ev.bucket", "dd.table", "dd.collect", "dd.resolve", "dd.bucket", "ss.gather", "ss.sort", "ss.proc", "ck.scan", "ck.res", "ss.csort", "wr.ud"];
+static PROF: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
+const PROF_NAMES: [&str; 17] =
+    ["ev.scan", "ev.bucket", "dd.table", "dd.collect", "dd.resolve", "dd.bucket", "ss.gather", "ss.sort", "ss.proc", "ck.scan", "ck.res", "ss.csort", "wr.ud", "ud.idx", "ud.int", "ud.revtop", "ud.write"];
 #[inline]
 fn now() -> Option<std::time::Instant> {
     if TIMING.load(Relaxed) {
@@ -2818,7 +2818,8 @@ fn int_col(f: &mut Pqf, c: &mut Cm, rows: &[&[UD]], n: usize, get: impl Fn(&UD) 
 }
 
 /// Writes one row group of `rows` (a list of row runs, n rows in all); returns its column chunks.
-fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names) -> Vec<Cm> {
+fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names, rev32: bool) -> Vec<Cm> {
+    let mut t3 = now();
     // pass 1: ranges and counts
     let (mut dlo, mut dhi) = (i64::MAX, i64::MIN);
     let (mut slo, mut shi, mut elo, mut ehi) = (u64::MAX, 0u64, u64::MAX, 0u64);
@@ -2845,7 +2846,7 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
         cm(1, "day"),
         cm(2, "sessions"),
         cm(2, "events"),
-        cm(2, "revenue_cents"),
+        cm(if rev32 { 1 } else { 2 }, "revenue_cents"),
         cm(6, "top_category"),
     ];
     // user_id: dictionary of the persons in row order, indices as one RLE run per person
@@ -2890,15 +2891,21 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
         f.page(&mut cols[0], true, persons, 0, &dict);
         f.page(&mut cols[0], false, n, 8, &idx);
     }
+    pt(13, &mut t3);
     int_col(f, &mut cols[1], rows, n, |r| r.day as i64, dlo, dhi);
     int_col(f, &mut cols[2], rows, n, |r| r.sessions as i64, slo as i64, shi as i64);
     int_col(f, &mut cols[3], rows, n, |r| r.events as i64, elo as i64, ehi as i64);
-    // revenue: PLAIN (wide range, mostly zeros)
+    pt(14, &mut t3);
+    // revenue: PLAIN (wide range, mostly zeros), INT32 when every value of the file fits
     {
         let mut b: Vec<u8> = Vec::with_capacity(n * 8);
         for g in rows {
             for r in g.iter() {
-                b.extend_from_slice(&(r.rev as i64).to_le_bytes());
+                if rev32 {
+                    b.extend_from_slice(&(r.rev as i32).to_le_bytes());
+                } else {
+                    b.extend_from_slice(&(r.rev as i64).to_le_bytes());
+                }
             }
         }
         f.page(&mut cols[4], false, n, 0, &b);
@@ -2930,6 +2937,7 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
         b.extend_from_slice(&vals.finish());
         f.page(&mut cols[5], false, n, 8, &b);
     }
+    pt(15, &mut t3);
     cols
 }
 
@@ -2938,6 +2946,7 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names)
     const RG: usize = 1 << 20;
     let total: usize = groups.iter().map(|g| g.len()).sum();
     let mut f = Pqf::new(total * 6 + 4096);
+    let rev32 = std::env::var_os("SHOP_REV64").is_none() && groups.iter().all(|g| g.iter().all(|r| r.rev <= i32::MAX as u64));
     // split the groups into row groups of at most RG rows
     let mut rgs: Vec<(Vec<Cm>, usize)> = vec![];
     let mut cur: Vec<&[UD]> = vec![];
@@ -2950,14 +2959,14 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names)
             n += k;
             s = &s[k..];
             if n == RG {
-                rgs.push((ud_row_group(&mut f, &cur, n, cats, names), n));
+                rgs.push((ud_row_group(&mut f, &cur, n, cats, names, rev32), n));
                 cur.clear();
                 n = 0;
             }
         }
     }
     if n > 0 {
-        rgs.push((ud_row_group(&mut f, &cur, n, cats, names), n));
+        rgs.push((ud_row_group(&mut f, &cur, n, cats, names, rev32), n));
     }
     // footer (FileMetaData)
     let mut t = Tc::new();
@@ -2973,7 +2982,7 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names)
         (1, 0, "day", 6, 6),
         (2, 0, "sessions", -1, 0),
         (2, 0, "events", -1, 0),
-        (2, 0, "revenue_cents", -1, 0),
+        (if rev32 { 1 } else { 2 }, 0, "revenue_cents", -1, 0),
         (6, 1, "top_category", 0, 1),
     ];
     for (ty, rep, name, conv, lt) in schema {
@@ -3029,9 +3038,10 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names)
     f.out.extend_from_slice(&t.b);
     f.out.extend_from_slice(&(t.b.len() as u32).to_le_bytes());
     f.out.extend_from_slice(b"PAR1");
+    pt(12, &mut tm);
     std::fs::write(path, &f.out).unwrap();
     out_kick(path);
-    pt(12, &mut tm);
+    pt(16, &mut tm);
 }
 
 fn write_campaign_daily(path: &Path, rows: &[(u32, i32, [u64; 4])], names: &[B], channels: &[B]) {
