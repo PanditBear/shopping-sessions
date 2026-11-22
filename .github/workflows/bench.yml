@@ -34,6 +34,12 @@ on:
       pqrefs:
         description: "if set: only the parquet reader check (Spark, pyarrow, duckdb, polars) of these refs"
         default: ""
+      seed:
+        description: "generator seed"
+        default: "7"
+      content:
+        description: "1 = compare output rows of every ref with the first ref (order ignored)"
+        default: "0"
 permissions:
   contents: read
 jobs:
@@ -60,6 +66,8 @@ jobs:
           EXITPROBE: ${{ github.event.inputs.exitprobe || '0' }}
           EVENTS: ${{ github.event.inputs.events || '20000000' }}
           CLICKS: ${{ github.event.inputs.clicks || '5000000' }}
+          SEED: ${{ github.event.inputs.seed || '7' }}
+          CONTENT: ${{ github.event.inputs.content || '0' }}
         run: bash bench.sh $REFS
   perf:
     if: ${{ github.event.inputs.perfsha != '' }}

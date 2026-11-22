@@ -109,6 +109,14 @@ for im in "${IMGS[@]:1}"; do
   if diff -r -q $W/keep-${IMGS[0]} $W/keep-$im >/dev/null; then echo "$im same"; else echo "$im DIFFERENT"; fi
 done | tee -a ${GITHUB_STEP_SUMMARY:-/dev/null}
 
+if [ "${CONTENT:-0}" = 1 ]; then
+  echo "== output content vs ${IMGS[0]} (rows as multisets, order ignored), seed $SEED events $EVENTS"
+  python3 -m pip install -q duckdb
+  K=(); for im in "${IMGS[@]}"; do K+=("$W/keep-$im"); done
+  set +e; python3 content.py "${K[@]}" | tee -a ${GITHUB_STEP_SUMMARY:-/dev/null}; crc=${PIPESTATUS[0]}; set -e
+  echo "content check exit $crc"
+fi
+
 echo "== last-run phase ticks"
 for im in "${IMGS[@]}"; do echo "-- $im"; cat $W/err-$im.txt; done
 
