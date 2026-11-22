@@ -2738,10 +2738,12 @@ struct Cm {
     comp: i64,
     dpo: i64,
     dico: Option<i64>,
+    // compress this chunk's pages (when the file has a compressor)
+    z: bool,
 }
 
 fn cm(ty: i32, name: &'static str) -> Cm {
-    Cm { ty, name, encs: vec![0, 3], nv: 0, unc: 0, comp: 0, dpo: 0, dico: None }
+    Cm { ty, name, encs: vec![0, 3], nv: 0, unc: 0, comp: 0, dpo: 0, dico: None, z: true }
 }
 
 struct Pqf {
@@ -2752,10 +2754,10 @@ struct Pqf {
 }
 impl Pqf {
     fn new(cap: usize) -> Self {
-        // uncompressed unless SHOP_CODEC=zstd[:level]: zstd cost about 0.09 CPU-s per 20M events
+        // zstd (level 1) on the chunks that shrink a lot for little work; SHOP_CODEC=none|zstd[:level]
         let v = std::env::var("SHOP_CODEC").unwrap_or_default();
         let (name, lvl) = v.split_once(':').unwrap_or((v.as_str(), "1"));
-        let z = if name != "zstd" { None } else { Some(zstd::bulk::Compressor::new(lvl.parse().unwrap_or(1)).unwrap()) };
+        let z = if name == "none" { None } else { Some(zstd::bulk::Compressor::new(lvl.parse().unwrap_or(1)).unwrap()) };
         let codec = if z.is_some() { 6 } else { 0 };
         let mut out = Vec::with_capacity(cap);
         out.extend_from_slice(b"PAR1");
@@ -2764,13 +2766,13 @@ impl Pqf {
     /// One page: `dict` selects a dictionary page (PLAIN) over a data page v1 with value encoding `enc`.
     fn page(&mut self, cm: &mut Cm, dict: bool, nv: usize, enc: i32, body: &[u8]) {
         let comp: &[u8] = match &mut self.z {
-            Some(z) => {
+            Some(z) if cm.z => {
                 self.zb.clear();
                 self.zb.reserve(zstd::zstd_safe::compress_bound(body.len()));
                 z.compress_to_buffer(body, &mut self.zb).unwrap();
                 &self.zb
             }
-            None => body,
+            _ => body,
         };
         let mut h = Tc::new();
         h.i32(1, if dict { 2 } else { 0 });
@@ -2876,6 +2878,11 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
         cm(if rev32 { 1 } else { 2 }, "revenue_cents"),
         cm(6, "top_category"),
     ];
+    // which chunks to compress, bit i = column i; default user_id and revenue_cents
+    let zm: u32 = std::env::var("SHOP_ZCOLS").ok().and_then(|v| v.parse().ok()).unwrap_or(17);
+    for (i, c) in cols.iter_mut().enumerate() {
+        c.z = (zm >> i) & 1 == 1;
+    }
     // user_id: dictionary of the persons in row order, indices as one RLE run per person
     {
         let w = bwid(persons.saturating_sub(1) as u64);
@@ -3047,7 +3054,7 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names)
             t.list(3, 8, 1);
             uvar(&mut t.b, c.name.len() as u64);
             t.b.extend_from_slice(c.name.as_bytes());
-            t.i32(4, f.codec);
+            t.i32(4, if c.z { f.codec } else { 0 });
             t.i64(5, c.nv);
             t.i64(6, c.unc);
             t.i64(7, c.comp);
