@@ -1329,13 +1329,14 @@ const RPD: usize = 32;
 
 // ---------- records ----------
 
-/// Dedup record of one event line: packed event_id, ingest key (`ing32`) and the line's index in
-/// its chunk's record list.
+/// Dedup record of one event line: packed event_id, ingest key (`ing32`), the line's index in
+/// its chunk (`loc`) and the line's record `e` (key 0 for a dropped line).
 #[derive(Clone, Copy)]
-struct DRec {
+struct DRec<E> {
     eid: u64,
     ing: u32,
     loc: u32,
+    e: E,
 }
 
 /// Dense dedup record: the generator index of the event_id, the ingest key and the line's record.
@@ -3419,7 +3420,7 @@ struct EvCtx<'a> {
 /// the line is invalid) and a dedup entry: packed event_id in `d`, others in `fb`; ingest times
 /// with an inexact key go to `side`. User ids with no packed key are noted in `fbn`.
 #[inline(never)]
-fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Fb, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>) {
+fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec<E>>, fb: &mut Fb<E>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>) {
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
     let c0 = c.as_ptr() as usize;
@@ -3474,8 +3475,8 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
                 side.push((loc, ingest));
             }
             match pack6(eid) {
-                Some(k) => d.push(DRec { eid: k, ing: ik, loc }),
-                None => fb_put(cx.rs, d, fb, eid, ingest, ik, loc),
+                Some(k) => d.push(DRec { eid: k, ing: ik, loc, e: r }),
+                None => fb_put(cx.rs, d, fb, eid, ingest, ik, loc, r),
             }
         }
     });
@@ -3485,7 +3486,7 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
 /// `parse_events_sol` go through it).
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn ev_line<E: Ev>(f: &[B; 7], cx: &EvCtx, c0: usize, tci: &mut TsCache, tct: &mut TsCache, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Fb, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
+fn ev_line<E: Ev>(f: &[B; 7], cx: &EvCtx, c0: usize, tci: &mut TsCache, tct: &mut TsCache, m: &mut Vec<E>, d: &mut Vec<DRec<E>>, fb: &mut Fb<E>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
     let &[eid, uid, ts, ing, et, pr, price] = f;
     if eid.is_empty() {
         return;
@@ -3525,14 +3526,16 @@ fn ev_line<E: Ev>(f: &[B; 7], cx: &EvCtx, c0: usize, tci: &mut TsCache, tct: &mu
         dz.put(i, ik, r, exact, ingest);
         return;
     }
-    let loc = m.len() as u32;
-    m.push(r);
+    let loc = (d.len() + fb.x.len()) as u32;
+    if dz.on {
+        m.push(r);
+    }
     if !exact {
         side.push((loc, ingest));
     }
     match k6 {
-        Some(k) => d.push(DRec { eid: k, ing: ik, loc }),
-        None => fb_put(cx.rs, d, fb, eid, ingest, ik, loc),
+        Some(k) => d.push(DRec { eid: k, ing: ik, loc, e: r }),
+        None => fb_put(cx.rs, d, fb, eid, ingest, ik, loc, r),
     }
 }
 
@@ -3541,58 +3544,64 @@ fn ev_line<E: Ev>(f: &[B; 7], cx: &EvCtx, c0: usize, tci: &mut TsCache, tct: &mu
 /// goes to the hash buckets with key hash | HBIT (pack6 keys keep bits 63..60 clear), and its bytes stay in
 /// `fb.v` (in loc order) for the exact compare on key matches.
 #[inline(never)]
-fn fb_put(rs: &RandomState, d: &mut Vec<DRec>, fb: &mut Fb, eid: B, ingest: i64, ik: u32, loc: u32) {
+fn fb_put<E: Ev>(rs: &RandomState, d: &mut Vec<DRec<E>>, fb: &mut Fb<E>, eid: B, ingest: i64, ik: u32, loc: u32, e: E) {
     // hex_full checks n == 33 and the prefix first, so other ids pay two compares
     if let Some((_, full)) = hex_full(eid) {
         if loc <= DX_LOC {
-            fb.x.push(DX::new(full, CODE[eid[0] as usize], ik, loc));
+            fb.x.push(DX::new(full, CODE[eid[0] as usize], ik, loc, e));
             return;
         }
     }
-    fb_put_other(rs, d, fb, eid, ingest, ik, loc);
+    fb_put_other(rs, d, fb, eid, ingest, ik, loc, e);
 }
 
 /// An event_id that is neither Short nor (storable) Hex: hash bucket record plus its bytes in `fb.v`.
 #[inline(never)]
-fn fb_put_other(rs: &RandomState, d: &mut Vec<DRec>, fb: &mut Fb, eid: B, ingest: i64, ik: u32, loc: u32) {
-    d.push(DRec { eid: rs.hash_one(eid) | HBIT, ing: ik, loc });
+fn fb_put_other<E: Ev>(rs: &RandomState, d: &mut Vec<DRec<E>>, fb: &mut Fb<E>, eid: B, ingest: i64, ik: u32, loc: u32, e: E) {
+    d.push(DRec { eid: rs.hash_one(eid) | HBIT, ing: ik, loc, e });
     fb.v.push((pack(eid), ingest, loc));
 }
 
 /// Event ids that pack6 rejects: Other ids `v` (packed bytes, ingest, loc; loc order), Hex ids `x` (loc order).
-#[derive(PartialEq, Default)]
-struct Fb {
+struct Fb<E> {
     v: Vec<(u64, i64, u32)>,
-    x: Vec<DX>,
+    x: Vec<DX<E>>,
+}
+impl<E> Default for Fb<E> {
+    fn default() -> Self {
+        Fb { v: vec![], x: vec![] }
+    }
 }
 
 /// One line with a Hex event_id: the 32 hex digits as hi:lo, the ingest key and lp = loc | prefix code << 26
-/// (the code is 1..=63, so lp >> 26 != 0).
+/// (the code is 1..=63, so lp >> 26 != 0), and the line's record `e`.
 #[derive(Clone, Copy, PartialEq, Debug)]
-struct DX {
+struct DX<E> {
     hi: u64,
     lo: u64,
     ing: u32,
     lp: u32,
+    e: E,
 }
 /// largest loc a DX can hold (26 bits)
 const DX_LOC: u32 = (1 << 26) - 1;
-impl DX {
+impl<E> DX<E> {
     /// the DX of a Hex id with digit value `full` and prefix code `c0` (non-zero), line `loc` <= DX_LOC
     #[inline(always)]
-    fn new(full: u128, c0: u8, ik: u32, loc: u32) -> DX {
-        DX { hi: (full >> 64) as u64, lo: full as u64, ing: ik, lp: loc | (c0 as u32) << 26 }
+    fn new(full: u128, c0: u8, ik: u32, loc: u32, e: E) -> DX<E> {
+        DX { hi: (full >> 64) as u64, lo: full as u64, ing: ik, lp: loc | (c0 as u32) << 26, e }
     }
 }
 
 /// hash of a Hex event id: the top EBB bits pick its bucket, bits 8.. its first table slot
 #[inline(always)]
-fn dx_hash(r: &DX) -> u64 {
+fn dx_hash<E>(r: &DX<E>) -> u64 {
     mix(r.hi.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ r.lo ^ ((r.lp >> 26) as u64) << 58)
 }
 
 /// The Hex event ids of dedup bucket b, every chunk in order and each chunk's in loc order. Slot: [hi, lo,
-/// ingest key << 32 | global index of the current winner, prefix code] (code != 0 marks a full slot); the
+/// ingest key << 32 | global index of the current winner, prefix code | the winner's DX address << 6]
+/// (code != 0 marks a full slot); the
 /// key (code, hi, lo) is the whole id, so equal keys are copies. On a match `better(g, ing, og, oing)` says
 /// whether the new line g beats the slot's line og; the loser goes to `lose`. Returns the table length used
 /// (the winners are the full slots of `tb[..len]`).
@@ -3615,19 +3624,21 @@ fn dx_table<E>(ev_out: &[EvChunk<E>], mbase: &[u32], b: usize, tb: &mut Vec<[u64
             let gi = mb + (r.lp & DX_LOC);
             let pre = (r.lp >> 26) as u64;
             let pk = ((r.ing as u64) << 32) | gi as u64;
+            let px = pre | (r as *const DX<E> as usize as u64) << 6;
             let mut p = (dx_hash(r) >> 8) as usize & mask;
             loop {
                 // SAFETY: p is masked to cap
                 let o = unsafe { t.get_unchecked_mut(p) };
                 if o[3] == 0 {
-                    *o = [r.hi, r.lo, pk, pre];
+                    *o = [r.hi, r.lo, pk, px];
                     break;
                 }
-                if o[0] == r.hi && o[1] == r.lo && o[3] == pre {
+                if o[0] == r.hi && o[1] == r.lo && o[3] & 63 == pre {
                     let ok = (o[2] >> 32) as u32;
                     let og = o[2] as u32;
                     if better(gi, r.ing, og, ok) {
                         o[2] = pk;
+                        o[3] = px;
                         lose(og);
                     } else {
                         lose(gi);
@@ -4076,7 +4087,7 @@ unsafe fn ts25h(p: *const u8, ra: u64, rb: u64, rd: i64, c: &mut DayCache, hs: i
 /// both ids take one `pack6x2` pass and the base-36 value is never formed.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
 #[inline(never)]
-fn parse_events_sol<E: Ev, const DZ: bool>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Fb, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
+fn parse_events_sol<E: Ev, const DZ: bool>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec<E>>, fb: &mut Fb<E>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
     use core::arch::x86_64::_bzhi_u64;
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
@@ -4254,8 +4265,10 @@ fn parse_events_sol<E: Ev, const DZ: bool>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: 
                     continue 'ln;
                 }
             }
-            let loc = m.len() as u32;
-            m.push(r);
+            let loc = (d.len() + fb.x.len()) as u32;
+            if DZ {
+                m.push(r);
+            }
             if !iex {
                 side.push((loc, ingest));
             }
@@ -4269,11 +4282,11 @@ fn parse_events_sol<E: Ev, const DZ: bool>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: 
                 unsafe { idk_hex(pe, ne) }
             };
             if cls == 0 {
-                d.push(DRec { eid: ke, ing: ik, loc });
+                d.push(DRec { eid: ke, ing: ik, loc, e: r });
             } else if cls == 1 && loc <= DX_LOC {
-                fb.x.push(DX::new(full, (ke >> 56) as u8 & 63, ik, loc));
+                fb.x.push(DX::new(full, (ke >> 56) as u8 & 63, ik, loc, r));
             } else {
-                fb_put_other(cx.rs, d, fb, sl(pe, ne), ingest, ik, loc);
+                fb_put_other(cx.rs, d, fb, sl(pe, ne), ingest, ik, loc, r);
             }
             continue 'ln;
         }
@@ -4289,7 +4302,7 @@ fn parse_events_sol<E: Ev, const DZ: bool>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: 
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
-fn parse_events_sol<E: Ev, const DZ: bool>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Fb, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
+fn parse_events_sol<E: Ev, const DZ: bool>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec<E>>, fb: &mut Fb<E>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
     let c0 = c.as_ptr() as usize;
@@ -4299,8 +4312,8 @@ fn parse_events_sol<E: Ev, const DZ: bool>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: 
 /// Output buffers of one event-parse call.
 struct EvBufs<E> {
     m: Vec<E>,
-    d: Vec<DRec>,
-    fb: Fb,
+    d: Vec<DRec<E>>,
+    fb: Fb<E>,
     fbn: Vec<(u64, u64)>,
     side: Vec<(u32, i64)>,
 }
@@ -4318,7 +4331,8 @@ impl<E: Ev> EvBufs<E> {
     }
     /// the first difference from `o` (records compared by key, ts and `pc`), if any
     fn diff(&self, o: &Self) -> Option<String> {
-        if self.m.len() != o.m.len() {
+        // parse_events_sol writes m only for the dense index path
+        if !self.m.is_empty() && !o.m.is_empty() && self.m.len() != o.m.len() {
             return Some(format!("m len {} vs {}", self.m.len(), o.m.len()));
         }
         for (i, (a, b)) in self.m.iter().zip(&o.m).enumerate() {
@@ -4326,11 +4340,12 @@ impl<E: Ev> EvBufs<E> {
                 return Some(format!("m[{i}]: key {:x}/{:x} rts {}/{} pc {:?}/{:?}", a.key(), b.key(), a.rts(), b.rts(), a.pc(), b.pc()));
             }
         }
-        let dk = |v: &[DRec]| v.iter().map(|r| (r.eid, r.ing, r.loc)).collect::<Vec<_>>();
+        let dk = |v: &[DRec<E>]| v.iter().map(|r| (r.eid, r.ing, r.loc, r.e.key(), r.e.rts(), r.e.pc())).collect::<Vec<_>>();
         if dk(&self.d) != dk(&o.d) {
             return Some(format!("d differs ({} vs {})", self.d.len(), o.d.len()));
         }
-        if self.fb != o.fb {
+        let xk = |v: &[DX<E>]| v.iter().map(|r| (r.hi, r.lo, r.ing, r.lp, r.e.key(), r.e.rts(), r.e.pc())).collect::<Vec<_>>();
+        if self.fb.v != o.fb.v || xk(&self.fb.x) != xk(&o.fb.x) {
             return Some(format!("fb differs ({}+{} vs {}+{})", self.fb.v.len(), self.fb.x.len(), o.fb.v.len(), o.fb.x.len()));
         }
         if self.fbn != o.fbn {
@@ -4388,13 +4403,14 @@ fn sol_bench<E: Ev>(ev_chunks: &[B], cx: &EvCtx) {
 }
 
 struct EvChunk<E> {
+    /// the line records, written only for the dense index path (else they ride in `d` / `dx`)
     m: Vec<E>,
-    d: Vec<DRec>,
+    d: Vec<DRec<E>>,
     doff: Vec<u32>,
     dz: Dz<E>,
-    fb: Fb,
+    fb: Fb<E>,
     /// the Hex event ids (`Fb::x`) grouped by `dx_hash` bucket, with offsets like `d` / `doff`
-    dx: Vec<DX>,
+    dx: Vec<DX<E>>,
     dxoff: Vec<u32>,
     fbn: Vec<(u64, u64)>,
     side: Vec<(u32, i64)>,
@@ -4402,7 +4418,7 @@ struct EvChunk<E> {
 
 #[allow(clippy::too_many_arguments)]
 fn ev_after<E: Ev>(
-    mut ev_out: Vec<EvChunk<E>>,
+    ev_out: Vec<EvChunk<E>>,
     tab: &IdTab,
     mf: &MoverF,
     click_out: &[(Vec<ClickRec>, Vec<u32>)],
@@ -4416,22 +4432,33 @@ fn ev_after<E: Ev>(
     if let Some(cfg) = idx_cfg() {
         return ev_after_idx(ev_out, tab, mf, click_out, ws, we, ncamp, d0, nd, tick, cfg);
     }
-    // dedup on event_id: every line has a global index (chunk base + its index in the chunk);
-    // each event_id's losers are marked in the dead bitmap. Each task takes DDG consecutive
-    // event_id buckets, one small (L2-sized) table at a time.
+    // dedup on event_id, fused with the person-bucket emit. Every line has a global index (chunk
+    // base + its index in the chunk) and its record rides in its dedup record (`d` / `dx`). Each
+    // task takes DDG consecutive event_id buckets, one small (L2-sized) table at a time; then the
+    // winners' records are read back from the bucket slices (key 0 = dropped line) and go to the
+    // task's person buckets (filter miss) or to the region lists (filter hit). Losers are not read again.
     let mut mbase: Vec<u32> = Vec::with_capacity(ev_out.len() + 1);
     let mut acc = 0usize;
     for c in &ev_out {
         mbase.push(acc as u32);
-        acc += c.m.len();
+        acc += c.d.len() + c.dx.len();
+        // record addresses are packed in 48 bits (main slots: chunk << 48 | address; Hex slots: address << 6)
+        assert!((c.d.as_ptr_range().end as usize as u64) < 1 << 48 && (c.dx.as_ptr_range().end as usize as u64) < 1 << 48);
     }
-    assert!(acc < u32::MAX as usize);
+    assert!(acc < u32::MAX as usize && ev_out.len() < 1 << 16);
     mbase.push(acc as u32);
-    let dead: Vec<AtomicU64> = (0..acc / 64 + 1).map(|_| AtomicU64::new(0)).collect();
-    let kill = |g: u32| {
-        dead[(g >> 6) as usize].fetch_or(1u64 << (g & 63), Relaxed);
+    let rb = (tab.s.len() >> 16).clamp(1, 512).trailing_zeros();
+    let nr = 1usize << rb;
+    let reg = move |k: u64| -> usize {
+        if rb == 0 {
+            0
+        } else {
+            (mix(k) >> (64 - rb)) as usize
+        }
     };
-    {
+    const PM: u64 = (1 << 48) - 1;
+    // per task: (filter misses by person bucket, their offsets, filter hits split by region)
+    let a: Vec<(Vec<E>, Vec<u32>, Vec<Vec<E>>)> = {
         let side_any = ev_out.iter().any(|c| !c.side.is_empty());
         let ibase = ws.div_euclid(1000);
         // exact ingest of line g with key k (only needed on key ties when some key is inexact)
@@ -4453,117 +4480,126 @@ fn ev_after<E: Ev>(
         };
         // does line g (ingest key k) beat line og (key ok) for the same event_id: smaller ingest, then exact ingest
         let better = |g: u32, k: u32, og: u32, ok: u32| k < ok || (k == ok && side_any && exact(g, k) < exact(og, ok));
-        let (ndb, dsh) = idx_cfg().map_or((0, 0), |c| (c.ndb, c.sh));
-        rayon::join(
-            || {
-                rayon::join(
-                    || {
-                        // dense buckets: one slot per index, a full slot is a duplicate event_id
-                        const G: usize = 4;
-                        let span = 1usize << dsh;
-                        let mask = span as u64 - 1;
-                        (0..ndb.div_ceil(G)).into_par_iter().for_each(|g| {
-                            let mut tm = now();
-                            let mut t: Vec<u64> = vec![u64::MAX; span];
-                            for b in g * G..((g + 1) * G).min(ndb) {
-                                let mut any = false;
-                                for (ci, c) in ev_out.iter().enumerate() {
-                                    let mb = mbase[ci];
-                                    for r in &c.d[c.doff[b] as usize..c.doff[b + 1] as usize] {
-                                        any = true;
-                                        let gi = mb + r.loc;
-                                        let pk = ((r.ing as u64) << 32) | gi as u64;
-                                        // SAFETY: the slot index is masked to span
-                                        let o = unsafe { t.get_unchecked_mut((r.eid & mask) as usize) };
-                                        if *o == u64::MAX {
-                                            *o = pk;
-                                            continue;
-                                        }
-                                        let ok = (*o >> 32) as u32;
-                                        let og = *o as u32;
-                                        let win = r.ing < ok || (r.ing == ok && side_any && exact(gi, r.ing) < exact(og, ok));
-                                        if win {
-                                            *o = pk;
-                                            kill(og);
-                                        } else {
-                                            kill(gi);
-                                        }
-                                    }
+        (0..EB / DDG)
+            .into_par_iter()
+            .map(|g| {
+                let mut tm = now();
+                let totals: [usize; DDG] = std::array::from_fn(|i| {
+                    ev_out.iter().map(|c| (c.doff[g * DDG + i + 1] - c.doff[g * DDG + i]) as usize).sum()
+                });
+                let xtot: usize = ev_out.iter().map(|c| (c.dxoff[(g + 1) * DDG] - c.dxoff[g * DDG]) as usize).sum();
+                let n = totals.iter().sum::<usize>() + xtot;
+                let maxcap = (totals.iter().max().unwrap() * 2).max(16).next_power_of_two();
+                // slot: (event_id, chunk << 48 | address of the current winner's DRec)
+                let mut tbuf: Vec<[u64; 2]> = vec![[0, 0]; maxcap];
+                let mut xbuf: Vec<[u64; 4]> = Vec::new();
+                let mut ms: Vec<E> = Vec::with_capacity(n);
+                let mut cnt = vec![0u32; PB + 1];
+                let mut h: Vec<Vec<E>> = (0..nr).map(|_| Vec::with_capacity(n / 2 / nr + 8)).collect();
+                for (i, &total) in totals.iter().enumerate() {
+                    let b = g * DDG + i;
+                    let cap = (total * 2).max(16).next_power_of_two();
+                    let mask = cap - 1;
+                    let t = &mut tbuf[..cap];
+                    if i > 0 {
+                        t.fill([0, 0]);
+                    }
+                    for (ci, c) in ev_out.iter().enumerate() {
+                        let mb = mbase[ci];
+                        let cb = (ci as u64) << 48;
+                        for r in &c.d[c.doff[b] as usize..c.doff[b + 1] as usize] {
+                            let pr = cb | r as *const DRec<E> as usize as u64;
+                            let mut p = (mix(r.eid) >> 8) as usize & mask;
+                            loop {
+                                let o = unsafe { t.get_unchecked_mut(p) };
+                                if o[0] == 0 {
+                                    *o = [r.eid, pr];
+                                    break;
                                 }
-                                if any {
-                                    t.fill(u64::MAX);
-                                }
-                            }
-                            pt(2, &mut tm);
-                        })
-                    },
-                    || {
-                (0..EB / DDG).into_par_iter().for_each(|g| {
-                    let mut tm = now();
-                    let totals: [usize; DDG] = std::array::from_fn(|i| {
-                        ev_out.iter().map(|c| (c.doff[ndb + g * DDG + i + 1] - c.doff[ndb + g * DDG + i]) as usize).sum()
-                    });
-                    let maxcap = (totals.iter().max().unwrap() * 2).max(16).next_power_of_two();
-                    // slot: (event_id, ingest key << 32 | global index of the current winner)
-                    let mut tbuf: Vec<[u64; 2]> = vec![[0, 0]; maxcap];
-                    let mut xbuf: Vec<[u64; 4]> = Vec::new();
-                    for (i, &total) in totals.iter().enumerate() {
-                        let b = ndb + g * DDG + i;
-                        let cap = (total * 2).max(16).next_power_of_two();
-                        let mask = cap - 1;
-                        let t = &mut tbuf[..cap];
-                        if i > 0 {
-                            t.fill([0, 0]);
-                        }
-                        for (ci, c) in ev_out.iter().enumerate() {
-                            let mb = mbase[ci];
-                            for r in &c.d[c.doff[b] as usize..c.doff[b + 1] as usize] {
-                                let gi = mb + r.loc;
-                                let pk = ((r.ing as u64) << 32) | gi as u64;
-                                let mut p = (mix(r.eid) >> 8) as usize & mask;
-                                loop {
-                                    let o = unsafe { t.get_unchecked_mut(p) };
-                                    if o[0] == 0 {
-                                        *o = [r.eid, pk];
-                                        break;
+                                if o[0] == r.eid {
+                                    // SAFETY: o[1] holds the chunk and address of a DRec of ev_out (alive, not moved)
+                                    let ro = unsafe { &*((o[1] & PM) as usize as *const DRec<E>) };
+                                    let og = unsafe { *mbase.get_unchecked((o[1] >> 48) as usize) } + ro.loc;
+                                    let gi = mb + r.loc;
+                                    if r.eid & HBIT != 0 && fbb(gi) != fbb(og) {
+                                        p = (p + 1) & mask;
+                                        continue;
                                     }
-                                    if o[0] == r.eid {
-                                        if r.eid & HBIT != 0 && fbb(gi) != fbb(o[1] as u32) {
-                                            p = (p + 1) & mask;
-                                            continue;
-                                        }
-                                        let ok = (o[1] >> 32) as u32;
-                                        let og = o[1] as u32;
-                                        let win = r.ing < ok || (r.ing == ok && side_any && exact(gi, r.ing) < exact(og, ok));
-                                        if win {
-                                            o[1] = pk;
-                                            kill(og);
-                                        } else {
-                                            kill(gi);
-                                        }
-                                        break;
+                                    let ok = ro.ing;
+                                    let win = r.ing < ok || (r.ing == ok && side_any && exact(gi, r.ing) < exact(og, ok));
+                                    if win {
+                                        o[1] = pr;
                                     }
-                                    p = (p + 1) & mask;
+                                    break;
                                 }
+                                p = (p + 1) & mask;
                             }
                         }
-                        dx_table(&ev_out, &mbase, g * DDG + i, &mut xbuf, &better, &kill);
+                    }
+                    let s0 = ms.len();
+                    for o in t.iter() {
+                        if o[0] != 0 {
+                            // SAFETY: as above
+                            let e = unsafe { (*((o[1] & PM) as usize as *const DRec<E>)).e };
+                            if e.key() != 0 {
+                                ms.push(e);
+                            }
+                        }
+                    }
+                    let xn = dx_table(&ev_out, &mbase, b, &mut xbuf, &better, |_| {});
+                    for o in &xbuf[..xn] {
+                        if o[3] != 0 {
+                            // SAFETY: o[3] >> 6 is the address of a DX of ev_out (alive, not moved)
+                            let e = unsafe { (*((o[3] >> 6) as usize as *const DX<E>)).e };
+                            if e.key() != 0 {
+                                ms.push(e);
+                            }
+                        }
                     }
                     pt(2, &mut tm);
-                })
-                    },
-                );
-            },
-            || {},
-        );
-        if TIMING.load(Relaxed) {
-            let dense: usize = ev_out.iter().map(|c| c.doff[ndb] as usize).sum();
-            let all: usize = ev_out.iter().map(|c| c.d.len() + c.fb.v.len() + c.dx.len()).sum();
-            tick(&format!("idx dense records {dense} of {all} ({:.5})", dense as f64 / all.max(1) as f64));
-        }
-    }
-    let parts = resolve_parts(ev_out, &mbase, &dead, tab, mf);
-    drop(dead);
+                    // filter: hits go to their region list, misses stay (compacted) and are counted by person bucket
+                    let l = ms.len();
+                    let mut w = s0;
+                    for j in s0..l {
+                        if j + RPD < l {
+                            mf.pf(ms[j + RPD].key());
+                        }
+                        let e = ms[j];
+                        let k = e.key();
+                        if mf.hit(k) {
+                            // SAFETY: reg(k) < nr = h.len()
+                            unsafe { h.get_unchecked_mut(reg(k)) }.push(e);
+                        } else {
+                            cnt[pbk(k) + 1] += 1;
+                            ms[w] = e;
+                            w += 1;
+                        }
+                    }
+                    ms.truncate(w);
+                    pt(4, &mut tm);
+                }
+                for p in 0..PB {
+                    cnt[p + 1] += cnt[p];
+                }
+                let tot = cnt[PB] as usize;
+                let mut out: Vec<E> = Vec::with_capacity(tot);
+                {
+                    let mut w = cnt.clone();
+                    let sp = out.spare_capacity_mut();
+                    for e in &ms {
+                        let p = pbk(e.key());
+                        sp[w[p] as usize].write(*e);
+                        w[p] += 1;
+                    }
+                }
+                unsafe { out.set_len(tot) };
+                pt(5, &mut tm);
+                (out, cnt, h)
+            })
+            .collect()
+    };
+    drop(ev_out);
+    let parts = region_parts(a, nr, tab);
     tick("dedup done");
 
     let offs: Vec<&[u32]> = parts.iter().map(|x| &x.1[..]).collect();
@@ -4853,70 +4889,10 @@ fn lpt_run<S: Send>(cost: &[u64], init: impl Fn() -> S + Sync, f: impl Fn(usize,
 /// then groups them by person bucket as one more part. Exact: every hit key gets `tab.get` as
 /// before and every miss maps to itself as before; only the order of lines inside a person
 /// bucket changes, and the sessionizer orders each person's lines by ts (equal ts share a session).
-fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU64], tab: &IdTab, mf: &MoverF) -> Vec<(Vec<E>, Vec<u32>)> {
-    let rb = (tab.s.len() >> 16).clamp(1, 512).trailing_zeros();
-    let nr = 1usize << rb;
-    let reg = move |k: u64| -> usize {
-        if rb == 0 {
-            0
-        } else {
-            (mix(k) >> (64 - rb)) as usize
-        }
-    };
-    // (filter misses by person bucket, their offsets, filter hits split by region: one list per
-    // region, filled in line order during the filter pass, so no second pass over the hits)
-    let a: Vec<(Vec<E>, Vec<u32>, Vec<Vec<E>>)> = ev_out
-        .into_par_iter()
-        .enumerate()
-        .map(|(ci, c)| {
-            let mut tm = now();
-            let mb = mbase[ci] as usize;
-            let mut m = c.m;
-            let n = m.len();
-            let mut cnt = vec![0u32; PB + 1];
-            let mut h: Vec<Vec<E>> = (0..nr).map(|_| Vec::with_capacity(n / 2 / nr + 8)).collect();
-            for i in 0..n {
-                if i + RPD < n {
-                    mf.pf(m[i + RPD].key());
-                }
-                let g = mb + i;
-                let k = m[i].key();
-                if k != 0 && dead[g >> 6].load(Relaxed) & (1u64 << (g & 63)) == 0 {
-                    if mf.hit(k) {
-                        // SAFETY: reg(k) < nr = h.len()
-                        unsafe { h.get_unchecked_mut(reg(k)) }.push(m[i]);
-                        m[i].set_key(0);
-                    } else {
-                        cnt[pbk(k) + 1] += 1;
-                    }
-                } else {
-                    m[i].set_key(0);
-                }
-            }
-            pt(4, &mut tm);
-            for p in 0..PB {
-                cnt[p + 1] += cnt[p];
-            }
-            let tot = cnt[PB] as usize;
-            let mut out: Vec<E> = Vec::with_capacity(tot);
-            {
-                let mut w = cnt.clone();
-                let sp = out.spare_capacity_mut();
-                for e in &m {
-                    let k = e.key();
-                    if k != 0 {
-                        let p = pbk(k);
-                        sp[w[p] as usize].write(*e);
-                        w[p] += 1;
-                    }
-                }
-            }
-            unsafe { out.set_len(tot) };
-            pt(5, &mut tm);
-            (out, cnt, h)
-        })
-        .collect();
-    // regroup the hit lists by region (chunk order kept inside a region)
+/// The emit parts: each task's person-bucket part, then one part per table region holding the
+/// filter hits with their person keys set (tab.get in region order keeps that table region in cache).
+fn region_parts<E: Ev>(a: Vec<(Vec<E>, Vec<u32>, Vec<Vec<E>>)>, nr: usize, tab: &IdTab) -> Vec<(Vec<E>, Vec<u32>)> {
+    // regroup the hit lists by region (task order kept inside a region)
     let mut a0: Vec<(Vec<E>, Vec<u32>)> = Vec::with_capacity(a.len() + nr);
     let mut regs: Vec<Vec<Vec<E>>> = (0..nr).map(|_| Vec::with_capacity(a.len())).collect();
     for (out, cnt, h) in a {
@@ -5796,8 +5772,8 @@ fn ukey_find(ev_chunks: &[B], ekey: u64) -> Option<u64> {
 fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
     let mut dz = Dz::new(idx_cfg(), c.len());
     let cap = if dz.on { c.len() / 4096 } else { c.len() / 64 };
-    let mut m: Vec<E> = Vec::with_capacity(cap);
-    let mut d: Vec<DRec> = Vec::with_capacity(cap);
+    let mut m: Vec<E> = Vec::with_capacity(if dz.on { cap } else { 0 });
+    let mut d: Vec<DRec<E>> = Vec::with_capacity(cap);
     let (mut fb, mut fbn, mut side) = (Fb::default(), vec![], vec![]);
     let mut tm = now();
     static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -8024,7 +8000,7 @@ mod idk_tests {
         }
         // DX round trip: hi/lo/code give back the id bytes
         let (_, f, _) = idk_ref(h.as_bytes());
-        let x = DX { hi: (f >> 64) as u64, lo: f as u64, ing: 7, lp: 5 | (CODE[b'e' as usize] as u32) << 26 };
+        let x = DX { hi: (f >> 64) as u64, lo: f as u64, ing: 7, lp: 5 | (CODE[b'e' as usize] as u32) << 26, e: EvL::nil() };
         let back = format!("{}{:016x}{:016x}", DECODE[(x.lp >> 26) as usize] as char, x.hi, x.lo);
         assert_eq!(back, h);
         assert_eq!(x.lp & DX_LOC, 5);
