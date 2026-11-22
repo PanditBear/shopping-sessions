@@ -6061,7 +6061,21 @@ enum Evs {
     W(Vec<EvChunk<EvW>>),
 }
 
+fn m52_since_start() -> f64 {
+    let st = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let up = std::fs::read_to_string("/proc/uptime").unwrap_or_default();
+    let tail = st.rsplit(')').next().unwrap_or("");
+    let start: f64 = tail.split_whitespace().nth(19).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let u: f64 = up.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    u - start / 100.0
+}
+fn m52_mem() -> String {
+    let r = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    r.lines().filter(|l| l.starts_with("VmRSS") || l.starts_with("VmHWM") || l.starts_with("RssAnon") || l.starts_with("RssFile")).map(|l| l.split_whitespace().collect::<Vec<_>>().join("")).collect::<Vec<_>>().join(" ")
+}
 fn main() {
+    let m52_top = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+    let m52_ss = m52_since_start();
     hpa::init();
     let ep = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
     let ep0 = ep();
@@ -6078,6 +6092,7 @@ fn main() {
     let timing = std::env::var("SHOP_TIMING").is_ok();
     TIMING.store(timing, Relaxed);
     let t0 = std::time::Instant::now();
+    let m52_t0 = ep();
     let tick = |s: &str| {
         if timing {
             eprintln!("[{:.2}s] {}", t0.elapsed().as_secs_f64(), s);
@@ -6548,6 +6563,7 @@ fn main() {
         || write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows, &camp_names, &channels),
     );
     tick("written");
+    let m52_w = ep();
     if timing {
         let v: Vec<String> = (0..PROF.len()).map(|i| format!("{}={:.2}", PROF_NAMES[i], PROF[i].load(Relaxed) as f64 / 1e9)).collect();
         eprintln!("prof(cpu s): {}", v.join(" "));
@@ -6561,6 +6577,10 @@ fn main() {
         if timing {
             eprintln!("dropin end {:.3}s", ep() - t);
         }
+    }
+    if timing {
+        let m52_x = ep();
+        eprintln!("m52 top={:.4} ep0={:.4} t0={:.4} written={:.4} preexit={:.4} sincestart_at_top={:.3} mem: {}", m52_top, ep0, m52_t0, m52_w, m52_x, m52_ss, m52_mem());
     }
     // all output files are written and closed; skip freeing the large tables
     std::process::exit(0);
