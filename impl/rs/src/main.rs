@@ -5855,6 +5855,152 @@ enum Evs {
     W(Vec<EvChunk<EvW>>),
 }
 
+#[cfg(windows)]
+mod bz {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    use std::sync::Mutex;
+    pub static STOP: AtomicBool = AtomicBool::new(false);
+    pub static TICKS: Mutex<Vec<(f64, String)>> = Mutex::new(Vec::new());
+    pub static SAMPLES: Mutex<Vec<(f64, Vec<(u32, u64)>)>> = Mutex::new(Vec::new());
+    #[repr(C)]
+    struct Te { sz: u32, cu: u32, tid: u32, pid: u32, bp: i32, dp: i32, fl: u32 }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(f: u32, p: u32) -> isize;
+        fn Thread32First(h: isize, e: *mut Te) -> i32;
+        fn Thread32Next(h: isize, e: *mut Te) -> i32;
+        fn CloseHandle(h: isize) -> i32;
+        fn OpenThread(a: u32, i: i32, t: u32) -> isize;
+        fn QueryThreadCycleTime(h: isize, c: *mut u64) -> i32;
+        fn GetCurrentProcessId() -> u32;
+        fn GetCurrentThreadId() -> u32;
+        fn Sleep(ms: u32);
+        fn GetCurrentThread() -> isize;
+        fn SetThreadPriority(h: isize, p: i32) -> i32;
+    }
+    #[link(name = "winmm")]
+    extern "system" { fn timeBeginPeriod(p: u32) -> u32; }
+    fn tids() -> Vec<u32> {
+        let mut v = vec![];
+        unsafe {
+            let pid = GetCurrentProcessId();
+            let me = GetCurrentThreadId();
+            let h = CreateToolhelp32Snapshot(4, 0);
+            let mut e = Te { sz: 28, cu: 0, tid: 0, pid: 0, bp: 0, dp: 0, fl: 0 };
+            if Thread32First(h, &mut e) != 0 {
+                loop {
+                    if e.pid == pid && e.tid != me { v.push(e.tid); }
+                    e.sz = 28;
+                    if Thread32Next(h, &mut e) == 0 { break; }
+                }
+            }
+            CloseHandle(h);
+        }
+        v
+    }
+    pub fn reg() {
+        let t = unsafe { GetCurrentThreadId() };
+        let h = unsafe { OpenThread(0x800, 0, t) };
+        if h != 0 { HS.lock().unwrap().push((t, h)); }
+    }
+    pub static HS: Mutex<Vec<(u32, isize)>> = Mutex::new(Vec::new());
+    pub fn start(t0: std::time::Instant) {
+        std::thread::spawn(move || {
+            unsafe { timeBeginPeriod(1); SetThreadPriority(GetCurrentThread(), 15); }
+            let me = unsafe { GetCurrentThreadId() };
+            while !STOP.load(Relaxed) {
+                let hs: Vec<(u32, isize)> = HS.lock().unwrap().clone();
+                let mut row = Vec::with_capacity(hs.len());
+                for &(t, h) in &hs {
+                    if t == me { continue; }
+                    let mut c = 0u64;
+                    unsafe { QueryThreadCycleTime(h, &mut c) };
+                    row.push((t, c));
+                }
+                let now = t0.elapsed().as_secs_f64();
+                SAMPLES.lock().unwrap().push((now, row));
+                unsafe { Sleep(1) };
+            }
+        });
+    }
+    pub fn dump() {
+        STOP.store(true, Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        if let Ok(p) = std::env::var("SHOP_BUSY") {
+            use std::io::Write;
+            let mut o = std::io::BufWriter::new(std::fs::File::create(p).unwrap());
+            for (t, l) in TICKS.lock().unwrap().iter() { writeln!(o, "T,{:.6},{}", t, l).ok(); }
+            for (t, r) in SAMPLES.lock().unwrap().iter() { for (id, c) in r { writeln!(o, "S,{:.6},{},{}", t, id, c).ok(); } }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod bz {
+    //! probe: busy threads per 5 ms slice from /proc/self/task/*/schedstat (ns on cpu); table to stderr at exit
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    use std::sync::Mutex;
+    pub static STOP: AtomicBool = AtomicBool::new(false);
+    pub static TICKS: Mutex<Vec<(f64, String)>> = Mutex::new(Vec::new());
+    static SAMPLES: Mutex<Vec<(f64, Vec<(u32, u64)>)>> = Mutex::new(Vec::new());
+    pub fn reg() {}
+    pub fn start(t0: std::time::Instant) {
+        std::thread::spawn(move || {
+            let me: u32 = std::fs::read_link("/proc/thread-self").ok().and_then(|p| p.file_name().and_then(|f| f.to_str()).and_then(|f| f.parse().ok())).unwrap_or(0);
+            while !STOP.load(Relaxed) {
+                let mut row = vec![];
+                if let Ok(rd) = std::fs::read_dir("/proc/self/task") {
+                    for e in rd.flatten() {
+                        let tid: u32 = match e.file_name().to_str().and_then(|f| f.parse().ok()) { Some(t) => t, None => continue };
+                        if tid == me { continue; }
+                        if let Ok(st) = std::fs::read_to_string(e.path().join("schedstat")) {
+                            if let Some(v) = st.split_whitespace().next().and_then(|x| x.parse::<u64>().ok()) { row.push((tid, v)); }
+                        }
+                    }
+                }
+                let now = t0.elapsed().as_secs_f64();
+                SAMPLES.lock().unwrap().push((now, row));
+                std::thread::sleep(std::time::Duration::from_micros(1500));
+            }
+        });
+    }
+    pub fn dump() {
+        STOP.store(true, Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let ticks = TICKS.lock().unwrap();
+        let smp = SAMPLES.lock().unwrap();
+        let end = ticks.last().map_or(0.0, |t| t.0);
+        eprintln!("BUSY samples {} threads-max {}", smp.len(), smp.iter().map(|r| r.1.len()).max().unwrap_or(0));
+        for (t, l) in ticks.iter() { eprintln!("BUSYTICK {:.1} {}", t * 1000.0, l.replace(' ', "_")); }
+        let ns = (end / 0.005) as usize + 1;
+        let mut tids: Vec<u32> = smp.iter().flat_map(|r| r.1.iter().map(|x| x.0)).collect();
+        tids.sort();
+        tids.dedup();
+        let mut busy = vec![0.0f64; ns];
+        for &tid in &tids {
+            let v: Vec<(f64, u64)> = smp.iter().filter_map(|r| r.1.iter().find(|x| x.0 == tid).map(|x| (r.0, x.1))).collect();
+            if v.len() < 2 { continue; }
+            let at = |t: f64| -> f64 {
+                let i = v.partition_point(|x| x.0 < t);
+                if i == 0 { return v[0].1 as f64; }
+                if i >= v.len() { return v[v.len() - 1].1 as f64; }
+                let (a, b) = (v[i - 1], v[i]);
+                if b.0 == a.0 { a.1 as f64 } else { a.1 as f64 + (b.1 as f64 - a.1 as f64) * (t - a.0) / (b.0 - a.0) }
+            };
+            let mut prev = at(0.0);
+            for (i, bz) in busy.iter_mut().enumerate() {
+                let c = at((i + 1) as f64 * 0.005);
+                *bz += ((c - prev) / 5e6).clamp(0.0, 1.0);
+                prev = c;
+            }
+        }
+        let mut o = String::new();
+        for (i, b) in busy.iter().enumerate() { o.push_str(&format!("BUSY {} {}
+", i * 5, (b * 100.0).round() as i64)); }
+        eprint!("{}", o);
+    }
+}
+
 fn main() {
     hpa::init();
     let ep = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
@@ -5863,6 +6009,7 @@ fn main() {
     let outd = std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into());
     let ncpu: usize = std::env::var("NCPU").ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(0);
     let mut tb = rayon::ThreadPoolBuilder::new().stack_size(8 << 20);
+    if std::env::var_os("SHOP_BUSY").is_some() { bz::reg(); tb = tb.start_handler(|_| bz::reg()); }
     if ncpu > 0 {
         tb = tb.num_threads(ncpu);
     }
@@ -5872,7 +6019,9 @@ fn main() {
     let timing = std::env::var("SHOP_TIMING").is_ok();
     TIMING.store(timing, Relaxed);
     let t0 = std::time::Instant::now();
+    if std::env::var_os("SHOP_BUSY").is_some() { bz::start(t0); }
     let tick = |s: &str| {
+        bz::TICKS.lock().unwrap().push((t0.elapsed().as_secs_f64(), s.to_string()));
         if timing {
             eprintln!("[{:.2}s] {}", t0.elapsed().as_secs_f64(), s);
         }
@@ -6335,7 +6484,7 @@ fn main() {
             eprintln!("dropin end {:.3}s", ep() - t);
         }
     }
-    // all output files are written and closed; skip freeing the large tables
+    if std::env::var_os("SHOP_BUSY").is_some() { bz::dump(); }
     std::process::exit(0);
 }
 
