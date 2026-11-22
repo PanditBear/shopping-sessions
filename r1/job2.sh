@@ -20,7 +20,7 @@ for i in 1 2 3 4; do
   [ -n "$PA" ] && break
 done
 if [ -z "$PA" ]; then S "ALL BUILDS IDENTICAL; using builds 1 and 2 as A and B"; PA=1; PB=2; else S "differing pair: build $PA = A, build $PB = B"; fi
-docker tag r1img$PA r1A; docker tag r1img$PB r1B
+docker tag r1img$PA imga; docker tag r1img$PB imgb
 A=$W/bin$PA; B=$W/bin$PB
 # (2) diff
 size -A $A > $W/sizeA.txt; size -A $B > $W/sizeB.txt
@@ -63,20 +63,20 @@ run_img() { # IMAGE OUTDIR -> RUN_WALL RUN_INT RUN_PEAK_MB RUN_RC ; peak = cgrou
 }
 med() { sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}'; }
 timing() { # label
-  for im in r1A r1B; do o=$(mktemp -d); run_img $im $o; wipe $o; done
+  for im in imga imgb; do o=$(mktemp -d); run_img $im $o; wipe $o; done
   : > $W/tA.txt; : > $W/tB.txt; : > $W/iA.txt; : > $W/iB.txt
   for k in 1 2 3 4 5 6 7 8 9; do
-    for im in A B; do o=$(mktemp -d); run_img r1$im $o; wipe $o; echo $RUN_WALL >> $W/t$im.txt; echo $RUN_INT >> $W/i$im.txt; S "$1 run$k $im rc=$RUN_RC wall=$RUN_WALL internal=$RUN_INT peakMB=$RUN_PEAK_MB"; done
+    for im in A B; do o=$(mktemp -d); run_img img${im,,} $o; wipe $o; echo $RUN_WALL >> $W/t$im.txt; echo $RUN_INT >> $W/i$im.txt; S "$1 run$k $im rc=$RUN_RC wall=$RUN_WALL internal=$RUN_INT peakMB=$RUN_PEAK_MB"; done
   done
   wa=$(med < $W/tA.txt); wb=$(med < $W/tB.txt); ia=$(med < $W/iA.txt); ib=$(med < $W/iB.txt)
   S "$1 MEDIAN wall A=$wa B=$wb diff(B-A)=$(echo "scale=3; ($wb - $wa)*100/$wa" | bc)%  internal A=$ia B=$ib diff=$(echo "scale=3; ($ib - $ia)*100/$ia" | bc)%"
   paired=0; for k in 1 2 3 4 5 6 7 8 9; do a=$(sed -n ${k}p $W/tA.txt); b=$(sed -n ${k}p $W/tB.txt); [ "$(echo "$a < $b" | bc)" = 1 ] && paired=$((paired+1)); done; S "$1 A faster in $paired/9 pairs (wall)"
 }
 gen 60000000 15000000
-oA=$(mktemp -d); oB=$(mktemp -d); run_img r1A $oA; run_img r1B $oB
+oA=$(mktemp -d); oB=$(mktemp -d); run_img imga $oA; run_img imgb $oB
 if python3 $W/content.py $oA $oB > $W/c.txt 2>&1; then S "A vs B content: SAME"; else S "A vs B content: DIFFERENT"; tail -6 $W/c.txt; fi; wipe $oA $oB
 timing 60M
-MEMLIM=12g; o=$(mktemp -d); run_img r1A $o; S "60M mem12g cgroup memory.peak polled 20ms: ${RUN_PEAK_MB} MB rc=$RUN_RC"; wipe $o
+MEMLIM=12g; o=$(mktemp -d); run_img imga $o; S "60M mem12g cgroup memory.peak polled 20ms: ${RUN_PEAK_MB} MB rc=$RUN_RC"; wipe $o
 o=$(mktemp -d); s=$(mktemp -d); chmod 777 $o $s
 DATA_DIR=$W/data OUTPUT_DIR=$o SCRATCH_DIR=$s NCPU=4 /usr/bin/time -v $A 2> $W/tv.txt >/dev/null; S "60M native maximum RSS (time -v, counts mmapped input pages): $(grep 'Maximum resident' $W/tv.txt)"; wipe $o $s
 unset MEMLIM
