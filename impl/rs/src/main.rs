@@ -2607,8 +2607,21 @@ fn ba(b: &[u8]) -> ByteArray {
     ByteArray::from(b.to_vec())
 }
 
+/// Text of each hashed user key (HBIT set), split into NSH shards by key bits so the shards are
+/// built in parallel and each stays small enough to sit in a core's cache.
 struct Names {
-    map: AHashMap<u64, u64>,
+    sh: Vec<AHashMap<u64, u64>>,
+}
+const NSH: usize = 64;
+#[inline(always)]
+fn nsh(k: u64) -> usize {
+    ((k >> 52) & (NSH as u64 - 1)) as usize
+}
+impl Names {
+    #[inline]
+    fn get(&self, k: u64) -> Option<&u64> {
+        self.sh[nsh(k)].get(&k)
+    }
 }
 
 // ---------- user_daily: a small direct parquet encoder ----------
@@ -2917,7 +2930,7 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
                         }
                         dict.extend_from_slice(&cb[..4 + ln]);
                     } else {
-                        let s = unpack(*names.map.get(&r.key).expect("name for hashed key"));
+                        let s = unpack(*names.get(r.key).expect("name for hashed key"));
                         dict.extend_from_slice(&(s.len() as u32).to_le_bytes());
                         dict.extend_from_slice(s);
                     }
@@ -5253,12 +5266,47 @@ fn parse_aid<E: Ev>(ev_chunks: &[B], cx: &EvCtx) {
     eprintln!("parse best {:.3}s sum {:016x} gcyc {:.4}", best, sum, bc as f64 / 1e9);
 }
 
-fn fbn_merge<E: Ev>(v: &[EvChunk<E>], names_map: &mut AHashMap<u64, u64>) {
-    for c in v {
-        for &(k, r) in &c.fbn {
-            names_map.entry(k).or_insert(r);
-        }
+/// The names of hashed user keys: those from the links pass first, then the first location of each
+/// key noted by the event parse. Entries are split by shard per group of chunks, then every shard
+/// is filled on its own thread.
+fn names_build<E: Ev>(v: &[EvChunk<E>], pre: AHashMap<u64, u64>) -> Names {
+    let mut pre_sh: Vec<Vec<(u64, u64)>> = vec![vec![]; NSH];
+    for (k, r) in pre {
+        pre_sh[nsh(k)].push((k, r));
     }
+    let tot: usize = v.iter().map(|c| c.fbn.len()).sum();
+    if tot == 0 {
+        let sh = pre_sh.into_iter().map(|p| p.into_iter().collect()).collect();
+        return Names { sh };
+    }
+    let ng = (rayon::current_num_threads() * 4).clamp(1, v.len().max(1));
+    let per = v.len().div_ceil(ng).max(1);
+    let parts: Vec<Vec<Vec<(u64, u64)>>> = v
+        .par_chunks(per)
+        .map(|cs| {
+            let mut p: Vec<Vec<(u64, u64)>> = vec![vec![]; NSH];
+            for c in cs {
+                for &e in &c.fbn {
+                    p[nsh(e.0)].push(e);
+                }
+            }
+            p
+        })
+        .collect();
+    let sh = pre_sh
+        .into_par_iter()
+        .enumerate()
+        .map(|(s, pre)| {
+            let mut m: AHashMap<u64, u64> = pre.into_iter().collect();
+            for p in &parts {
+                for &(k, r) in &p[s] {
+                    m.entry(k).or_insert(r);
+                }
+            }
+            m
+        })
+        .collect();
+    Names { sh }
 }
 
 enum Evs {
@@ -5365,7 +5413,7 @@ fn main() {
         .collect();
     tick("links parsed");
     // links (serial union-find) overlaps the parallel event parse; events do not need the id table
-    let ((mut tab, root, bk, nl, nroot, mut names_map), ev_out) = rayon::join(
+    let ((mut tab, root, bk, nl, nroot, names_map), ev_out) = rayon::join(
         || {
             let occ: usize = link_pairs.iter().map(|v| v.len()).sum::<usize>() * 2;
             let mut names_map: AHashMap<u64, u64> = AHashMap::new();
@@ -5677,10 +5725,11 @@ fn main() {
         })
         .collect();
     tick("clicks parsed");
-    match &ev_out {
-        Evs::L(v) => fbn_merge(v, &mut names_map),
-        Evs::W(v) => fbn_merge(v, &mut names_map),
-    }
+    let names = match &ev_out {
+        Evs::L(v) => names_build(v, names_map),
+        Evs::W(v) => names_build(v, names_map),
+    };
+    tick("names built");
 
     // person buckets
     let d0 = ws.div_euclid(DAY);
@@ -5692,7 +5741,6 @@ fn main() {
     tick("sessionized");
 
     // outputs
-    let names = Names { map: names_map };
     let ud_dir = outd.join("user_daily");
     let cd_dir = outd.join("campaign_daily");
     std::fs::create_dir_all(&ud_dir).unwrap();
