@@ -4059,62 +4059,7 @@ fn ev_after<E: Ev>(
             tick(&format!("idx dense records {dense} of {all} ({:.5})", dense as f64 / all.max(1) as f64));
         }
     }
-    // kept lines: user key -> person key (0 marks a dropped line; keys that miss the mover filter
-    // map to themselves without a table lookup), then each chunk's kept lines
-    // are grouped by person bucket inside the chunk (a cache-sized scatter; the order within a
-    // bucket stays the line order). The sessionizer gathers a bucket from every chunk in chunk order.
-    let parts: Vec<(Vec<E>, Vec<u32>)> = ev_out
-        .into_par_iter()
-        .enumerate()
-        .map(|(ci, c)| {
-            let mut tm = now();
-            let mut cnt = vec![0u32; PB + 1];
-            let mb = mbase[ci] as usize;
-            let mut m = c.m;
-            let n = m.len();
-            for i in 0..n {
-                if i + 2 * RPD < n {
-                    mf.pf(m[i + 2 * RPD].key());
-                }
-                if i + RPD < n {
-                    let k = m[i + RPD].key();
-                    if mf.hit(k) {
-                        tab.pf(k);
-                    }
-                }
-                let g = mb + i;
-                let k = m[i].key();
-                if k != 0 && dead[g >> 6].load(Relaxed) & (1u64 << (g & 63)) == 0 {
-                    let pk = if mf.hit(k) { tab.get(k) } else { k };
-                    m[i].set_key(pk);
-                    cnt[pbk(pk) + 1] += 1;
-                } else {
-                    m[i].set_key(0);
-                }
-            }
-            pt(4, &mut tm);
-            for p in 0..PB {
-                cnt[p + 1] += cnt[p];
-            }
-            let tot = cnt[PB] as usize;
-            let mut out: Vec<E> = Vec::with_capacity(tot);
-            {
-                let mut w = cnt.clone();
-                let sp = out.spare_capacity_mut();
-                for e in &m {
-                    let k = e.key();
-                    if k != 0 {
-                        let p = pbk(k);
-                        sp[w[p] as usize].write(*e);
-                        w[p] += 1;
-                    }
-                }
-            }
-            unsafe { out.set_len(tot) };
-            pt(5, &mut tm);
-            (out, cnt)
-        })
-        .collect();
+    let parts = resolve_parts(ev_out, &mbase, &dead, tab, mf);
     drop(dead);
     tick("dedup done");
 
@@ -4394,6 +4339,128 @@ fn lpt_run<S: Send>(cost: &[u64], init: impl Fn() -> S + Sync, f: impl Fn(usize,
 // is the generator's order: a person's events then mostly arrive as one run already sorted by
 // ts. The sessionizer sorts only the persons that do not (process_runs). Exact for any input:
 // the order of the lines only decides the speed.
+
+/// Kept lines of the noidx path: user key -> person key (empty keys and dedup losers are dropped),
+/// grouped by person bucket. The sessionizer gathers a bucket from every part.
+/// Lines whose key misses the mover filter map to themselves: each chunk groups them by person
+/// bucket at once (a cache-sized scatter). Lines that hit it need a table lookup; a lookup per
+/// line would miss the cache (the table is about 16 bytes per linked ID), so each chunk lists
+/// those lines grouped by the top bits of their table slot (about 1 MB of the table per region),
+/// and one task per region answers that region's lines of every chunk with its probes in cache,
+/// then groups them by person bucket as one more part. Exact: every hit key gets `tab.get` as
+/// before and every miss maps to itself as before; only the order of lines inside a person
+/// bucket changes, and the sessionizer orders each person's lines by ts (equal ts share a session).
+fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU64], tab: &IdTab, mf: &MoverF) -> Vec<(Vec<E>, Vec<u32>)> {
+    let rb = (tab.s.len() >> 16).clamp(1, 512).trailing_zeros();
+    let nr = 1usize << rb;
+    let reg = move |k: u64| -> usize {
+        if rb == 0 {
+            0
+        } else {
+            (mix(k) >> (64 - rb)) as usize
+        }
+    };
+    // (filter misses by person bucket, their offsets, filter hits by region, their offsets)
+    let a: Vec<(Vec<E>, Vec<u32>, Vec<E>, Vec<u32>)> = ev_out
+        .into_par_iter()
+        .enumerate()
+        .map(|(ci, c)| {
+            let mut tm = now();
+            let mb = mbase[ci] as usize;
+            let mut m = c.m;
+            let n = m.len();
+            let mut cnt = vec![0u32; PB + 1];
+            let mut h: Vec<E> = Vec::with_capacity(n / 2);
+            for i in 0..n {
+                if i + RPD < n {
+                    mf.pf(m[i + RPD].key());
+                }
+                let g = mb + i;
+                let k = m[i].key();
+                if k != 0 && dead[g >> 6].load(Relaxed) & (1u64 << (g & 63)) == 0 {
+                    if mf.hit(k) {
+                        h.push(m[i]);
+                        m[i].set_key(0);
+                    } else {
+                        cnt[pbk(k) + 1] += 1;
+                    }
+                } else {
+                    m[i].set_key(0);
+                }
+            }
+            let (hk, ho) = bucketize(&h, nr, |e| reg(e.key()));
+            pt(4, &mut tm);
+            for p in 0..PB {
+                cnt[p + 1] += cnt[p];
+            }
+            let tot = cnt[PB] as usize;
+            let mut out: Vec<E> = Vec::with_capacity(tot);
+            {
+                let mut w = cnt.clone();
+                let sp = out.spare_capacity_mut();
+                for e in &m {
+                    let k = e.key();
+                    if k != 0 {
+                        let p = pbk(k);
+                        sp[w[p] as usize].write(*e);
+                        w[p] += 1;
+                    }
+                }
+            }
+            unsafe { out.set_len(tot) };
+            pt(5, &mut tm);
+            (out, cnt, hk, ho)
+        })
+        .collect();
+    let hp: Vec<(Vec<E>, Vec<u32>)> = (0..nr)
+        .into_par_iter()
+        .with_max_len(1)
+        .map(|r| {
+            const PD: usize = 16;
+            let mut tm = now();
+            let mut pk: Vec<u64> = Vec::new();
+            let mut cnt = vec![0u32; PB + 1];
+            for x in &a {
+                let s = &x.2[x.3[r] as usize..x.3[r + 1] as usize];
+                let l = s.len();
+                for j in 0..l {
+                    if j + PD < l {
+                        tab.pf(s[j + PD].key());
+                    }
+                    let p = tab.get(s[j].key());
+                    cnt[pbk(p) + 1] += 1;
+                    pk.push(p);
+                }
+            }
+            pt(4, &mut tm);
+            for p in 0..PB {
+                cnt[p + 1] += cnt[p];
+            }
+            let tot = cnt[PB] as usize;
+            let mut out: Vec<E> = Vec::with_capacity(tot);
+            {
+                let mut w = cnt.clone();
+                let sp = out.spare_capacity_mut();
+                let mut q = 0usize;
+                for x in &a {
+                    for e in &x.2[x.3[r] as usize..x.3[r + 1] as usize] {
+                        let mut e = *e;
+                        let p = pk[q];
+                        q += 1;
+                        e.set_key(p);
+                        let b = pbk(p);
+                        sp[w[b] as usize].write(e);
+                        w[b] += 1;
+                    }
+                }
+            }
+            unsafe { out.set_len(tot) };
+            pt(5, &mut tm);
+            (out, cnt)
+        })
+        .collect();
+    a.into_iter().map(|x| (x.0, x.1)).chain(hp).collect()
+}
 
 /// Last few (user key, person key) pairs: lines in index order mostly repeat a user.
 struct PkCache {
