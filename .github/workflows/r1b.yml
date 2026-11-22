@@ -1,0 +1,16 @@
+name: r1b build variance
+on:
+  push:
+    branches: [ready-r1]
+permissions:
+  contents: read
+jobs:
+  job:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: bash r1/job2.sh
