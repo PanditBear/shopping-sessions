@@ -5313,66 +5313,97 @@ fn main() {
         || {
             let occ: usize = link_pairs.iter().map(|v| v.len()).sum::<usize>() * 2;
             let mut names_map: AHashMap<u64, u64> = AHashMap::new();
-            let (mut t, root, bk, nl, nroot) = {
-                // unique-id estimate by linear counting over the parsed keys (bitmap of 1-4 MB)
+            let (t, root, bk, nl, nroot) = {
+                // unique-id estimate by linear counting over the parsed keys (shared bitmap of 1-4 MB)
                 let est = {
                     let m = (occ * 2).next_power_of_two().clamp(1 << 16, 1 << 25);
-                    let mut bits = vec![0u64; m / 64];
+                    let bits: Vec<AtomicU64> = (0..m / 64).map(|_| AtomicU64::new(0)).collect();
                     let sh = 64 - m.trailing_zeros();
-                    for v in &link_pairs {
+                    link_pairs.par_iter().for_each(|v| {
                         for e in v {
                             for k in [e[0], e[2]] {
                                 let h = (mix(k) >> sh) as usize;
-                                bits[h >> 6] |= 1u64 << (h & 63);
+                                bits[h >> 6].fetch_or(1u64 << (h & 63), Relaxed);
                             }
                         }
-                    }
-                    let set: usize = bits.iter().map(|w| w.count_ones() as usize).sum();
+                    });
+                    let set: usize = bits.iter().map(|w| w.load(Relaxed).count_ones() as usize).sum();
                     let z = (m - set).max(1) as f64;
                     let e = -(m as f64) * (z / m as f64).ln();
                     (e as usize).min(occ)
                 };
                 // slots for the estimate plus a margin, load at most about 0.7
                 let mut slots = ((est + est / 8) as f64 * 1.45) as usize;
-                slots = slots.max(16).next_power_of_two();
-                let mut t;
-                let mut idx_key: Vec<u64>;
-                let mut idx_ref: Vec<u64>;
-                let mut parent: Vec<u32>;
-                let mut edges: Vec<(u32, u32)>;
-                'retry: loop {
-                t = IdTab::with_slots(slots);
-                idx_key = vec![];
-                idx_ref = vec![];
-                parent = vec![];
-                let limit = slots / 8 * 7;
-                edges = Vec::with_capacity(occ / 2);
-                for v in &link_pairs {
-                    for (n, e) in v.iter().enumerate() {
-                        if n + PFD / 2 < v.len() {
-                            t.pf(v[n + PFD / 2][0]);
-                            t.pf(v[n + PFD / 2][2]);
-                        }
-                        let mut g = |k: u64, r: u64| -> u32 {
-                            let (id, new) = t.get_or_insert(k, idx_key.len() as u64);
-                            if new {
-                                idx_key.push(k);
-                                idx_ref.push(r);
-                                parent.push(id as u32);
+                slots = slots.max(4096).next_power_of_two();
+                // Concurrent insert: a slot is claimed by a CAS on its key word, its position is the node
+                // id (the union-find runs over slot positions), and the second word holds the id's string ref.
+                let (t, edges, nl) = 'retry: loop {
+                    let mut t = IdTab::with_slots(slots);
+                    let limit = slots / 8 * 7;
+                    let total = AtomicUsize::new(0);
+                    let over = AtomicBool::new(false);
+                    let mask = t.mask;
+                    let shift = t.shift;
+                    let sp = t.s.as_mut_ptr() as usize;
+                    let edges: Vec<Vec<(u32, u32)>> = link_pairs
+                        .par_iter()
+                        .map(|v| {
+                            let sl = |k: u64| (mix(k) >> shift) as usize;
+                            let ins = |k: u64, r: u64, newc: &mut usize| -> u32 {
+                                let mut i = sl(k);
+                                loop {
+                                    let kp = unsafe { &*((sp as *const [u64; 2]).add(i) as *const AtomicU64) };
+                                    let cur = kp.load(Relaxed);
+                                    if cur == k {
+                                        return i as u32;
+                                    }
+                                    if cur == 0 {
+                                        match kp.compare_exchange(0, k, Relaxed, Relaxed) {
+                                            Ok(_) => {
+                                                unsafe { *((sp as *mut [u64; 2]).add(i) as *mut u64).add(1) = r };
+                                                *newc += 1;
+                                                return i as u32;
+                                            }
+                                            Err(c2) if c2 == k => return i as u32,
+                                            Err(_) => {}
+                                        }
+                                    }
+                                    i = (i + 1) & mask;
+                                }
+                            };
+                            let mut out = Vec::with_capacity(v.len());
+                            let (mut newc, mut flushed) = (0usize, 0usize);
+                            for (n, e) in v.iter().enumerate() {
+                                if over.load(Relaxed) {
+                                    break;
+                                }
+                                if n + PFD / 2 < v.len() {
+                                    for k in [v[n + PFD / 2][0], v[n + PFD / 2][2]] {
+                                        prefetch((sp as *const [u64; 2]).wrapping_add(sl(k)));
+                                    }
+                                }
+                                let a = ins(e[0], e[1], &mut newc);
+                                let b = ins(e[2], e[3], &mut newc);
+                                out.push((a, b));
+                                if newc - flushed >= 32 {
+                                    let tt = total.fetch_add(newc - flushed, Relaxed) + (newc - flushed);
+                                    flushed = newc;
+                                    if tt > limit {
+                                        over.store(true, Relaxed);
+                                    }
+                                }
                             }
-                            id as u32
-                        };
-                        let a = g(e[0], e[1]);
-                        let b = g(e[2], e[3]);
-                        edges.push((a, b));
-                        if idx_key.len() > limit {
-                            slots *= 2;
-                            continue 'retry;
-                        }
+                            total.fetch_add(newc - flushed, Relaxed);
+                            out
+                        })
+                        .collect();
+                    let nl = total.load(Relaxed);
+                    if over.load(Relaxed) || nl > limit {
+                        slots *= 2;
+                        continue 'retry;
                     }
-                }
-                break;
-                }
+                    break (t, edges, nl);
+                };
                 fn find(p: &mut [u32], mut x: u32) -> u32 {
                     while p[x as usize] != x {
                         let g = p[p[x as usize] as usize];
@@ -5381,40 +5412,52 @@ fn main() {
                     }
                     x
                 }
-                tick(&format!("links inserted {} est {} slots {}", idx_key.len(), est, slots));
-                // union by index: the larger root goes under the smaller one, so parent[g] <= g always
+                tick(&format!("links inserted {} est {} slots {}", nl, est, slots));
+                let ns = t.s.len();
+                let mut parent: Vec<u32> = vec![0u32; ns];
+                parent.par_chunks_mut(1 << 16).enumerate().for_each(|(ci, c)| {
+                    for (j, x) in c.iter_mut().enumerate() {
+                        *x = ((ci << 16) + j) as u32;
+                    }
+                });
+                // union by position: the larger root goes under the smaller one, so parent[g] <= g always
                 // holds (path halving keeps it too)
-                for (a, b) in edges {
-                    let ra = find(&mut parent, a);
-                    let rb = find(&mut parent, b);
-                    if ra < rb {
-                        parent[rb as usize] = ra;
-                    } else if rb < ra {
-                        parent[ra as usize] = rb;
+                for v in &edges {
+                    for &(a, b) in v {
+                        let ra = find(&mut parent, a);
+                        let rb = find(&mut parent, b);
+                        if ra < rb {
+                            parent[rb as usize] = ra;
+                        } else if rb < ra {
+                            parent[ra as usize] = rb;
+                        }
                     }
                 }
+                drop(edges);
                 tick("links union");
-                let nl = idx_key.len();
                 // one forward pass sets every entry to its root: parent[g] <= g and lower entries are final
                 let mut root = parent;
-                for g in 0..nl {
+                for g in 0..ns {
                     let p = root[g] as usize;
                     root[g] = root[p];
                 }
-                // smallest id of each component as [key, index] at its root; the root is the component's
-                // lowest index, so it comes before every other member
-                let mut bk: Vec<[u64; 2]> = vec![[0u64; 2]; nl];
-                for g in 0..nl {
-                    if g + RPD < nl {
+                // smallest id of each component as [key, slot] at its root; the root is the component's
+                // lowest slot, so it comes before every other member
+                let mut bk: Vec<[u64; 2]> = vec![[0u64; 2]; ns];
+                for g in 0..ns {
+                    let [kg, rg] = t.s[g];
+                    if kg == 0 {
+                        continue;
+                    }
+                    if g + RPD < ns {
                         prefetch(bk.as_ptr().wrapping_add(root[g + RPD] as usize));
                     }
                     let r = root[g] as usize;
-                    let kg = idx_key[g];
                     if r == g {
                         bk[g] = [kg, g as u64];
                     } else {
                         let [kb, b] = bk[r];
-                        let less = if kg & HBIT == 0 && kb & HBIT == 0 { kg < kb } else { unpack(idx_ref[g]) < unpack(idx_ref[b as usize]) };
+                        let less = if kg & HBIT == 0 && kb & HBIT == 0 { kg < kb } else { unpack(rg) < unpack(t.s[b as usize][1]) };
                         if less {
                             bk[r] = [kg, g as u64];
                         }
@@ -5422,12 +5465,12 @@ fn main() {
                 }
                 tick("links best");
                 let mut nroot = 0usize;
-                for r in 0..nl {
-                    if root[r] as usize == r {
+                for r in 0..ns {
+                    if t.s[r][0] != 0 && root[r] as usize == r {
                         nroot += 1;
                         let [pk, b] = bk[r];
                         if pk & HBIT != 0 {
-                            names_map.insert(pk, idx_ref[b as usize]);
+                            names_map.insert(pk, t.s[b as usize][1]);
                         }
                     }
                 }
@@ -5553,21 +5596,16 @@ fn main() {
     // the insert table becomes the id table in place (a slot's index turns into its person key), with the whole pool
     {
         let (root, bk) = (&root[..], &bk[..]);
-        tab.s.par_chunks_mut(1 << 14).for_each(|c| {
+        tab.s.par_chunks_mut(1 << 14).enumerate().for_each(|(ci, c)| {
             let n = c.len();
+            let base = ci << 14;
             for i in 0..n {
-                if i + 2 * PFD < n {
-                    prefetch(root.as_ptr().wrapping_add(c[i + 2 * PFD][1] as usize));
-                }
-                if i + PFD < n {
-                    let e = c[i + PFD];
-                    if e[0] != 0 {
-                        prefetch(bk.as_ptr().wrapping_add(root[e[1] as usize] as usize));
-                    }
+                if i + PFD < n && c[i + PFD][0] != 0 {
+                    prefetch(bk.as_ptr().wrapping_add(root[base + i + PFD] as usize));
                 }
                 let e = &mut c[i];
                 if e[0] != 0 {
-                    e[1] = bk[root[e[1] as usize] as usize][0];
+                    e[1] = bk[root[base + i] as usize][0];
                 }
             }
         });
