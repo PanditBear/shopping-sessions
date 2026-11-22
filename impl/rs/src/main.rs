@@ -115,6 +115,35 @@ fn pf_dist() -> usize {
     })
 }
 
+/// Dedup slot path with the record kept inside the slot (no line buffer). SHOP_TS=0/1 overrides;
+/// otherwise on for GenuineIntel CPUs. Read once.
+fn ts_on() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| {
+        if let Some(v) = std::env::var("SHOP_TS").ok() {
+            return v != "0";
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: cpuid is available on every x86_64 CPU
+            let r = unsafe { core::arch::x86_64::__cpuid(0) };
+            if r.ebx == 0x756e_6547 && r.edx == 0x4965_6e69 && r.ecx == 0x6c65_746e {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// One dedup slot: ingest key, occupied flag and the winning record.
+#[derive(Clone, Copy)]
+#[repr(C, align(16))]
+struct TSlot<E> {
+    ing: u32,
+    occ: u32,
+    e: E,
+}
+
 // ---------- id keys ----------
 // An id of 1..=10 bytes drawn from [0-9A-Z_a-z] packs exactly into 6-bit codes (order-preserving,
 // left aligned, zero padded): a value below 2^60. Any other id gets a 63-bit hash with bit 63 set,
@@ -4456,9 +4485,14 @@ fn ev_after_idx<E: Ev>(
                 let mask = span as u64 - 1;
                 (0..ndb.div_ceil(G))
                     .into_par_iter()
-                    .map(|g| {
+                    .map_init(Vec::<TSlot<E>>::new, |tsv, g| {
                         let mut tm = now();
-                        let mut t: Vec<u64> = vec![u64::MAX; span];
+                        let use_ts = !dside_any && std::mem::size_of::<E>() == 16 && ts_on();
+                        let mut t: Vec<u64> = if use_ts { Vec::new() } else { vec![u64::MAX; span] };
+                        if use_ts && tsv.len() != span {
+                            // SAFETY: E is plain integer data, all-zero is a valid (empty) slot
+                            *tsv = vec![unsafe { std::mem::zeroed::<TSlot<E>>() }; span];
+                        }
                         let mut lb: Vec<E> = Vec::new();
                         let mut lg: Vec<u64> = Vec::new();
                         // em outlives the task (sessionize reads its runs), so size it once from the
@@ -4480,6 +4514,78 @@ fn ev_after_idx<E: Ev>(
                         let (mut rk, mut rs, mut rok, mut lts) = (0u64, 0usize, true, 0u64);
                         let mut pc = PkCache { k: [0; 4], p: [0; 4], n: 0 };
                         for b in g * G..((g + 1) * G).min(ndb) {
+                            if use_ts {
+                                let ts = &mut tsv[..];
+                                let mut n = 0usize;
+                                for (ci, c) in ev_out.iter().enumerate() {
+                                    if let Some(n) = ev_out.get(ci + 4) {
+                                        if b < n.dz.dn.len() {
+                                            prefetch(n.dz.dn.as_ptr().wrapping_add(b));
+                                        }
+                                    }
+                                    if let Some(n) = ev_out.get(ci + 2) {
+                                        if b < n.dz.dn.len() {
+                                            let p = (n.dz.r.as_ptr() as *const DR<E>).wrapping_add(b * n.dz.cap) as *const u8;
+                                            let len = n.dz.dn[b] as usize * std::mem::size_of::<DR<E>>();
+                                            for o in (0..len.min(1024)).step_by(64) {
+                                                prefetch(p.wrapping_add(o));
+                                            }
+                                        }
+                                    }
+                                    let (sa, _, oa, _) = c.dz.seg(b);
+                                    for part in [sa, oa] {
+                                        for (j, x) in part.iter().enumerate() {
+                                            if let Some(y) = part.get(j + 16) {
+                                                prefetch(ts.as_ptr().wrapping_add((y.i as u64 & mask) as usize) as *const u8);
+                                            }
+                                            n += 1;
+                                            // SAFETY: the slot index is masked to span
+                                            let o = unsafe { ts.get_unchecked_mut((x.i as u64 & mask) as usize) };
+                                            if o.occ == 0 || x.ing < o.ing {
+                                                o.occ = 1;
+                                                o.ing = x.ing;
+                                                o.e = x.e;
+                                            }
+                                        }
+                                    }
+                                }
+                                pt(2, &mut tm);
+                                if n > 0 {
+                                    em.reserve(n);
+                                    let emp = em.as_mut_ptr();
+                                    let mut en = em.len();
+                                    for o in ts.iter_mut() {
+                                        if o.occ != 0 {
+                                            o.occ = 0;
+                                            let mut e = o.e;
+                                            let k = e.key();
+                                            if k != 0 {
+                                                let pk = pk_of(&mut pc, k, tab, mf);
+                                                e.set_key(pk);
+                                                let tsv2 = e.rts();
+                                                if pk != rk || en == rs {
+                                                    if en > rs {
+                                                        ds.push(RunD::new(rk, rs, en - rs, rok));
+                                                    }
+                                                    rk = pk;
+                                                    rs = en;
+                                                    rok = true;
+                                                } else {
+                                                    rok &= tsv2 >= lts;
+                                                }
+                                                lts = tsv2;
+                                                // SAFETY: en < old len + n <= capacity (reserved above), at most one write per record
+                                                unsafe { emp.add(en).write(e.slim()) };
+                                                en += 1;
+                                            }
+                                        }
+                                    }
+                                    // SAFETY: en - old len records were written, en <= capacity
+                                    unsafe { em.set_len(en) };
+                                }
+                                pt(4, &mut tm);
+                                continue;
+                            }
                             lb.clear();
                             lg.clear();
                             let bn: usize = ev_out
