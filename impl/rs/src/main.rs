@@ -5327,7 +5327,10 @@ fn main() {
     let rs = hasher();
 
     let link_chunks = all_chunks(&csv_files(&data.join("links")), CHUNK);
-    let link_pairs: Vec<Vec<[u64; 4]>> = link_chunks
+    let ev_files = csv_files(&data.join("events"));
+    let ev_chunks = all_chunks(&ev_files, ev_chunk(&ev_files));
+    // the event key search runs beside the link parse: the click pass in the links arm needs the user key
+    let (link_pairs, ()) = rayon::join(|| link_chunks
         .par_iter()
         .map(|&c| {
             let mut v = vec![];
@@ -5338,10 +5341,18 @@ fn main() {
             });
             v
         })
-        .collect();
+        .collect::<Vec<Vec<[u64; 4]>>>(), || {
+            let _ = IDXC.set(idx_find(&ev_files, &ev_chunks));
+            match idx_cfg() {
+                Some(c) => tick(&format!("idx key found=1 lim={} sh={} ndb={}", c.lim, c.sh, c.ndb)),
+                None => tick("idx key found=0"),
+            }
+            let _ = UKEYC.set(idx_cfg().and_then(|c| ukey_find(&ev_chunks, c.key)));
+            tick(&format!("user key found={}", UKEYC.get().copied().flatten().is_some() as u8));
+        });
     tick("links parsed");
     // links (serial union-find) overlaps the parallel event parse; events do not need the id table
-    let ((mut tab, root, bk, nl, nroot, mut names_map), ev_out) = rayon::join(
+    let ((tab, mut names_map, mf, click_out), ev_out) = rayon::join(
         || {
             let occ: usize = link_pairs.iter().map(|v| v.len()).sum::<usize>() * 2;
             let mut names_map: AHashMap<u64, u64> = AHashMap::new();
@@ -5467,18 +5478,83 @@ fn main() {
             };
             drop(link_pairs);
             tick("links done");
-            (t, root, bk, nl, nroot, names_map)
+            // the id table, the mover filter and the whole click pass run here, inside the event
+            // parse, so their tasks fill the parse's idle threads instead of a phase of their own
+            let mut tab = t;
+            // the insert table becomes the id table in place (a slot's index turns into its person key), with the whole pool
+            {
+                let (root, bk) = (&root[..], &bk[..]);
+                tab.s.par_chunks_mut(1 << 14).for_each(|c| {
+                    let n = c.len();
+                    for i in 0..n {
+                        if i + 2 * PFD < n {
+                            prefetch(root.as_ptr().wrapping_add(c[i + 2 * PFD][1] as usize));
+                        }
+                        if i + PFD < n {
+                            let e = c[i + PFD];
+                            if e[0] != 0 {
+                                prefetch(bk.as_ptr().wrapping_add(root[e[1] as usize] as usize));
+                            }
+                        }
+                        let e = &mut c[i];
+                        if e[0] != 0 {
+                            e[1] = bk[root[e[1] as usize] as usize][0];
+                        }
+                    }
+                });
+            }
+            tab.mov = nl - nroot;
+            drop((root, bk));
+            tick(&format!("links table movers {}", tab.mov));
+
+            // clicks
+            let click_chunks = all_chunks(&csv_files(&data.join("clicks")), CHUNK);
+            let mut tm = now();
+            let mf = MoverF::build(&tab);
+            pt(4, &mut tm);
+            let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_chunks
+                .par_iter()
+                .map(|&c| {
+                    let mut tmp: Vec<ClickRec> = Vec::with_capacity(c.len() / 40);
+                    let mut tm = now();
+                    parse_clicks(c, &camp, &rs, ws, we, &mut tmp);
+                    pt(9, &mut tm);
+                    // keys that miss the mover filter map to themselves without a table lookup. The
+                    // filter pass lists the hits without branching on them, the table pass resolves only
+                    // those, and both count the person buckets of the final keys on the way.
+                    let n = tmp.len();
+                    let mut hit = vec![0u32; n + 1];
+                    let mut cnt = vec![0u32; PB + 1];
+                    let mut m = 0usize;
+                    for i in 0..n {
+                        if i + RPD < n {
+                            mf.pf(tmp[i + RPD].key);
+                        }
+                        let k = tmp[i].key;
+                        let h = mf.hit(k);
+                        hit[m] = i as u32;
+                        m += h as usize;
+                        cnt[pbk(k) + 1] += (!h) as u32;
+                    }
+                    for j in 0..m {
+                        if j + RPD < m {
+                            tab.pf(tmp[hit[j + RPD] as usize].key);
+                        }
+                        let i = hit[j] as usize;
+                        let k = tab.get(tmp[i].key);
+                        tmp[i].key = k;
+                        cnt[pbk(k) + 1] += 1;
+                    }
+                    drop(hit);
+                    let r = scatter_counted(&tmp, cnt, |x| pbk(x.key));
+                    pt(10, &mut tm);
+                    r
+                })
+                .collect();
+            tick("clicks parsed");
+            (tab, names_map, mf, click_out)
         },
         || {
-            let ev_files = csv_files(&data.join("events"));
-            let ev_chunks = all_chunks(&ev_files, ev_chunk(&ev_files));
-            let _ = IDXC.set(idx_find(&ev_files, &ev_chunks));
-            match idx_cfg() {
-                Some(c) => tick(&format!("idx key found=1 lim={} sh={} ndb={}", c.lim, c.sh, c.ndb)),
-                None => tick("idx key found=0"),
-            }
-            let _ = UKEYC.set(idx_cfg().and_then(|c| ukey_find(&ev_chunks, c.key)));
-            tick(&format!("user key found={}", UKEYC.get().copied().flatten().is_some() as u8));
             let cx = EvCtx { prod: &prod, unknown_cat, ws, we, ibase: ws.div_euclid(1000), rs: &rs };
             if std::env::var_os("SHOP_PARSE").is_some() {
                 if lean {
@@ -5582,77 +5658,6 @@ fn main() {
         },
     );
 
-    // the insert table becomes the id table in place (a slot's index turns into its person key), with the whole pool
-    {
-        let (root, bk) = (&root[..], &bk[..]);
-        tab.s.par_chunks_mut(1 << 14).for_each(|c| {
-            let n = c.len();
-            for i in 0..n {
-                if i + 2 * PFD < n {
-                    prefetch(root.as_ptr().wrapping_add(c[i + 2 * PFD][1] as usize));
-                }
-                if i + PFD < n {
-                    let e = c[i + PFD];
-                    if e[0] != 0 {
-                        prefetch(bk.as_ptr().wrapping_add(root[e[1] as usize] as usize));
-                    }
-                }
-                let e = &mut c[i];
-                if e[0] != 0 {
-                    e[1] = bk[root[e[1] as usize] as usize][0];
-                }
-            }
-        });
-    }
-    tab.mov = nl - nroot;
-    drop((root, bk));
-    tick(&format!("links table movers {}", tab.mov));
-
-    // clicks
-    let click_chunks = all_chunks(&csv_files(&data.join("clicks")), CHUNK);
-    let mut tm = now();
-    let mf = MoverF::build(&tab);
-    pt(4, &mut tm);
-    let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_chunks
-        .par_iter()
-        .map(|&c| {
-            let mut tmp: Vec<ClickRec> = Vec::with_capacity(c.len() / 40);
-            let mut tm = now();
-            parse_clicks(c, &camp, &rs, ws, we, &mut tmp);
-            pt(9, &mut tm);
-            // keys that miss the mover filter map to themselves without a table lookup. The
-            // filter pass lists the hits without branching on them, the table pass resolves only
-            // those, and both count the person buckets of the final keys on the way.
-            let n = tmp.len();
-            let mut hit = vec![0u32; n + 1];
-            let mut cnt = vec![0u32; PB + 1];
-            let mut m = 0usize;
-            for i in 0..n {
-                if i + RPD < n {
-                    mf.pf(tmp[i + RPD].key);
-                }
-                let k = tmp[i].key;
-                let h = mf.hit(k);
-                hit[m] = i as u32;
-                m += h as usize;
-                cnt[pbk(k) + 1] += (!h) as u32;
-            }
-            for j in 0..m {
-                if j + RPD < m {
-                    tab.pf(tmp[hit[j + RPD] as usize].key);
-                }
-                let i = hit[j] as usize;
-                let k = tab.get(tmp[i].key);
-                tmp[i].key = k;
-                cnt[pbk(k) + 1] += 1;
-            }
-            drop(hit);
-            let r = scatter_counted(&tmp, cnt, |x| pbk(x.key));
-            pt(10, &mut tm);
-            r
-        })
-        .collect();
-    tick("clicks parsed");
     match &ev_out {
         Evs::L(v) => fbn_merge(v, &mut names_map),
         Evs::W(v) => fbn_merge(v, &mut names_map),
