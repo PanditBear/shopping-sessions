@@ -3866,6 +3866,9 @@ unsafe fn pack6x2(pa: *const u8, na: usize, pb: *const u8, nb: usize) -> (u64, b
 #[inline(always)]
 unsafe fn pack6x1(pa: *const u8, na: usize) -> (u64, bool) {
     use core::arch::x86_64::*;
+    if na.wrapping_sub(1) >= 10 {
+        return (0, false);
+    }
     let x = _mm_loadu_si128(pa as *const __m128i);
     let l4 = _mm_set1_epi8(0x0F);
     let hn = _mm_and_si128(_mm_srli_epi16(x, 4), l4);
@@ -3878,15 +3881,21 @@ unsafe fn pack6x1(pa: *const u8, na: usize) -> (u64, bool) {
     let us = _mm_and_si128(_mm_cmpeq_epi8(x, _mm_set1_epi8(0x5F)), _mm_set1_epi8(4));
     let code = _mm_sub_epi8(_mm_sub_epi8(x, _mm_shuffle_epi8(off_t, hn)), us);
     let iota = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    let inf = _mm_cmpgt_epi8(_mm_set1_epi8(na.min(16) as i8), iota);
-    let bad = _mm_movemask_epi8(_mm_and_si128(invalid, inf)) as u32;
+    // 1 <= na <= 10 from here on
+    let inf = _mm_cmpgt_epi8(_mm_set1_epi8(na as i8), iota);
+    if _mm_testz_si128(invalid, inf) == 0 {
+        return (0, false);
+    }
     let c = _mm_and_si128(code, inf);
+    // pairs -> 12 bits; dword 0: codes 0-3, dword 1: codes 4-7 shifted up by 8, dword 2: codes
+    // 8-9 (codes 10 and 11 are zero). Rotating qword 0 right by 28 puts dword 0 at bits 36-59
+    // and dword 1 at bits 12-35.
     let w = _mm_maddubs_epi16(c, _mm_set1_epi16(0x0140));
-    let dw = _mm_madd_epi16(w, _mm_set1_epi32(0x0001_1000));
+    let dw = _mm_madd_epi16(w, _mm_setr_epi32(0x0001_1000, 0x0001_1000, 0x0000_0001, 0));
+    let dw = _mm_sllv_epi32(dw, _mm_setr_epi32(0, 8, 0, 0));
     let q = _mm_cvtsi128_si64(dw) as u64;
     let d2 = _mm_extract_epi32(dw, 2) as u32;
-    let k = ((q & 0xFFFF_FFFF) << 36) | ((q >> 32) << 12) | (d2 as u64 >> 12);
-    (k, bad == 0 && na.wrapping_sub(1) < 10)
+    (q.rotate_right(28) | d2 as u64, true)
 }
 
 // ---------- id classes (Short / Hex / Other) ----------
