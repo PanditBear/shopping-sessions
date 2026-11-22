@@ -2590,7 +2590,7 @@ struct Names {
 // the user_id dictionary is the persons in order and its indices are runs; day, sessions and events
 // are small ranges, so their dictionaries are the whole range and an index is `value - min`; the
 // category dictionary is the category list. Format: data page v1, RLE/bit-packed hybrid indices,
-// one row group per at most 2^20 rows, zstd pages (SHOP_CODEC=none stores them uncompressed).
+// one row group per at most 2^20 rows, uncompressed pages (SHOP_CODEC=zstd[:level] compresses them).
 
 fn uvar(o: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
@@ -2726,9 +2726,10 @@ struct Pqf {
 }
 impl Pqf {
     fn new(cap: usize) -> Self {
+        // uncompressed unless SHOP_CODEC=zstd[:level]: zstd cost about 0.09 CPU-s per 20M events
         let v = std::env::var("SHOP_CODEC").unwrap_or_default();
         let (name, lvl) = v.split_once(':').unwrap_or((v.as_str(), "1"));
-        let z = if name == "none" { None } else { Some(zstd::bulk::Compressor::new(lvl.parse().unwrap_or(1)).unwrap()) };
+        let z = if name != "zstd" { None } else { Some(zstd::bulk::Compressor::new(lvl.parse().unwrap_or(1)).unwrap()) };
         let codec = if z.is_some() { 6 } else { 0 };
         let mut out = Vec::with_capacity(cap);
         out.extend_from_slice(b"PAR1");
@@ -2856,7 +2857,6 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
         let mut dict: Vec<u8> = Vec::with_capacity(persons * 14);
         let mut idx: Vec<u8> = Vec::with_capacity(1 + persons * (3 + vb));
         idx.push(w as u8);
-        let mut tmp: Vec<u8> = Vec::with_capacity(16);
         let mut k = 0u64;
         let mut run = 0u64;
         let mut last = None;
@@ -2871,10 +2871,15 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
                     k += 1;
                     run = 0;
                     if r.key & HBIT == 0 {
-                        tmp.clear();
-                        decode6(r.key, &mut tmp);
-                        dict.extend_from_slice(&(tmp.len() as u32).to_le_bytes());
-                        dict.extend_from_slice(&tmp);
+                        // the codes are left aligned and end at the first zero code
+                        let kk = r.key;
+                        let ln = if kk == 0 { 0 } else { 10 - (kk.trailing_zeros() as usize) / 6 };
+                        let mut cb = [0u8; 14];
+                        cb[..4].copy_from_slice(&(ln as u32).to_le_bytes());
+                        for i in 0..10 {
+                            cb[4 + i] = DECODE[((kk >> (54 - 6 * i)) & 63) as usize];
+                        }
+                        dict.extend_from_slice(&cb[..4 + ln]);
                     } else {
                         let s = unpack(*names.map.get(&r.key).expect("name for hashed key"));
                         dict.extend_from_slice(&(s.len() as u32).to_le_bytes());
