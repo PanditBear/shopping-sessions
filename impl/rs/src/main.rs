@@ -4076,7 +4076,12 @@ impl<E: Ev> SsW<E> {
     fn gather_rd(&mut self, p: usize, dparts: &[RdPart<E::S>], rest: &(Vec<E>, Vec<u32>), click_out: &[(Vec<ClickRec>, Vec<u32>)]) {
         let mut tm = now();
         self.cl.clear();
-        for (v, o) in click_out.iter() {
+        for (i, (v, o)) in click_out.iter().enumerate() {
+            if let Some((nv, no)) = click_out.get(i + CL_AHEAD) {
+                let q = nv.as_ptr().wrapping_add(no[p] as usize) as *const u8;
+                prefetch(q);
+                prefetch(q.wrapping_add(64));
+            }
             self.cl.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
         }
         let srt = &mut self.srt;
@@ -4121,40 +4126,61 @@ impl<E: Ev> SsW<E> {
         let runs = &mut self.runs;
         evs.clear();
         runs.clear();
+        let total: usize = srt.iter().map(|r| (r.lk >> 1) as usize).sum();
+        evs.reserve(total);
+        let base = evs.as_mut_ptr();
+        let esz = std::mem::size_of::<E::S>();
+        let mut len = 0usize;
         for i in 0..srt.len() {
             if let Some(nx) = srt.get(i + RD_AHEAD) {
                 let q = src(nx);
-                prefetch(q);
-                prefetch(q.wrapping_add(64));
+                let bytes = (nx.lk >> 1) as usize * esz;
+                let mut o = 0;
+                while o < bytes.min(RD_LINES * 64) {
+                    prefetch(q.wrapping_add(o));
+                    o += 64;
+                }
             }
             let r = &srt[i];
             let t = (r.src >> 32) as usize;
             let off = r.src as u32 as usize;
             let n = (r.lk >> 1) as usize;
             let ok = r.lk & 1 != 0;
-            let s = evs.len();
+            let s = len;
             if t < nd {
                 let v = &dparts[t].0[off..off + n];
                 match runs.last_mut() {
                     Some(last) if last.k == r.k => {
-                        last.ok = last.ok && ok && v[0].rts() >= evs[s - 1].rts();
+                        // SAFETY: s > 0 here (a run was pushed), and base[s - 1] was written below.
+                        let prev = unsafe { &*base.add(s - 1) };
+                        last.ok = last.ok && ok && v[0].rts() >= prev.rts();
                         last.l += n as u32;
                     }
                     _ => runs.push(Run { d: r.d, k: r.k, s: s as u32, l: n as u32, ok }),
                 }
-                evs.extend_from_slice(v);
+                // SAFETY: len + n <= total <= capacity (total sums every run's n, reserved above);
+                // source and destination do not overlap (dparts lines vs evs_s).
+                unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), base.add(len), n) };
+                len += n;
             } else {
                 let v = &rest.0[off..off + n];
                 match runs.last_mut() {
                     Some(last) if last.k == r.k => {
-                        last.ok = last.ok && ok && v[0].rts() >= evs[s - 1].rts();
+                        let prev = unsafe { &*base.add(s - 1) };
+                        last.ok = last.ok && ok && v[0].rts() >= prev.rts();
                         last.l += n as u32;
                     }
                     _ => runs.push(Run { d: r.d, k: r.k, s: s as u32, l: n as u32, ok }),
                 }
-                evs.extend(v.iter().map(|e| e.slim()));
+                for e in v {
+                    // SAFETY: as above, len < total while records of this run remain.
+                    unsafe { base.add(len).write(e.slim()) };
+                    len += 1;
+                }
             }
         }
+        // SAFETY: the first len == total elements were initialized above.
+        unsafe { evs.set_len(len) };
         pt(6, &mut tm);
     }
 }
@@ -4190,7 +4216,10 @@ struct SRun {
 }
 
 /// How many descriptors ahead gather_rd prefetches a run's first lines.
-const RD_AHEAD: usize = 3;
+const RD_AHEAD: usize = 6;
+/// Cache lines of a run prefetched ahead, and chunks ahead for the click copy.
+const RD_LINES: usize = 5;
+const CL_AHEAD: usize = 4;
 
 /// One dense dedup task's output: its kept lines in index order, its run descriptors grouped by
 /// person bucket, their bucket offsets, and the bucket offsets of the lines they cover.
