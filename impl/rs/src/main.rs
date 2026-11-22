@@ -4398,9 +4398,9 @@ fn wmb_bench<E: Ev>(ev_chunks: &[B], cx: &EvCtx, mb: usize) {
                 dz.ovb.clear();
                 dz.ovoff.clear();
                 dz.dside.clear();
-                parse_events_sol::<E, true>(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side, &mut dz);
+                parse_events_sol::<E>(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side, &mut dz);
             } else {
-                parse_events_sol::<E, false>(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side, &mut dz);
+                parse_events_sol::<E>(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side, &mut dz);
             }
             if rep == reps + 1 {
                 // untimed: checksum of the last rep
