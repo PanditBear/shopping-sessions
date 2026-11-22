@@ -1944,8 +1944,14 @@ fn bucketize<T: Copy>(v: &[T], nb: usize, bk: impl Fn(&T) -> usize) -> (Vec<T>, 
         let sp: &mut [MaybeUninit<T>] = out.spare_capacity_mut();
         for x in v {
             let b = bk(x);
-            sp[w[b] as usize].write(*x);
-            w[b] += 1;
+            debug_assert!(b <= nb && (w[b] as usize) < sp.len());
+            // SAFETY: the counting pass indexed cnt[b + 1] with this bucket, so b < nb < w.len(); the
+            // prefix sums give w[b] < cnt[b + 1] <= v.len() = sp.len() while bucket b has items left
+            unsafe {
+                let wb = w.get_unchecked_mut(b);
+                sp.get_unchecked_mut(*wb as usize).write(*x);
+                *wb += 1;
+            }
         }
     }
     unsafe { out.set_len(v.len()) };
