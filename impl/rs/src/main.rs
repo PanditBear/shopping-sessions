@@ -4935,6 +4935,8 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
         // only read.
         let mut km = vec![0u64; n.div_ceil(64)];
         let mut hi: Vec<u32> = Vec::with_capacity(n);
+        // person bucket of every line, kept for the scatter (PB <= 65536)
+        let mut pb = vec![0u16; n];
         {
             let hs = hi.spare_capacity_mut();
             let mut nh = 0usize;
@@ -4963,6 +4965,7 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
                 let hit = MoverF::hit_h(mw, mmask, h);
                 let keep = live & !hit;
                 let p = pbk_h(h);
+                pb[i] = p as u16;
                 cnt[p + 1] += keep as u32;
                 km[i >> 6] |= (keep as u64) << (i & 63);
                 // SAFETY: nh <= i < n = hs.len()
@@ -4994,7 +4997,8 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
                     let i = wi * 64 + b.trailing_zeros() as usize;
                     b &= b - 1;
                     let e = m[i];
-                    let p = pbk(e.key());
+                    let p = pb[i] as usize;
+                    debug_assert_eq!(p, pbk(e.key()));
                     sp[w[p] as usize].write(e);
                     w[p] += 1;
                 }
