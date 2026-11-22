@@ -1289,9 +1289,13 @@ impl MoverF {
     }
     #[inline(always)]
     fn hit(&self, k: u64) -> bool {
-        let h = mix(k);
+        Self::hit_h(&self.w, self.mask, mix(k))
+    }
+    /// `hit` for h = mix(key), on the table words `w` and `mask` copied out by the caller
+    #[inline(always)]
+    fn hit_h(w: &[u64], mask: usize, h: u64) -> bool {
         let b = Self::bits(h);
-        (unsafe { *self.w.get_unchecked(h as usize & self.mask) }) & b == b
+        (unsafe { *w.get_unchecked(h as usize & mask) }) & b == b
     }
 }
 
@@ -1973,7 +1977,12 @@ fn scatter_counted<T: Copy>(v: &[T], mut cnt: Vec<u32>, bk: impl Fn(&T) -> usize
 
 #[inline(always)]
 fn pbk(key: u64) -> usize {
-    (mix(key) >> 20) as usize & (PB - 1)
+    pbk_h(mix(key))
+}
+/// `pbk` of a key whose mix is h
+#[inline(always)]
+fn pbk_h(h: u64) -> usize {
+    (h >> 20) as usize & (PB - 1)
 }
 
 // ---------- per-bucket processing ----------
@@ -4928,16 +4937,29 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
         {
             let hs = hi.spare_capacity_mut();
             let mut nh = 0usize;
+            let (mw, mmask) = (&mf.w[..], mf.mask);
+            // mix of the key RPD lines ahead is computed once for its prefetch and parked in a
+            // ring for the filter test and the bucket of that line
+            let mut ring = [0u64; RPD];
+            for i in 0..RPD.min(n) {
+                let h = mix(m[i].key());
+                prefetch(unsafe { mw.as_ptr().add(h as usize & mmask) });
+                ring[i] = h;
+            }
             for i in 0..n {
+                let h = ring[i & (RPD - 1)];
                 if i + RPD < n {
-                    mf.pf(m[i + RPD].key());
+                    let hn = mix(m[i + RPD].key());
+                    prefetch(unsafe { mw.as_ptr().add(hn as usize & mmask) });
+                    ring[i & (RPD - 1)] = hn;
                 }
                 let g = mb + i;
                 let k = m[i].key();
                 let live = (k != 0) & (dead[g >> 6].load(Relaxed) & (1u64 << (g & 63)) == 0);
-                let hit = mf.hit(k);
+                let hit = MoverF::hit_h(mw, mmask, h);
                 let keep = live & !hit;
-                cnt[pbk(k) + 1] += keep as u32;
+                let p = pbk_h(h);
+                cnt[p + 1] += keep as u32;
                 km[i >> 6] |= (keep as u64) << (i & 63);
                 // SAFETY: nh <= i < n = hs.len()
                 unsafe { hs.get_unchecked_mut(nh) }.write(i as u32);
@@ -6428,15 +6450,24 @@ fn main() {
                 let mut hit = vec![0u32; n + 1];
                 let mut cnt = vec![0u32; PB + 1];
                 let mut m = 0usize;
+                let (mw, mmask) = (&mf.w[..], mf.mask);
+                let mut ring = [0u64; RPD];
+                for i in 0..RPD.min(n) {
+                    let hh = mix(tmp[i].key);
+                    prefetch(unsafe { mw.as_ptr().add(hh as usize & mmask) });
+                    ring[i] = hh;
+                }
                 for i in 0..n {
+                    let hh = ring[i & (RPD - 1)];
                     if i + RPD < n {
-                        mf.pf(tmp[i + RPD].key);
+                        let hn = mix(tmp[i + RPD].key);
+                        prefetch(unsafe { mw.as_ptr().add(hn as usize & mmask) });
+                        ring[i & (RPD - 1)] = hn;
                     }
-                    let k = tmp[i].key;
-                    let h = mf.hit(k);
+                    let h = MoverF::hit_h(mw, mmask, hh);
                     hit[m] = i as u32;
                     m += h as usize;
-                    cnt[pbk(k) + 1] += (!h) as u32;
+                    cnt[pbk_h(hh) + 1] += (!h) as u32;
                 }
                 for j in 0..m {
                     if j + RPD < m {
