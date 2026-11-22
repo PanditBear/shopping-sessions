@@ -27,6 +27,18 @@ printf '{\n  "window_start": "2028-01-23T00:00:00Z",\n  "window_end": "2028-02-0
 i=0; IMGS=()
 for spec in "$@"; do
   i=$((i+1)); r=${spec%%@*}; envs=""; [ "$spec" != "$r" ] && envs=${spec#*@}
+  if [[ "$r" == ext=* ]]; then
+    # ext=<git url>#<sha>: a public repository timed for comparison, built from its own Dockerfile
+    # (never the first spec: bench1 must be ours)
+    u=${r#ext=}; url=${u%%#*}; xsha=${u#*#}
+    X=$(mktemp -d $W/xXXXXXX); git clone -q "$url" $X/src; git -C $X/src checkout -q "$xsha"
+    echo "== image bench$i: external $url $(git -C $X/src rev-parse --short HEAD) env [${envs//@/ }]"
+    t=$(date +%s.%N); docker build -q -t bench${i}x $X/src >/dev/null
+    echo "external image built in $(echo "$(date +%s.%N) - $t" | bc) s"
+    mkdir -p $X/img; { echo "FROM bench${i}x"; for e in ${envs//@/ }; do echo "ENV $e"; done; } > $X/img/Dockerfile
+    docker build -q -t bench$i $X/img >/dev/null
+    IMGS+=("bench$i"); continue
+  fi
   git fetch -q origin "$r" 2>/dev/null || true
   sha=$(git rev-parse --short "$r^{commit}" 2>/dev/null || git rev-parse --short "origin/$r")
   if [ ! -f $W/bin-$sha ]; then
