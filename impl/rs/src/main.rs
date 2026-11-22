@@ -302,6 +302,65 @@ fn quote_bad(q1: u64, c: u64) -> (u64, u64) {
     (x, q1 ^ x ^ (e >> 1))
 }
 
+/// `quote_bad` on a 128-byte window.
+#[inline(always)]
+fn quote_bad128(q1: u128, c: u128) -> (u128, u128) {
+    let x = q1 & ((c << 1) | 1);
+    let e = !c.wrapping_sub(x) & c;
+    (x, q1 ^ x ^ (e >> 1))
+}
+
+/// The `parse_clicks` line rule on 128 bytes, for a line with no newline in its first 64 bytes
+/// (`ca`, `qa`: that window's masks): the newline l < 128 with exactly three commas e0 < e1 < e2
+/// before it and only whole-field quotes; returns them with the opening-quote bit of each field,
+/// or None. The caller guarantees 128 readable bytes at `p`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn line4_128(p: *const u8, ca: u64, qa: u64) -> Option<(u32, u32, u32, u32, [u64; 4])> {
+    let (cw, qw, nw) = masks64(p.add(64));
+    let c = (ca as u128) | ((cw as u128) << 64);
+    let q = (qa as u128) | ((qw as u128) << 64);
+    let n = (nw as u128) << 64;
+    let l = n.trailing_zeros();
+    let lm = n.wrapping_sub(1) & !n;
+    let cl = c & lm;
+    let e0 = cl.trailing_zeros();
+    let c1 = cl & cl.wrapping_sub(1);
+    let e1 = c1.trailing_zeros();
+    let c2 = c1 & c1.wrapping_sub(1);
+    let e2 = c2.trailing_zeros();
+    let c3 = c2 & c2.wrapping_sub(1);
+    let (x, bad) = quote_bad128(q & lm, c | n);
+    if (nw == 0) | (c2 == 0) | (c3 != 0) | (bad != 0) {
+        return None;
+    }
+    Some((l, e0, e1, e2, [(x & 1) as u64, ((x >> (e0 + 1)) & 1) as u64, ((x >> (e1 + 1)) & 1) as u64, ((x >> (e2 + 1)) & 1) as u64]))
+}
+
+/// The first-window part of the `parse_events_sol` classifier on 128 bytes, for a line with no
+/// newline in its first 64 bytes (`ca`, `qa`: that window's masks): the first three commas
+/// e0 < e1 < e2 < 128 with no newline before e2, the opening-quote bit of fields 0-2, and the
+/// `quote_bad` mask of fields 0-2 folded to 64 bits; None if there are fewer than three commas
+/// in the 128 bytes or a newline comes first. The caller guarantees 128 readable bytes at `p`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn first3_128(p: *const u8, ca: u64, qa: u64) -> Option<(u32, u32, u32, [u64; 3], u64)> {
+    let (cw, qw, nw) = masks64(p.add(64));
+    let c = (ca as u128) | ((cw as u128) << 64);
+    let q = (qa as u128) | ((qw as u128) << 64);
+    let e0 = c.trailing_zeros();
+    let c1 = c & c.wrapping_sub(1);
+    let e1 = c1.trailing_zeros();
+    let c2 = c1 & c1.wrapping_sub(1);
+    let e2 = c2.trailing_zeros();
+    if (c2 == 0) | (e2 >= 64 + nw.trailing_zeros()) {
+        return None;
+    }
+    let (x, bad) = quote_bad128(q & ((1u128 << e2) - 1), c);
+    let xq = [(x & 1) as u64, ((x >> (e0 + 1)) & 1) as u64, ((x >> (e1 + 1)) & 1) as u64];
+    Some((e0, e1, e2, xq, (bad as u64) | ((bad >> 64) as u64)))
+}
+
 /// Calls `f` with the unquoted fields of every well-formed line of `chunk` (N fields).
 /// Same dialect as rules.md: only \n ends a line; quotes allowed only around a whole field.
 #[inline(always)]
@@ -1753,7 +1812,7 @@ fn parse_clicks(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: 
     let mut pos = 0usize;
     let mut sbuf: Vec<[B; 4]> = Vec::new();
     let pfd = pf_dist();
-    while pos + 64 <= len {
+    'ln: while pos + 64 <= len {
         if pfd != 0 {
             // a prefetch never faults, so the address may lie past the chunk
             prefetch(base.wrapping_add(pos + pfd));
@@ -1770,23 +1829,37 @@ fn parse_clicks(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: 
         let e2 = c2.trailing_zeros();
         let c3 = blsr(c2);
         let (x, bad) = quote_bad(bzhi(qa, l), ca | na);
-        if (na != 0) & (c2 != 0) & (c3 == 0) & (bad == 0) {
+        'slow: {
+            // l: the newline; e0..e2: the commas; xq: whether each field opens with a quote;
+            // win: the readable bytes at p
+            let (l, e0, e1, e2, xq, win) = if (na != 0) & (c2 != 0) & (c3 == 0) & (bad == 0) {
+                (l, e0, e1, e2, [x & 1, (x >> (e0 + 1)) & 1, (x >> (e1 + 1)) & 1, (x >> (e2 + 1)) & 1], 64)
+            } else if (na == 0) & (pos + 128 <= len) {
+                // a line longer than the window (long ids): the same rule on 128 bytes
+                // SAFETY: pos + 128 <= len
+                match unsafe { line4_128(p, ca, qa) } {
+                    Some((l, e0, e1, e2, xq)) => (l, e0, e1, e2, xq, 128),
+                    None => break 'slow,
+                }
+            } else {
+                break 'slow;
+            };
             #[cfg(test)]
             SCAN7_FAST.with(|c| c.set(c.get() + 1));
             pos += (l + 1) as usize;
-            let fld = |s: u32, e: u32| {
-                let q = ((x >> s) & 1) as u32;
-                // SAFETY: s <= e <= 63 inside the window; a quoted field has e - s >= 2
+            let fld = |q: u64, s: u32, e: u32| {
+                let q = q as u32;
+                // SAFETY: s <= e < win inside the window; a quoted field has e - s >= 2
                 (unsafe { p.add((s + q) as usize) }, (e - s - 2 * q) as usize)
             };
-            let (pc, nc) = fld(0, e0);
-            let (pu, nu) = fld(e0 + 1, e1);
+            let (pc, nc) = fld(xq[0], 0, e0);
+            let (pu, nu) = fld(xq[1], e0 + 1, e1);
             if (nc == 0) | (nu == 0) {
-                continue;
+                continue 'ln;
             }
-            let (pm, nm) = fld(e1 + 1, e2);
-            let Some(ci) = camp.get_fast2(sl(pm, nm), lo) else { continue };
-            let (pt, nt) = fld(e2 + 1, l);
+            let (pm, nm) = fld(xq[2], e1 + 1, e2);
+            let Some(ci) = camp.get_fast2(sl(pm, nm), lo) else { continue 'ln };
+            let (pt, nt) = fld(xq[3], e2 + 1, l);
             // SAFETY (ldp, day_get, hms, ts25): a 20- or 25-byte field lies inside the window.
             // ts13: the time is the fourth field and both ids are not empty, so the 3 bytes
             // before it and the 16 bytes from pt - 3 lie inside the window.
@@ -1803,18 +1876,18 @@ fn parse_clicks(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: 
             } else {
                 None
             };
-            let Some(t) = f.or_else(|| parse_ts_c(sl(pt, nt), &mut tc)) else { continue };
+            let Some(t) = f.or_else(|| parse_ts_c(sl(pt, nt), &mut tc)) else { continue 'ln };
             if (t < tlo) | (t >= we) {
-                continue;
+                continue 'ln;
             }
             let uid = sl(pu, nu);
-            // SAFETY (pack6x1): e0 < 47 puts the 16 bytes from pu inside the window
-            let key = match if e0 < 47 { unsafe { pack6x1(pu, nu) } } else { (0, false) } {
+            // SAFETY (pack6x1): e0 + 17 < win puts the 16 bytes from pu inside the window
+            let key = match if e0 + 17 < win { unsafe { pack6x1(pu, nu) } } else { (0, false) } {
                 (k, true) => k,
                 _ => ukey(rs, uid),
             };
             out.push(ClickRec { key, ts: t, cid: pack(sl(pc, nc)), camp: ci });
-            continue;
+            continue 'ln;
         }
         sbuf.clear();
         pos = scan4_line(c, pos, &mut sbuf);
@@ -3604,9 +3677,21 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
         let c2 = blsr(c1);
         let e2 = c2.trailing_zeros();
         'slow: {
-            if !((c2 != 0) & (bzhi(na, e2) == 0)) {
+            // e0..e2: the first three commas; xq: whether fields 0-2 open with a quote
+            let (e0, e1, e2, xq, bad_a) = if (c2 != 0) & (bzhi(na, e2) == 0) {
+                let (xa, bad_a) = quote_bad(bzhi(qa, e2), ca);
+                (e0, e1, e2, [xa & 1, (xa >> (e0 + 1)) & 1, (xa >> (e1 + 1)) & 1], bad_a)
+            } else if (na == 0) & (pos + 192 <= len) {
+                // fields 0-2 run past the first window (long ids): the same rule on 128 bytes
+                // SAFETY: pos + 192 <= len
+                match unsafe { first3_128(p, ca, qa) } {
+                    Some(v) => v,
+                    None => break 'slow,
+                }
+            } else {
                 break 'slow;
-            }
+            };
+            // SAFETY: e2 < 128, and 192 bytes at p are readable whenever e2 >= 64
             let pb = unsafe { p.add(e2 as usize + 1) };
             let (cb, qb, nb) = masks64(pb);
             let l = nb.trailing_zeros();
@@ -3616,29 +3701,29 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
             let d2 = blsr(d1);
             let e5 = d2.trailing_zeros();
             let d3 = blsr(d2);
-            let (xa, bad_a) = quote_bad(bzhi(qa, e2), ca);
             let (xb, bad_b) = quote_bad(bzhi(qb, l), cb | nb);
             if !((nb != 0) & (e5 < l) & (bzhi(d3, l) == 0) & ((bad_a | bad_b) == 0)) {
                 break 'slow;
             }
             pos += (e2 + l + 2) as usize;
-            let fld = |p: *const u8, x: u64, s: u32, e: u32| {
-                let q = ((x >> s) & 1) as u32;
-                // SAFETY: s <= e <= 63 inside a window; a quoted field has e - s >= 2
+            let fq = |p: *const u8, q: u64, s: u32, e: u32| {
+                let q = q as u32;
+                // SAFETY: s <= e < 128 inside the classified bytes; a quoted field has e - s >= 2
                 (unsafe { p.add((s + q) as usize) }, (e - s - 2 * q) as usize)
             };
-            let (pe, ne) = fld(p, xa, 0, e0);
+            let fld = |p: *const u8, x: u64, s: u32, e: u32| fq(p, (x >> s) & 1, s, e);
+            let (pe, ne) = fq(p, xq[0], 0, e0);
             if ne == 0 {
                 continue 'ln;
             }
-            let (pu, nu) = fld(p, xa, e0 + 1, e1);
-            let (pt, nt) = fld(p, xa, e1 + 1, e2);
+            let (pu, nu) = fq(p, xq[1], e0 + 1, e1);
+            let (pt, nt) = fq(p, xq[2], e1 + 1, e2);
             let (pi, ni) = fld(pb, xb, 0, e3);
             let (pet, net) = fld(pb, xb, e3 + 1, e4);
             let (pp, np) = fld(pb, xb, e4 + 1, e5);
             let (ppr, npr) = fld(pb, xb, e5 + 1, l);
-            // SAFETY: both ids start in the first window, so 16 bytes from each stay inside
-            // the 128 readable bytes at p
+            // SAFETY: both ids start before byte 128 (e1 < e2 < 128), so 16 bytes from each stay
+            // inside the readable bytes at p (128 when e2 < 64, else 192)
             let (oke, val, ku, oku) = unsafe { fuse_eu(pe, ne, pu, nu) };
             // SAFETY (ldp, hms): a 20-byte field lies inside its window. (ra, rb, rd): the
             // ingest's date key and day start when it is a valid F1 date, else 2000-01-01's.
@@ -6171,7 +6256,7 @@ mod tests {
             }
         };
         let id = |r: &mut Rng| -> Vec<u8> {
-            let n = if r.chance(10) { r.below(14) } else { 8 + r.below(2) };
+            let n = if r.chance(10) { r.below(14) } else if r.chance(15) { 30 + r.below(6) } else { 8 + r.below(2) };
             (0..n).map(|_| if r.chance(98) { ID[r.below(23) as usize] } else { ID[r.below(ID.len() as u64) as usize] }).collect()
         };
         let ts = |r: &mut Rng, iso_only: bool| -> Vec<u8> {
