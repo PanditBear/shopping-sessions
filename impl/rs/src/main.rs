@@ -92,11 +92,25 @@ fn prefetch<T>(p: *const T) {
     let _ = p;
 }
 
-/// Input prefetch distance in bytes for the event and click line kernels: SHOP_PFD, default
-/// 0 (off), set a byte count to enable. Read once.
+/// Input prefetch distance in bytes for the event and click line kernels. SHOP_PFD overrides
+/// (0 off). Otherwise 4096 on GenuineIntel CPUs, where it shortens the scan, and 0 elsewhere.
+/// Read once.
 fn pf_dist() -> usize {
     static D: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *D.get_or_init(|| std::env::var("SHOP_PFD").ok().and_then(|s| s.parse().ok()).unwrap_or(0))
+    *D.get_or_init(|| {
+        if let Some(v) = std::env::var("SHOP_PFD").ok().and_then(|s| s.parse().ok()) {
+            return v;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: cpuid is available on every x86_64 CPU
+            let r = unsafe { core::arch::x86_64::__cpuid(0) };
+            if r.ebx == 0x756e_6547 && r.edx == 0x4965_6e69 && r.ecx == 0x6c65_746e {
+                return 4096;
+            }
+        }
+        0
+    })
 }
 
 // ---------- id keys ----------
@@ -885,11 +899,6 @@ fn leak_file(p: &Path) -> Option<B> {
     #[cfg(target_os = "linux")]
     {
         let _ = m.advise(memmap2::Advice::Sequential);
-    }
-    #[cfg(target_os = "linux")]
-    if std::env::var_os("SHOP_INHP").is_some_and(|v| v == "1") {
-        let r = m.advise(memmap2::Advice::HugePage);
-        eprintln!("SHOP_INHP madvise(HugePage): {}", if r.is_ok() { "Ok" } else { "Err" });
     }
     let m: &'static memmap2::Mmap = Box::leak(Box::new(m));
     #[cfg(target_os = "linux")]
