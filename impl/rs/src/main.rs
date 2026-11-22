@@ -4379,6 +4379,82 @@ fn sol_bench<E: Ev>(ev_chunks: &[B], cx: &EvCtx) {
     eprintln!("solbench best old {best_o:.2} ns/rec new {best_n:.2} ns/rec speedup {:.3}", best_o / best_n);
 }
 
+/// measurement aid (SHOP_WMB=<MB>, SHOP_WMB_REPS): the event kernel alone, one thread, over the first
+/// MB of the event chunks copied to heap memory (no mmap in the timed loop); the output buffers are
+/// allocated once and reused. Prints min and median ns per line and a checksum of the records.
+fn wmb_bench<E: Ev>(ev_chunks: &[B], cx: &EvCtx, mb: usize) {
+    let reps: usize = std::env::var("SHOP_WMB_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(7).max(1);
+    let (mut heap, mut lens) = (Vec::<u8>::with_capacity(mb << 20), vec![]);
+    for &c in ev_chunks {
+        if heap.len() >= mb << 20 {
+            break;
+        }
+        heap.extend_from_slice(c);
+        lens.push(c.len());
+    }
+    let mut acc = 0u8;
+    for i in (0..heap.len()).step_by(4096) {
+        acc = acc.wrapping_add(heap[i]);
+    }
+    let heap: B = Vec::leak(heap);
+    let mut chunks: Vec<B> = vec![];
+    let mut at = 0;
+    for l in lens {
+        chunks.push(&heap[at..at + l]);
+        at += l;
+    }
+    let lines: usize = chunks.iter().map(|c| memchr::memchr_iter(b'\n', c).count()).sum();
+    let maxlen = chunks.iter().map(|c| c.len()).max().unwrap_or(0);
+    let mut b = EvBufs::<E>::new();
+    let mut dz = Dz::<E>::new(idx_cfg(), maxlen);
+    let mut times = vec![];
+    let mut sum = 0u64;
+    for rep in 0..=reps + 1 {
+        let t = std::time::Instant::now();
+        for &c in &chunks {
+            b.clear();
+            if dz.on {
+                dz.dn.iter_mut().for_each(|x| *x = 0);
+                dz.ov.clear();
+                dz.ovb.clear();
+                dz.ovoff.clear();
+                dz.dside.clear();
+                parse_events_sol::<E, true>(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side, &mut dz);
+            } else {
+                parse_events_sol::<E, false>(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side, &mut dz);
+            }
+            if rep == reps + 1 {
+                // untimed: checksum of the last rep
+                let mut h = sum;
+                let mut add = |x: u64| h = mix(h ^ x).wrapping_add(x);
+                add(b.m.len() as u64);
+                for e in &b.m {
+                    add(e.key() ^ (e.rts() << 1));
+                    if let Some((p, cat)) = e.pc() {
+                        add(p ^ ((cat as u64) << 32));
+                    }
+                }
+                for x in &b.d {
+                    add(x.eid ^ ((x.ing as u64) << 1) ^ ((x.loc as u64) << 40));
+                }
+                // fb.v and fbn hold addresses of the input, so only their lengths go in
+                add((b.fb.v.len() as u64) << 32 | b.fbn.len() as u64);
+                for x in &b.side {
+                    add(x.0 as u64 ^ x.1 as u64);
+                }
+                sum = h;
+            }
+        }
+        // rep 0 is a warm-up (the buffers grow to size); the checksum rep is not timed
+        if rep > 0 && rep <= reps {
+            times.push(t.elapsed().as_secs_f64() * 1e9 / lines.max(1) as f64);
+        }
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let (min, med) = (times.first().copied().unwrap_or(0.0), times.get(times.len() / 2).copied().unwrap_or(0.0));
+    eprintln!("wmb lines={lines} reps={} min_ns_per_line={min:.3} med_ns_per_line={med:.3} checksum={sum:016x} ({})", times.len(), acc & 1);
+}
+
 struct EvChunk<E> {
     m: Vec<E>,
     d: Vec<DRec>,
@@ -6185,6 +6261,14 @@ fn main() {
                     parse_aid::<EvL>(&ev_chunks, &cx);
                 } else {
                     parse_aid::<EvW>(&ev_chunks, &cx);
+                }
+                std::process::exit(0);
+            }
+            if let Some(mb) = std::env::var("SHOP_WMB").ok().map(|v| v.parse::<usize>().unwrap_or(400)) {
+                if lean {
+                    wmb_bench::<EvL>(&ev_chunks, &cx, mb);
+                } else {
+                    wmb_bench::<EvW>(&ev_chunks, &cx, mb);
                 }
                 std::process::exit(0);
             }
