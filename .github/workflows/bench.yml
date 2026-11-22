@@ -95,7 +95,7 @@ jobs:
             T0=$(sed 's/T0=//' $R/phase$n.t0.txt)
             for w in "events parsed|clicks parsed|clk" "dedup done|sessionized|ses" "clicks parsed|dedup done|ded"; do
               l1=$(echo "$w" | cut -d'|' -f1); l2=$(echo "$w" | cut -d'|' -f2); nm=$(echo "$w" | cut -d'|' -f3)
-              t1=$(grep "$l1" $R/rec$n.ticks.txt | head -1 | sed -E 's/^\[([0-9.]+)s\].*//'); t2=$(grep "$l2" $R/rec$n.ticks.txt | head -1 | sed -E 's/^\[([0-9.]+)s\].*//')
+              t1=$(grep "$l1" $R/rec$n.ticks.txt | head -1 | sed -E 's/^\[([0-9.]+)s\].*/\1/'); t2=$(grep "$l2" $R/rec$n.ticks.txt | head -1 | sed -E 's/^\[([0-9.]+)s\].*/\1/')
               a=$(echo "$T0 + $t1" | bc -l); b=$(echo "$T0 + $t2" | bc -l)
               sudo $P report -i $W/perf$n.data --stdio -n --no-children -g none --sort srcline --time $a,$b 2>/dev/null | grep -v '^#' | grep -v '^$' | head -45 > $R/win-$nm.srcline.txt
             done
