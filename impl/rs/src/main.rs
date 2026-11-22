@@ -3135,7 +3135,7 @@ fn int_col(f: &mut Pqf, c: &mut Cm, rows: &[&[UD]], n: usize, get: impl Fn(&UD) 
 }
 
 /// Writes one row group of `rows` (a list of row runs, n rows in all); returns its column chunks.
-fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names, rev32: bool) -> Vec<Cm> {
+fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names, rev32: bool, zm: u32) -> Vec<Cm> {
     let mut t3 = now();
     // pass 1: ranges and counts
     let (mut dlo, mut dhi) = (i64::MAX, i64::MIN);
@@ -3168,7 +3168,6 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
     ];
     // which chunks to compress, bit i = column i. Default revenue_cents only: mostly zeros, so zstd
     // shrinks it about 7x for almost no work; the other chunks are already dictionary/bit-packed
-    let zm: u32 = std::env::var("SHOP_ZCOLS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
     for (i, c) in cols.iter_mut().enumerate() {
         c.z = (zm >> i) & 1 == 1;
     }
@@ -3268,72 +3267,62 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
     cols
 }
 
-static WIO_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-static WIO_SEQ: AtomicU64 = AtomicU64::new(0);
-static WIO_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+// ---- SHOP_ZAUTO: user_daily chunk compression follows the output disk ----
+// Files that start before four user_daily kicks (out_kick wall time) have finished are compressed (mask 25).
+// When the fourth kick completes, the slowest of the four is stored once: above 3 ms (slow disk, bytes are the
+// cost) the rest stay compressed, otherwise they are written plain (mask 16, CPU is the cost).
+// SHOP_ZAUTO=on (default) adaptive; =plain every file after the first four plain; =zstd all compressed.
+// An explicit SHOP_ZCOLS overrides everything.
+static ZA_REST: AtomicU64 = AtomicU64::new(0); // 0 undecided, 1 compressed, 2 plain
+static ZA_NEXT: AtomicU64 = AtomicU64::new(0); // kicks begun
+static ZA_DONE: AtomicU64 = AtomicU64::new(0); // kick times stored
+static ZA_K: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4]; // microseconds
+static ZA_START: AtomicU64 = AtomicU64::new(0);
+static ZA_NZ: AtomicU64 = AtomicU64::new(0);
 
-fn wio_ms() -> f64 {
-    WIO_T0.get().map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e3)
-}
-
-/// Dirty+Writeback kB from /proc/meminfo (timing runs only).
-fn wio_dirty() -> u64 {
-    let t = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    t.lines().filter(|l| l.starts_with("Dirty:") || l.starts_with("Writeback:")).map(|l| l.split_whitespace().nth(1).and_then(|x| x.parse::<u64>().ok()).unwrap_or(0)).sum()
-}
-
-/// One-time description of the output block device (timing runs only).
-#[cfg(not(target_os = "linux"))]
-fn wio_dev(_dir: &Path) {}
-
-#[cfg(target_os = "linux")]
-fn wio_dev(dir: &Path) {
-    use std::os::unix::fs::MetadataExt;
-    let rd = |p: &str| std::fs::read_to_string(p).map(|x| x.trim().to_string()).unwrap_or_else(|_| "-".into());
-    let Ok(m) = std::fs::metadata(dir) else { return };
-    let d = m.dev();
-    let (maj, min) = (((d >> 8) & 0xfff) | ((d >> 32) & !0xfff), (d & 0xff) | ((d >> 12) & !0xff));
-    let mut out = format!("wio dev {maj}:{min}");
-    let mi = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
-    let key = format!(" {maj}:{min} ");
-    for l in mi.lines().filter(|l| l.contains(&key)) {
-        out += &format!(" | mount {}", l.split(" - ").collect::<Vec<_>>().join(" - "));
+fn za_mask() -> u32 {
+    if let Some(m) = std::env::var("SHOP_ZCOLS").ok().and_then(|v| v.parse().ok()) {
+        return m;
     }
-    let link = format!("/sys/dev/block/{maj}:{min}");
-    match std::fs::canonicalize(&link) {
-        Ok(mut p) => {
-            out += &format!(" | sys {}", p.display());
-            if p.join("partition").exists() {
-                p.pop();
-            }
-            let n = p.file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
-            let drv = std::fs::read_link(p.join("device/driver")).ok().and_then(|x| x.file_name().map(|y| y.to_string_lossy().to_string())).unwrap_or_else(|| "-".into());
-            let sub = std::fs::read_link(p.join("device/subsystem")).ok().and_then(|x| x.file_name().map(|y| y.to_string_lossy().to_string())).unwrap_or_else(|| "-".into());
-            out += &format!(
-                " | dev {n} driver={drv} subsys={sub} model={} vendor={} nr_requests={} max_sectors_kb={} rotational={} write_cache={} scheduler={} nr_hw_queues={} rq_affinity={} wbt_lat_usec={} queue_depth={} size={}",
-                rd(&p.join("device/model").to_string_lossy()),
-                rd(&p.join("device/vendor").to_string_lossy()),
-                rd(&p.join("queue/nr_requests").to_string_lossy()),
-                rd(&p.join("queue/max_sectors_kb").to_string_lossy()),
-                rd(&p.join("queue/rotational").to_string_lossy()),
-                rd(&p.join("queue/write_cache").to_string_lossy()),
-                rd(&p.join("queue/scheduler").to_string_lossy()),
-                std::fs::read_dir(p.join("mq")).map(|r| r.count().to_string()).unwrap_or_else(|_| "-".into()),
-                rd(&p.join("queue/rq_affinity").to_string_lossy()),
-                rd(&p.join("queue/wbt_lat_usec").to_string_lossy()),
-                rd(&p.join("device/queue_depth").to_string_lossy()),
-                rd(&p.join("size").to_string_lossy()),
-            );
+    let seq = ZA_START.fetch_add(1, Relaxed);
+    let plain = match std::env::var("SHOP_ZAUTO").as_deref() {
+        Ok("zstd") => false,
+        Ok("plain") => seq >= 4,
+        _ => ZA_REST.load(Relaxed) == 2,
+    };
+    if !plain {
+        ZA_NZ.fetch_add(1, Relaxed);
+    }
+    if plain { 16 } else { 25 }
+}
+
+fn za_kick(us: u64) {
+    let i = ZA_NEXT.fetch_add(1, Relaxed) as usize;
+    if i < 4 {
+        ZA_K[i].store(us, Relaxed);
+        if ZA_DONE.fetch_add(1, Relaxed) == 3 {
+            let mx = ZA_K.iter().map(|k| k.load(Relaxed)).max().unwrap_or(0);
+            ZA_REST.store(if mx > 3000 { 1 } else { 2 }, Relaxed);
         }
-        Err(e) => out += &format!(" | sys none ({e})"),
     }
-    eprintln!("{out}");
+}
+
+fn za_line() -> String {
+    let k: Vec<String> = ZA_K.iter().map(|k| format!("{:.2}", k.load(Relaxed) as f64 / 1e3)).collect();
+    let mx = ZA_K.iter().map(|k| k.load(Relaxed)).max().unwrap_or(0);
+    let mode = std::env::var("SHOP_ZAUTO").unwrap_or_else(|_| "on".into());
+    format!(
+        "zauto mode={mode} k={} kmax={:.2} rest={} nz={}/16",
+        k.join(","),
+        mx as f64 / 1e3,
+        match ZA_REST.load(Relaxed) { 1 => "z", 2 => "raw", _ => "undecided" },
+        ZA_NZ.load(Relaxed)
+    )
 }
 
 fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names, rev32: bool) {
     let mut tm = now();
-    let wio_on = WIO_T0.get().is_some();
-    let w_es = wio_ms();
+    let zm = za_mask();
     const RG: usize = 1 << 20;
     let total: usize = groups.iter().map(|g| g.len()).sum();
     let mut f = Pqf::new(total * 6 + 4096);
@@ -3349,14 +3338,14 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names,
             n += k;
             s = &s[k..];
             if n == RG {
-                rgs.push((ud_row_group(&mut f, &cur, n, cats, names, rev32), n));
+                rgs.push((ud_row_group(&mut f, &cur, n, cats, names, rev32, zm), n));
                 cur.clear();
                 n = 0;
             }
         }
     }
     if n > 0 {
-        rgs.push((ud_row_group(&mut f, &cur, n, cats, names, rev32), n));
+        rgs.push((ud_row_group(&mut f, &cur, n, cats, names, rev32, zm), n));
     }
     // footer (FileMetaData)
     let mut t = Tc::new();
@@ -3429,26 +3418,10 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names,
     f.out.extend_from_slice(&(t.b.len() as u32).to_le_bytes());
     f.out.extend_from_slice(b"PAR1");
     pt(12, &mut tm);
-    if wio_on {
-        let (w_ee, nb) = (wio_ms(), f.out.len());
-        std::fs::write(path, &f.out).unwrap();
-        let w_wr = wio_ms();
-        let d0 = wio_dirty();
-        out_kick(path);
-        let w_k = wio_ms();
-        let d1 = wio_dirty();
-        let seq = WIO_SEQ.fetch_add(1, Relaxed);
-        let th = rayon::current_thread_index().unwrap_or(99);
-        WIO_LOG.lock().unwrap().push(format!(
-            "wio ud seq={seq} file={} thr={th} bytes={nb} enc={w_es:.1}..{w_ee:.1} write_ms={:.2} kick_ms={:.2} kick_at={w_wr:.1} dirty_before={d0} dirty_after={d1}",
-            path.file_name().unwrap().to_string_lossy(),
-            w_wr - w_ee,
-            w_k - w_wr
-        ));
-    } else {
-        std::fs::write(path, &f.out).unwrap();
-        out_kick(path);
-    }
+    std::fs::write(path, &f.out).unwrap();
+    let k0 = std::time::Instant::now();
+    out_kick(path);
+    za_kick(k0.elapsed().as_micros() as u64);
     pt(16, &mut tm);
 }
 
@@ -3484,11 +3457,7 @@ fn write_campaign_daily(path: &Path, rows: &[(u32, i32, [u64; 4])], names: &[B],
         rg.close().unwrap();
     }
     w.close().unwrap();
-    let c0 = wio_ms();
     out_kick(path);
-    if WIO_T0.get().is_some() {
-        WIO_LOG.lock().unwrap().push(format!("wio cd end_before_kick={c0:.1} kick_ms={:.2} dirty={}", wio_ms() - c0, wio_dirty()));
-    }
 }
 
 /// Start writeback of a finished output file now (SYNC_FILE_RANGE_WRITE, does not wait). The
@@ -6671,11 +6640,6 @@ fn main() {
     // one revenue width for every file of the table, so all part files share a schema
     let rev32 = std::env::var_os("SHOP_REV64").is_none()
         && files.par_iter().all(|g| g.iter().all(|x| x.iter().all(|r| r.rev <= i32::MAX as u64)));
-    if timing {
-        wio_dev(&ud_dir);
-        let _ = WIO_T0.set(std::time::Instant::now());
-        eprintln!("wio start dirty_kb={}", wio_dirty());
-    }
     rayon::join(
         || {
             files.par_iter().enumerate().filter(|(i, g)| g.iter().any(|x| !x.is_empty()) || (*i == 0 && !any_rows)).for_each(|(i, g)| {
@@ -6686,11 +6650,7 @@ fn main() {
     );
     tick("written");
     if timing {
-        for l in WIO_LOG.lock().unwrap().iter() {
-            eprintln!("{l}");
-        }
-    }
-    if timing {
+        eprintln!("{}", za_line());
         let v: Vec<String> = (0..PROF.len()).map(|i| format!("{}={:.2}", PROF_NAMES[i], PROF[i].load(Relaxed) as f64 / 1e9)).collect();
         eprintln!("prof(cpu s): {}", v.join(" "));
     }
