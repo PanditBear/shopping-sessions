@@ -4455,6 +4455,61 @@ fn wmb_bench<E: Ev>(ev_chunks: &[B], cx: &EvCtx, mb: usize) {
     eprintln!("wmb lines={lines} reps={} min_ns_per_line={min:.3} med_ns_per_line={med:.3} checksum={sum:016x} ({})", times.len(), acc & 1);
 }
 
+/// measurement aid (SHOP_WMB_CK=1 with SHOP_WMB=<MB>, SHOP_WMB_REPS): `parse_clicks` alone, one thread,
+/// over the first MB of the click chunks copied to heap memory; the output vector is reused. Prints
+/// min and median ns per line and a checksum of the click records.
+fn wmb_clicks(ck_chunks: &[B], camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, mb: usize) {
+    let reps: usize = std::env::var("SHOP_WMB_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(7).max(1);
+    let (mut heap, mut lens) = (Vec::<u8>::with_capacity(mb << 20), vec![]);
+    for &c in ck_chunks {
+        if heap.len() >= mb << 20 {
+            break;
+        }
+        heap.extend_from_slice(c);
+        lens.push(c.len());
+    }
+    let mut acc = 0u8;
+    for i in (0..heap.len()).step_by(4096) {
+        acc = acc.wrapping_add(heap[i]);
+    }
+    let heap: B = Vec::leak(heap);
+    let mut chunks: Vec<B> = vec![];
+    let mut at = 0;
+    for l in lens {
+        chunks.push(&heap[at..at + l]);
+        at += l;
+    }
+    let lines: usize = chunks.iter().map(|c| memchr::memchr_iter(b'\n', c).count()).sum();
+    let mut out: Vec<ClickRec> = Vec::new();
+    let mut times = vec![];
+    let mut sum = 0u64;
+    for rep in 0..=reps + 1 {
+        let t = std::time::Instant::now();
+        for &c in &chunks {
+            out.clear();
+            parse_clicks(c, camp, rs, ws, we, &mut out);
+            if rep == reps + 1 {
+                // untimed: checksum of the last rep
+                let mut h = sum;
+                let mut add = |x: u64| h = mix(h ^ x).wrapping_add(x);
+                add(out.len() as u64);
+                for r in &out {
+                    add(r.key ^ (r.ts as u64).rotate_left(17));
+                    // cid is an input address: the offset into the chunk and the length stand for it
+                    add(((r.cid & ((1u64 << 48) - 1)).wrapping_sub(c.as_ptr() as u64)) ^ (r.cid >> 48 << 32) ^ ((r.camp as u64) << 40));
+                }
+                sum = h;
+            }
+        }
+        if rep > 0 && rep <= reps {
+            times.push(t.elapsed().as_secs_f64() * 1e9 / lines.max(1) as f64);
+        }
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let (min, med) = (times.first().copied().unwrap_or(0.0), times.get(times.len() / 2).copied().unwrap_or(0.0));
+    eprintln!("wmb kind=clicks lines={lines} reps={} min_ns_per_line={min:.3} med_ns_per_line={med:.3} checksum={sum:016x} ({})", times.len(), acc & 1);
+}
+
 struct EvChunk<E> {
     m: Vec<E>,
     d: Vec<DRec>,
@@ -6264,7 +6319,7 @@ fn main() {
                 }
                 std::process::exit(0);
             }
-            if let Some(mb) = std::env::var("SHOP_WMB").ok().map(|v| v.parse::<usize>().unwrap_or(400)) {
+            if let Some(mb) = std::env::var("SHOP_WMB").ok().filter(|_| std::env::var_os("SHOP_WMB_CK").is_none()).map(|v| v.parse::<usize>().unwrap_or(400)) {
                 if lean {
                     wmb_bench::<EvL>(&ev_chunks, &cx, mb);
                 } else {
@@ -6394,6 +6449,11 @@ fn main() {
 
     // clicks
     let click_chunks = all_chunks(&csv_files(&data.join("clicks")), CHUNK);
+    if std::env::var_os("SHOP_WMB_CK").is_some() {
+        let mb = std::env::var("SHOP_WMB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(400);
+        wmb_clicks(&click_chunks, &camp, &rs, ws, we, mb);
+        std::process::exit(0);
+    }
     let mut tm = now();
     let mf = MoverF::build(&tab);
     pt(4, &mut tm);
