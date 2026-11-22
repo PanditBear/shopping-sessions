@@ -4096,40 +4096,72 @@ fn parse_events_sol<E: Ev, const DZ: bool>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: 
         // SAFETY: pos + 128 <= len, and the second window starts at most 64 bytes in
         let p = unsafe { base.add(pos) };
         let (ca, qa, na) = masks64(p);
-        let e0 = ca.trailing_zeros();
-        let c1 = blsr(ca);
-        let e1 = c1.trailing_zeros();
-        let c2 = blsr(c1);
-        let e2 = c2.trailing_zeros();
         'slow: {
-            // e0..e2: the first three commas; xq: whether fields 0-2 open with a quote
-            let (e0, e1, e2, xq, bad_a) = if (c2 != 0) & (bzhi(na, e2) == 0) {
-                let (xa, bad_a) = quote_bad(bzhi(qa, e2), ca);
-                (e0, e1, e2, [xa & 1, (xa >> (e0 + 1)) & 1, (xa >> (e1 + 1)) & 1], bad_a)
-            } else if (na == 0) & (pos + 192 <= len) {
-                // fields 0-2 run past the first window (long ids): the same rule on 128 bytes
-                // SAFETY: pos + 192 <= len
-                match unsafe { first3_128(p, ca, qa) } {
-                    Some(v) => v,
-                    None => break 'slow,
-                }
+            // SAFETY: pos + 128 <= len
+            let (ch, qh, nh) = masks64(unsafe { p.add(64) });
+            // one 128-byte view of the line when it ends in bytes 64..127: all separators and
+            // quotes of the line from these masks, no second classification
+            let t = nh.trailing_zeros();
+            let l7 = 64 + t;
+            let ch7 = bzhi(ch, t);
+            let cc = (ca as u128) | ((ch7 as u128) << 64);
+            let qq = (qa as u128) | ((bzhi(qh, t) as u128) << 64);
+            let f0 = ca.trailing_zeros();
+            let w1 = cc.wrapping_shr(f0 + 1) as u64;
+            let f1 = f0 + 1 + w1.trailing_zeros();
+            let f2 = f0 + 1 + blsr(w1).trailing_zeros();
+            let w2 = cc.wrapping_shr(f2 + 1) as u64;
+            let (x7, bad7) = quote_bad128(qq, cc | (((nh & nh.wrapping_neg()) as u128) << 64));
+            let fast = (na == 0)
+                & (nh != 0)
+                & (pos + 192 <= len)
+                & (ca != 0)
+                & (ca.count_ones() + ch7.count_ones() == 6)
+                & (blsr(w1) != 0)
+                & (l7 <= f2 + 64)
+                & (bad7 == 0);
+            let (e0, e1, e2, xq, pb, e3, e4, e5, l, xb) = if fast {
+                let x1 = x7.wrapping_shr(f0 + 1) as u64;
+                let d1 = blsr(w2);
+                // SAFETY: f2 < l7 < 128
+                let pb = unsafe { p.add(f2 as usize + 1) };
+                (f0, f1, f2, [(x7 as u64) & 1, x1 & 1, (x1 >> (f1 - f0)) & 1], pb, w2.trailing_zeros(), d1.trailing_zeros(), blsr(d1).trailing_zeros(), l7 - f2 - 1, x7.wrapping_shr(f2 + 1) as u64)
             } else {
-                break 'slow;
+                let e0 = ca.trailing_zeros();
+                let c1 = blsr(ca);
+                let e1 = c1.trailing_zeros();
+                let c2 = blsr(c1);
+                let e2 = c2.trailing_zeros();
+                // e0..e2: the first three commas; xq: whether fields 0-2 open with a quote
+                let (e0, e1, e2, xq, bad_a) = if (c2 != 0) & (bzhi(na, e2) == 0) {
+                    let (xa, bad_a) = quote_bad(bzhi(qa, e2), ca);
+                    (e0, e1, e2, [xa & 1, (xa >> (e0 + 1)) & 1, (xa >> (e1 + 1)) & 1], bad_a)
+                } else if (na == 0) & (pos + 192 <= len) {
+                    // fields 0-2 run past the first window (long ids): the same rule on 128 bytes
+                    // SAFETY: pos + 192 <= len
+                    match unsafe { first3_128(p, ca, qa) } {
+                        Some(v) => v,
+                        None => break 'slow,
+                    }
+                } else {
+                    break 'slow;
+                };
+                // SAFETY: e2 < 128, and 192 bytes at p are readable whenever e2 >= 64
+                let pb = unsafe { p.add(e2 as usize + 1) };
+                let (cb, qb, nb) = masks64(pb);
+                let l = nb.trailing_zeros();
+                let e3 = cb.trailing_zeros();
+                let d1 = blsr(cb);
+                let e4 = d1.trailing_zeros();
+                let d2 = blsr(d1);
+                let e5 = d2.trailing_zeros();
+                let d3 = blsr(d2);
+                let (xb, bad_b) = quote_bad(bzhi(qb, l), cb | nb);
+                if !((nb != 0) & (e5 < l) & (bzhi(d3, l) == 0) & ((bad_a | bad_b) == 0)) {
+                    break 'slow;
+                }
+                (e0, e1, e2, xq, pb, e3, e4, e5, l, xb)
             };
-            // SAFETY: e2 < 128, and 192 bytes at p are readable whenever e2 >= 64
-            let pb = unsafe { p.add(e2 as usize + 1) };
-            let (cb, qb, nb) = masks64(pb);
-            let l = nb.trailing_zeros();
-            let e3 = cb.trailing_zeros();
-            let d1 = blsr(cb);
-            let e4 = d1.trailing_zeros();
-            let d2 = blsr(d1);
-            let e5 = d2.trailing_zeros();
-            let d3 = blsr(d2);
-            let (xb, bad_b) = quote_bad(bzhi(qb, l), cb | nb);
-            if !((nb != 0) & (e5 < l) & (bzhi(d3, l) == 0) & ((bad_a | bad_b) == 0)) {
-                break 'slow;
-            }
             pos += (e2 + l + 2) as usize;
             let fq = |p: *const u8, q: u64, s: u32, e: u32| {
                 let q = q as u32;
