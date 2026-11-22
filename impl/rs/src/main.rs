@@ -5681,6 +5681,7 @@ fn main() {
         Evs::L(v) => fbn_merge(v, &mut names_map),
         Evs::W(v) => fbn_merge(v, &mut names_map),
     }
+    tick("names built");
 
     // person buckets
     let d0 = ws.div_euclid(DAY);
