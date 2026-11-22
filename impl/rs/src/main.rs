@@ -4107,31 +4107,33 @@ fn parse_events_sol<E: Ev, const DZ: bool>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: 
         'slow: {
             // SAFETY: pos + 128 <= len
             let (ch, qh, nh) = masks64(unsafe { p.add(64) });
-            // one 128-byte view of the line when it ends in bytes 64..127: all separators and
-            // quotes of the line from these masks, no second classification
-            let t = nh.trailing_zeros();
-            let l7 = 64 + t;
-            let ch7 = bzhi(ch, t);
-            let cc = (ca as u128) | ((ch7 as u128) << 64);
-            let qq = (qa as u128) | ((bzhi(qh, t) as u128) << 64);
-            let f0 = ca.trailing_zeros();
+            // the whole line from these two windows when it ends before byte 128 (99.6% of
+            // lines): all separators and quotes from one classification, and no branch on where
+            // the fields fall
+            let ta = na.trailing_zeros();
+            let tb = nh.trailing_zeros();
+            let ma = 0u64.wrapping_sub((na == 0) as u64);
+            let l7 = ta + (tb & ma as u32);
+            let ca7 = bzhi(ca, ta);
+            let ch7 = bzhi(ch, tb) & ma;
+            let cc = (ca7 as u128) | ((ch7 as u128) << 64);
+            let qq = (bzhi(qa, ta) as u128) | (((bzhi(qh, tb) & ma) as u128) << 64);
+            let f0 = cc.trailing_zeros();
             let w1 = cc.wrapping_shr(f0 + 1) as u64;
             let f1 = f0 + 1 + w1.trailing_zeros();
             let f2 = f0 + 1 + blsr(w1).trailing_zeros();
             let w2 = cc.wrapping_shr(f2 + 1) as u64;
-            let (x7, bad7) = quote_bad128(qq, cc | (((nh & nh.wrapping_neg()) as u128) << 64));
-            let fast = (na == 0)
-                & (nh != 0)
-                & (pos + 192 <= len)
-                & (ca != 0)
-                & (ca.count_ones() + ch7.count_ones() == 6)
+            let (x7, bad7) = quote_bad128(qq, cc | 1u128.wrapping_shl(l7));
+            let fast = (l7 < 128)
+                & ((f2 < 64) | (pos + 192 <= len))
+                & (ca7.count_ones() + ch7.count_ones() == 6)
                 & (blsr(w1) != 0)
                 & (l7 <= f2 + 64)
                 & (bad7 == 0);
             let (e0, e1, e2, xq, pb, e3, e4, e5, l, xb) = if fast {
                 let x1 = x7.wrapping_shr(f0 + 1) as u64;
                 let d1 = blsr(w2);
-                // SAFETY: f2 < l7 < 128
+                // SAFETY: f2 < l7 < 128; 192 bytes at p are readable whenever f2 >= 64
                 let pb = unsafe { p.add(f2 as usize + 1) };
                 (f0, f1, f2, [(x7 as u64) & 1, x1 & 1, (x1 >> (f1 - f0)) & 1], pb, w2.trailing_zeros(), d1.trailing_zeros(), blsr(d1).trailing_zeros(), l7 - f2 - 1, x7.wrapping_shr(f2 + 1) as u64)
             } else {
