@@ -23,6 +23,8 @@ S "base image: $(grep -E 'resolve docker.io/library/rust|FROM docker.io/library/
 cid=$(docker create r1img); docker cp $cid:/app/shop $W/shop-img; docker rm $cid >/dev/null
 S "BINSHA $ROLE $(sha256sum $W/shop-img | cut -d' ' -f1)"
 echo "$ROLE $(sha256sum $W/shop-img | cut -d' ' -f1) build=${bt}s" > $W/binsha-$ROLE.txt
+docker build --no-cache -q -t r1img2 $W/src > /dev/null 2>&1; cid=$(docker create r1img2); docker cp $cid:/app/shop $W/shop-img2; docker rm $cid >/dev/null
+S "SAME-RUNNER REBUILD $ROLE: $(sha256sum $W/shop-img2 | cut -d' ' -f1) vs first $(sha256sum $W/shop-img | cut -d' ' -f1)"
 # 2. reference build (native, as bench.sh builds a ref)
 git worktree add -q --detach $W/refsrc $REF
 (cd $W/refsrc/impl/rs && CC_x86_64_unknown_linux_musl=musl-gcc RUSTFLAGS="-C target-cpu=x86-64-v3" CARGO_TARGET_DIR=$W/tgt \
@@ -36,12 +38,12 @@ python3 -m pip install -q duckdb
 git show origin/bench:content.py > $W/content.py
 gen() { wipe $W/data; $G --seed 7 --events $1 --clicks $2 --output $W/data --threads 4 >/dev/null; S "dataset events=$1 clicks=$2: $(du -sh $W/data | cut -f1)"; }
 run_img() { # CPUS MEM OUTDIR -> RUN_RC RUN_WALL RUN_PEAK_MB
-  local c=$1 m=$2 out=$3 scr nm=r1c-$RANDOM t0 t1 rc pk=0 v pid cg id
+  local dc c=$1 m=$2; dc=$c; [ $c -gt 4 ] && dc=4; local m=$2 out=$3 scr nm=r1c-$RANDOM t0 t1 rc pk=0 v pid cg id
   scr=$(mktemp -d); chmod 777 $out $scr
   t0=$(date +%s.%N)
   docker run --name $nm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 \
     --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 \
-    --cpus $c --memory $m --memory-swap $m --user 1000:1000 \
+    --cpus $dc --memory $m --memory-swap $m --user 1000:1000 \
     -v $W/data:/data:ro -v $out:/output -v $scr:/scratch \
     -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
     -e NCPU=$c -e SHOP_TIMING=1 r1img 2>$W/err.txt &
