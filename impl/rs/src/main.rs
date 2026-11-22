@@ -4837,6 +4837,44 @@ fn lpt_run<S: Send>(cost: &[u64], init: impl Fn() -> S + Sync, f: impl Fn(usize,
     r.into_iter().map(|x| x.0).collect()
 }
 
+/// Maps every item on the pool like an in-order map, but the workers pull the items biggest cost
+/// first from a shared counter (LPT list scheduling), so the big items start early and the small
+/// ones fill the end. The results come back in item order, so the output does not depend on the
+/// schedule.
+fn lpt_map<I: Send, T: Send>(items: Vec<I>, cost: &[u64], f: impl Fn(usize, I) -> T + Sync) -> Vec<T> {
+    let n = items.len();
+    let mut ord: Vec<u32> = (0..n as u32).collect();
+    ord.sort_unstable_by_key(|&p| (std::cmp::Reverse(cost[p as usize]), p));
+    let slots: Vec<std::sync::Mutex<Option<I>>> = items.into_iter().map(|x| std::sync::Mutex::new(Some(x))).collect();
+    let next = AtomicUsize::new(0);
+    let nt = rayon::current_num_threads().clamp(1, n.max(1));
+    let r: Vec<Vec<(u32, T)>> = (0..nt)
+        .into_par_iter()
+        .with_min_len(1)
+        .with_max_len(1)
+        .map(|_| {
+            let mut v = Vec::new();
+            loop {
+                let i = next.fetch_add(1, Relaxed);
+                if i >= n {
+                    break;
+                }
+                let p = ord[i];
+                let x = slots[p as usize].lock().unwrap().take().unwrap();
+                v.push((p, f(p as usize, x)));
+            }
+            v
+        })
+        .collect();
+    let mut out: Vec<Option<T>> = (0..n).map(|_| None).collect();
+    for v in r {
+        for (p, t) in v {
+            out[p as usize] = Some(t);
+        }
+    }
+    out.into_iter().map(|x| x.unwrap()).collect()
+}
+
 // ---------- dense-index pipeline after the parse ----------
 // With dense event indices, the winners of each dense bucket are emitted in index order, which
 // is the generator's order: a person's events then mostly arrive as one run already sorted by
@@ -4865,57 +4903,55 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
     };
     // (filter misses by person bucket, their offsets, filter hits split by region: one list per
     // region, filled in line order during the filter pass, so no second pass over the hits)
-    let a: Vec<(Vec<E>, Vec<u32>, Vec<Vec<E>>)> = ev_out
-        .into_par_iter()
-        .enumerate()
-        .map(|(ci, c)| {
-            let mut tm = now();
-            let mb = mbase[ci] as usize;
-            let mut m = c.m;
-            let n = m.len();
-            let mut cnt = vec![0u32; PB + 1];
-            let mut h: Vec<Vec<E>> = (0..nr).map(|_| Vec::with_capacity(n / 2 / nr + 8)).collect();
-            for i in 0..n {
-                if i + RPD < n {
-                    mf.pf(m[i + RPD].key());
-                }
-                let g = mb + i;
-                let k = m[i].key();
-                if k != 0 && dead[g >> 6].load(Relaxed) & (1u64 << (g & 63)) == 0 {
-                    if mf.hit(k) {
-                        // SAFETY: reg(k) < nr = h.len()
-                        unsafe { h.get_unchecked_mut(reg(k)) }.push(m[i]);
-                        m[i].set_key(0);
-                    } else {
-                        cnt[pbk(k) + 1] += 1;
-                    }
-                } else {
+    // chunks and regions start largest first (lpt_map), results stay in chunk / region order
+    let ccost: Vec<u64> = ev_out.iter().map(|c| c.m.len() as u64).collect();
+    let a: Vec<(Vec<E>, Vec<u32>, Vec<Vec<E>>)> = lpt_map(ev_out, &ccost, |ci, c: EvChunk<E>| {
+        let mut tm = now();
+        let mb = mbase[ci] as usize;
+        let mut m = c.m;
+        let n = m.len();
+        let mut cnt = vec![0u32; PB + 1];
+        let mut h: Vec<Vec<E>> = (0..nr).map(|_| Vec::with_capacity(n / 2 / nr + 8)).collect();
+        for i in 0..n {
+            if i + RPD < n {
+                mf.pf(m[i + RPD].key());
+            }
+            let g = mb + i;
+            let k = m[i].key();
+            if k != 0 && dead[g >> 6].load(Relaxed) & (1u64 << (g & 63)) == 0 {
+                if mf.hit(k) {
+                    // SAFETY: reg(k) < nr = h.len()
+                    unsafe { h.get_unchecked_mut(reg(k)) }.push(m[i]);
                     m[i].set_key(0);
+                } else {
+                    cnt[pbk(k) + 1] += 1;
+                }
+            } else {
+                m[i].set_key(0);
+            }
+        }
+        pt(4, &mut tm);
+        for p in 0..PB {
+            cnt[p + 1] += cnt[p];
+        }
+        let tot = cnt[PB] as usize;
+        let mut out: Vec<E> = Vec::with_capacity(tot);
+        {
+            let mut w = cnt.clone();
+            let sp = out.spare_capacity_mut();
+            for e in &m {
+                let k = e.key();
+                if k != 0 {
+                    let p = pbk(k);
+                    sp[w[p] as usize].write(*e);
+                    w[p] += 1;
                 }
             }
-            pt(4, &mut tm);
-            for p in 0..PB {
-                cnt[p + 1] += cnt[p];
-            }
-            let tot = cnt[PB] as usize;
-            let mut out: Vec<E> = Vec::with_capacity(tot);
-            {
-                let mut w = cnt.clone();
-                let sp = out.spare_capacity_mut();
-                for e in &m {
-                    let k = e.key();
-                    if k != 0 {
-                        let p = pbk(k);
-                        sp[w[p] as usize].write(*e);
-                        w[p] += 1;
-                    }
-                }
-            }
-            unsafe { out.set_len(tot) };
-            pt(5, &mut tm);
-            (out, cnt, h)
-        })
-        .collect();
+        }
+        unsafe { out.set_len(tot) };
+        pt(5, &mut tm);
+        (out, cnt, h)
+    });
     // regroup the hit lists by region (chunk order kept inside a region)
     let mut a0: Vec<(Vec<E>, Vec<u32>)> = Vec::with_capacity(a.len() + nr);
     let mut regs: Vec<Vec<Vec<E>>> = (0..nr).map(|_| Vec::with_capacity(a.len())).collect();
@@ -4925,49 +4961,46 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
             regs[r].push(v);
         }
     }
-    let hp: Vec<(Vec<E>, Vec<u32>)> = regs
-        .into_par_iter()
-        .with_max_len(1)
-        .map(|mut rl| {
-            const PD: usize = 16;
-            let mut tm = now();
-            let mut cnt = vec![0u32; PB + 1];
-            // person keys set in place: same lookups as a line-by-line pass, with this region of
-            // the table in cache
-            for s in rl.iter_mut() {
-                let l = s.len();
-                for j in 0..l {
-                    if j + PD < l {
-                        tab.pf(s[j + PD].key());
-                    }
-                    let p = tab.get(s[j].key());
-                    s[j].set_key(p);
-                    cnt[pbk(p) + 1] += 1;
+    let rcost: Vec<u64> = regs.iter().map(|rl| rl.iter().map(|s| s.len() as u64).sum()).collect();
+    let hp: Vec<(Vec<E>, Vec<u32>)> = lpt_map(regs, &rcost, |_, mut rl: Vec<Vec<E>>| {
+        const PD: usize = 16;
+        let mut tm = now();
+        let mut cnt = vec![0u32; PB + 1];
+        // person keys set in place: same lookups as a line-by-line pass, with this region of
+        // the table in cache
+        for s in rl.iter_mut() {
+            let l = s.len();
+            for j in 0..l {
+                if j + PD < l {
+                    tab.pf(s[j + PD].key());
+                }
+                let p = tab.get(s[j].key());
+                s[j].set_key(p);
+                cnt[pbk(p) + 1] += 1;
+            }
+        }
+        pt(4, &mut tm);
+        for p in 0..PB {
+            cnt[p + 1] += cnt[p];
+        }
+        let tot = cnt[PB] as usize;
+        let mut out: Vec<E> = Vec::with_capacity(tot);
+        {
+            let mut w = cnt.clone();
+            let sp = out.spare_capacity_mut();
+            for s in &rl {
+                for e in s {
+                    let b = pbk(e.key());
+                    sp[w[b] as usize].write(*e);
+                    w[b] += 1;
                 }
             }
-            pt(4, &mut tm);
-            for p in 0..PB {
-                cnt[p + 1] += cnt[p];
-            }
-            let tot = cnt[PB] as usize;
-            let mut out: Vec<E> = Vec::with_capacity(tot);
-            {
-                let mut w = cnt.clone();
-                let sp = out.spare_capacity_mut();
-                for s in &rl {
-                    for e in s {
-                        let b = pbk(e.key());
-                        sp[w[b] as usize].write(*e);
-                        w[b] += 1;
-                    }
-                }
-            }
-            unsafe { out.set_len(tot) };
-            drop(rl);
-            pt(5, &mut tm);
-            (out, cnt)
-        })
-        .collect();
+        }
+        unsafe { out.set_len(tot) };
+        drop(rl);
+        pt(5, &mut tm);
+        (out, cnt)
+    });
     a0.extend(hp);
     a0
 }
