@@ -4018,6 +4018,23 @@ unsafe fn ts13(p: *const u8) -> Option<i64> {
     Some(((x & 0xFFFF_FFFF) * 100_000_000 + (x >> 32)) as i64)
 }
 
+/// `ts13` as (value, ok) with no branch: ok exactly when `ts13` gives Some (then the value is its).
+#[inline(always)]
+unsafe fn ts13v(p: *const u8) -> (i64, bool) {
+    use core::arch::x86_64::*;
+    let keep = _mm_setr_epi8(0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    let raw = _mm_loadu_si128(p.sub(3) as *const __m128i);
+    let v = _mm_and_si128(_mm_add_epi8(raw, _mm_set1_epi8(-(b'0' as i8))), keep);
+    let over = _mm_subs_epu8(v, _mm_set1_epi8(9));
+    let ok = _mm_testz_si128(over, over) != 0;
+    let a = _mm_maddubs_epi16(v, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1));
+    let b = _mm_madd_epi16(a, _mm_setr_epi16(100, 1, 100, 1, 100, 1, 100, 1));
+    let c = _mm_packus_epi32(b, b);
+    let d = _mm_madd_epi16(c, _mm_setr_epi16(10000, 1, 10000, 1, 10000, 1, 10000, 1));
+    let x = _mm_cvtsi128_si64(d) as u64;
+    (((x & 0xFFFF_FFFF) * 100_000_000 + (x >> 32)) as i64, ok)
+}
+
 /// Milliseconds of the 25 bytes "YYYY-MM-DDTHH:MM:SS+HH:MM" (or '-') at `p`, the same value as
 /// `ts_iso`; None means "use the general parser". `(ra, rb, rd)` is a valid date key and its day
 /// start. The 8 bytes "SS+HH:MM" get one range test per byte (',' sits between '+' and '-').
@@ -4176,7 +4193,20 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
                 if (nu == 0) | (np == 0) {
                     break 'v;
                 }
-                let t = if nt == 20 && unsafe { *pt.add(19) } == b'Z' {
+                // the two common forms (20-byte ISO with a cached day, 13 digits) without a
+                // length branch: both values are computed and one is picked; else the chain below
+                let (ta, tb) = unsafe { (ldp(pt), ldp(pt.add(3))) };
+                let e = &dct.ents[(tb.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize];
+                let same = (ta == ra) & (tb == rb);
+                let d20 = if same { rd } else { e.ds };
+                // SAFETY: as for ts13 below (the ids are not empty, and pt + 19 is readable)
+                let (v13, g13) = unsafe { ts13v(pt) };
+                let is20 = (nt == 20) & (unsafe { *pt.add(19) } == b'Z');
+                let ok = (is20 & hto & (same | ((e.a == ta) & (e.b == tb)))) | ((nt == 13) & g13);
+                let t = if ok {
+                    let m = -(is20 as i64);
+                    (((d20 + hts) * 1000) & m) | (v13 & !m)
+                } else if nt == 20 && unsafe { *pt.add(19) } == b'Z' {
                     // same date bytes as the ingest: same day start
                     let (ta, tb) = unsafe { (ldp(pt), ldp(pt.add(3))) };
                     let d = if (ta == ra) & (tb == rb) {
@@ -7578,6 +7608,9 @@ mod pack_simd_tests {
             // SAFETY: buf has 3 bytes before and 3 after the 13
             let got = unsafe { ts13(buf.as_ptr().add(3)) };
             assert_eq!(got, want, "{:?}", &buf[3..16]);
+            // SAFETY: as above
+            let (v, g) = unsafe { ts13v(buf.as_ptr().add(3)) };
+            assert_eq!(if g { Some(v) } else { None }, want, "{:?}", &buf[3..16]);
             ok += want.is_some() as u32;
         }
         assert!(ok > 100_000, "{ok}");
