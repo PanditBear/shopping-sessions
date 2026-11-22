@@ -3268,7 +3268,7 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
     cols
 }
 
-fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names, rev32: bool) {
+fn write_user_daily(io: &std::sync::mpsc::Sender<(std::path::PathBuf, Vec<u8>)>, path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names, rev32: bool) {
     let mut tm = now();
     const RG: usize = 1 << 20;
     let total: usize = groups.iter().map(|g| g.len()).sum();
@@ -3365,8 +3365,8 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names,
     f.out.extend_from_slice(&(t.b.len() as u32).to_le_bytes());
     f.out.extend_from_slice(b"PAR1");
     pt(12, &mut tm);
-    std::fs::write(path, &f.out).unwrap();
-    out_kick(path);
+    let _ = &mut tm;
+    io.send((path.to_path_buf(), std::mem::take(&mut f.out))).unwrap();
     pt(16, &mut tm);
 }
 
@@ -6585,14 +6585,35 @@ fn main() {
     // one revenue width for every file of the table, so all part files share a schema
     let rev32 = std::env::var_os("SHOP_REV64").is_none()
         && files.par_iter().all(|g| g.iter().all(|x| x.iter().all(|r| r.rev <= i32::MAX as u64)));
-    rayon::join(
-        || {
-            files.par_iter().enumerate().filter(|(i, g)| g.iter().any(|x| !x.is_empty()) || (*i == 0 && !any_rows)).for_each(|(i, g)| {
-                write_user_daily(&ud_dir.join(format!("part-{i}.parquet")), g, &cat_names, &names, rev32);
-            })
-        },
-        || write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows, &camp_names, &channels),
-    );
+    {
+        let (tx, rx) = std::sync::mpsc::channel::<(std::path::PathBuf, Vec<u8>)>();
+        let rx = std::sync::Mutex::new(rx);
+        std::thread::scope(|sc| {
+            for _ in 0..2 {
+                sc.spawn(|| loop {
+                    let m = rx.lock().unwrap().recv();
+                    match m {
+                        Ok((p, b)) => {
+                            let mut tm = now();
+                            std::fs::write(&p, &b).unwrap();
+                            out_kick(&p);
+                            pt(16, &mut tm);
+                        }
+                        Err(_) => break,
+                    }
+                });
+            }
+            rayon::join(
+                || {
+                    files.par_iter().enumerate().filter(|(i, g)| g.iter().any(|x| !x.is_empty()) || (*i == 0 && !any_rows)).for_each_with(tx.clone(), |tx, (i, g)| {
+                        write_user_daily(tx, &ud_dir.join(format!("part-{i}.parquet")), g, &cat_names, &names, rev32);
+                    });
+                },
+                || write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows, &camp_names, &channels),
+            );
+            drop(tx);
+        });
+    }
     tick("written");
     if timing {
         let v: Vec<String> = (0..PROF.len()).map(|i| format!("{}={:.2}", PROF_NAMES[i], PROF[i].load(Relaxed) as f64 / 1e9)).collect();
