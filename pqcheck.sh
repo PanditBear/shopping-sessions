@@ -6,7 +6,7 @@ set -euo pipefail
 EVENTS=${EVENTS:-3000000}; CLICKS=${CLICKS:-800000}; SEED=${SEED:-11}
 W=/tmp/pq; mkdir -p $W
 curl -sSfL -o $W/gen.zip https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
-echo "13724cadbac5a99d847e27cea911cd2e338ff972b46c2039da87452011bb101e  $W/gen.zip" | sha256sum -c --quiet
+echo "78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a  $W/gen.zip" | sha256sum -c --quiet
 (cd $W && unzip -q -o gen.zip && cd generator && cargo build --release -q)
 G=$(find $W -path '*release/generate' -type f | head -1)
 $G --seed $SEED --events $EVENTS --clicks $CLICKS --output $W/data --threads 4 >/dev/null
