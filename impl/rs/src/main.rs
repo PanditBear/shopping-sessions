@@ -71,7 +71,7 @@ fn ebb() -> u32 {
 /// event_id bucket bits for `bytes` of event files: EBB up to ~24M lines (88 bytes a line), above
 /// that the fewest bits that keep a bucket at most EBP lines
 fn ebb_for(bytes: usize) -> u32 {
-    const EBP: usize = 83_000;
+    const EBP: usize = 166_000;
     let est = bytes / 88;
     if est <= 24_000_000 {
         return EBB;
