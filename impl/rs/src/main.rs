@@ -4911,6 +4911,7 @@ fn lpt_map<I: Send, T: Send>(items: Vec<I>, cost: &[u64], f: impl Fn(usize, I) -
 fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU64], tab: &IdTab, mf: &MoverF) -> Vec<(Vec<E>, Vec<u32>)> {
     let rb = (tab.s.len() >> 16).clamp(1, 512).trailing_zeros();
     let nr = 1usize << rb;
+    assert!(dead.len() * 64 >= *mbase.last().unwrap() as usize);
     let reg = move |k: u64| -> usize {
         if rb == 0 {
             0
@@ -4955,7 +4956,10 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
                 }
                 let g = mb + i;
                 let k = m[i].key();
-                let live = (k != 0) & (dead[g >> 6].load(Relaxed) & (1u64 << (g & 63)) == 0);
+                debug_assert!(g >> 6 < dead.len());
+                // SAFETY: g < the total line count (asserted at the top) and dead has a word per 64 lines
+                let dw = unsafe { dead.get_unchecked(g >> 6) };
+                let live = (k != 0) & (dw.load(Relaxed) & (1u64 << (g & 63)) == 0);
                 let hit = MoverF::hit_h(mw, mmask, h);
                 let keep = live & !hit;
                 let p = pbk_h(h);
