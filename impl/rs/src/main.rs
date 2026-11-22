@@ -3135,7 +3135,7 @@ fn int_col(f: &mut Pqf, c: &mut Cm, rows: &[&[UD]], n: usize, get: impl Fn(&UD) 
 }
 
 /// Writes one row group of `rows` (a list of row runs, n rows in all); returns its column chunks.
-fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names, rev32: bool) -> Vec<Cm> {
+fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names, rev32: bool, zm: u32) -> Vec<Cm> {
     let mut t3 = now();
     // pass 1: ranges and counts
     let (mut dlo, mut dhi) = (i64::MAX, i64::MIN);
@@ -3168,7 +3168,6 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
     ];
     // which chunks to compress, bit i = column i. Default revenue_cents only: mostly zeros, so zstd
     // shrinks it about 7x for almost no work; the other chunks are already dictionary/bit-packed
-    let zm: u32 = std::env::var("SHOP_ZCOLS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
     for (i, c) in cols.iter_mut().enumerate() {
         c.z = (zm >> i) & 1 == 1;
     }
@@ -3268,8 +3267,59 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
     cols
 }
 
+// ---- SHOP_ZAUTO: user_daily chunk compression follows the output disk ----
+// Default plain (mask 16). The first out_kick that takes longer than the threshold (slow disk: bytes are the
+// cost) sets ZA_SLOW; every file that has not started encoding by then is compressed (mask 25). Monotone.
+// SHOP_ZAUTO=on (default) adaptive; =plain all plain; =zstd all compressed. SHOP_ZCOLS overrides everything.
+// SHOP_ZAUTO_MS overrides the threshold (default 6 ms).
+static ZA_SLOW: AtomicBool = AtomicBool::new(false);
+static ZA_NEXT: AtomicU64 = AtomicU64::new(0); // kicks completed
+static ZA_FIRST: AtomicU64 = AtomicU64::new(u64::MAX); // index of the first slow kick
+static ZA_K: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16]; // microseconds, by completion order
+static ZA_NZ: AtomicU64 = AtomicU64::new(0);
+
+fn za_mask() -> u32 {
+    if let Some(m) = std::env::var("SHOP_ZCOLS").ok().and_then(|v| v.parse().ok()) {
+        return m;
+    }
+    let z = match std::env::var("SHOP_ZAUTO").as_deref() {
+        Ok("zstd") => true,
+        Ok("plain") => false,
+        _ => ZA_SLOW.load(std::sync::atomic::Ordering::Acquire),
+    };
+    if z {
+        ZA_NZ.fetch_add(1, Relaxed);
+    }
+    if z { 25 } else { 16 }
+}
+
+fn za_kick(us: u64) {
+    let i = ZA_NEXT.fetch_add(1, Relaxed) as usize;
+    if i < 16 {
+        ZA_K[i].store(us, Relaxed);
+    }
+    let ms: u64 = std::env::var("SHOP_ZAUTO_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+    if us >= ms * 1000 {
+        ZA_FIRST.fetch_min(i as u64, Relaxed);
+        ZA_SLOW.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn za_line() -> String {
+    let k: Vec<String> = ZA_K.iter().map(|k| format!("{:.2}", k.load(Relaxed) as f64 / 1e3)).collect();
+    let f = ZA_FIRST.load(Relaxed);
+    let mode = std::env::var("SHOP_ZAUTO").unwrap_or_else(|_| "on".into());
+    format!(
+        "zauto mode={mode} k={} first_slow={} nz={}/16",
+        k.join(","),
+        if f == u64::MAX { "none".to_string() } else { f.to_string() },
+        ZA_NZ.load(Relaxed)
+    )
+}
+
 fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names, rev32: bool) {
     let mut tm = now();
+    let zm = za_mask();
     const RG: usize = 1 << 20;
     let total: usize = groups.iter().map(|g| g.len()).sum();
     let mut f = Pqf::new(total * 6 + 4096);
@@ -3285,14 +3335,14 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names,
             n += k;
             s = &s[k..];
             if n == RG {
-                rgs.push((ud_row_group(&mut f, &cur, n, cats, names, rev32), n));
+                rgs.push((ud_row_group(&mut f, &cur, n, cats, names, rev32, zm), n));
                 cur.clear();
                 n = 0;
             }
         }
     }
     if n > 0 {
-        rgs.push((ud_row_group(&mut f, &cur, n, cats, names, rev32), n));
+        rgs.push((ud_row_group(&mut f, &cur, n, cats, names, rev32, zm), n));
     }
     // footer (FileMetaData)
     let mut t = Tc::new();
@@ -3366,7 +3416,9 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names,
     f.out.extend_from_slice(b"PAR1");
     pt(12, &mut tm);
     std::fs::write(path, &f.out).unwrap();
+    let k0 = std::time::Instant::now();
     out_kick(path);
+    za_kick(k0.elapsed().as_micros() as u64);
     pt(16, &mut tm);
 }
 
@@ -6595,6 +6647,7 @@ fn main() {
     );
     tick("written");
     if timing {
+        eprintln!("{}", za_line());
         let v: Vec<String> = (0..PROF.len()).map(|i| format!("{}={:.2}", PROF_NAMES[i], PROF[i].load(Relaxed) as f64 / 1e9)).collect();
         eprintln!("prof(cpu s): {}", v.join(" "));
     }
