@@ -1921,25 +1921,6 @@ impl<T: Copy> Slots<T> {
     }
 }
 
-/// Where the event parse puts a line's dedup record.
-trait DSink {
-    fn push(&mut self, r: DRec);
-}
-impl DSink for Vec<DRec> {
-    #[inline(always)]
-    fn push(&mut self, r: DRec) {
-        Vec::push(self, r)
-    }
-}
-/// dedup records straight into their event_id bucket (`EB` buckets)
-struct DSlots(Slots<DRec>);
-impl DSink for DSlots {
-    #[inline(always)]
-    fn push(&mut self, r: DRec) {
-        self.0.push((mix(r.eid) >> (64 - EBB)) as usize, r)
-    }
-}
-
 /// `bucketize` when the bucket counts are already known: `cnt[b + 1]` = the number of items in
 /// bucket `b` (`cnt[0]` = 0); returns (vec ordered by bucket, offsets[nb+1]).
 fn scatter_counted<T: Copy>(v: &[T], mut cnt: Vec<u32>, bk: impl Fn(&T) -> usize) -> (Vec<T>, Vec<u32>) {
@@ -3249,7 +3230,7 @@ struct EvCtx<'a> {
 /// the line is invalid) and a dedup entry: packed event_id in `d`, others in `fb`; ingest times
 /// with an inexact key go to `side`. User ids with no packed key are noted in `fbn`.
 #[inline(never)]
-fn parse_events<E: Ev, D: DSink>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut D, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>) {
+fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>) {
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
     let c0 = c.as_ptr() as usize;
@@ -3315,7 +3296,7 @@ fn parse_events<E: Ev, D: DSink>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut D, fb
 /// `parse_events_sol` go through it).
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn ev_line<E: Ev, D: DSink>(f: &[B; 7], cx: &EvCtx, c0: usize, tci: &mut TsCache, tct: &mut TsCache, m: &mut Vec<E>, d: &mut D, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
+fn ev_line<E: Ev>(f: &[B; 7], cx: &EvCtx, c0: usize, tci: &mut TsCache, tct: &mut TsCache, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
     let &[eid, uid, ts, ing, et, pr, price] = f;
     if eid.is_empty() {
         return;
@@ -3369,7 +3350,7 @@ fn ev_line<E: Ev, D: DSink>(f: &[B; 7], cx: &EvCtx, c0: usize, tci: &mut TsCache
 /// An event_id that pack6 rejects: its record goes to the hash buckets with key hash | HBIT (pack6 keys
 /// keep bits 63..60 clear), and its bytes stay in `fb` (in loc order) for the exact compare on key matches.
 #[inline(never)]
-fn fb_put<D: DSink>(rs: &RandomState, d: &mut D, fb: &mut Vec<(u64, i64, u32)>, eid: B, ingest: i64, ik: u32, loc: u32) {
+fn fb_put(rs: &RandomState, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, eid: B, ingest: i64, ik: u32, loc: u32) {
     d.push(DRec { eid: rs.hash_one(eid) | HBIT, ing: ik, loc });
     fb.push((pack(eid), ingest, loc));
 }
@@ -3689,7 +3670,7 @@ unsafe fn ts25h(p: *const u8, ra: u64, rb: u64, rd: i64, c: &mut DayCache, hs: i
 /// as pointer and length, both ids packed in one vector, ISO times straight to seconds.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
 #[inline(never)]
-fn parse_events_sol<E: Ev, D: DSink>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut D, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
+fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
     use core::arch::x86_64::_bzhi_u64;
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
@@ -3875,7 +3856,7 @@ fn parse_events_sol<E: Ev, D: DSink>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut D
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
-fn parse_events_sol<E: Ev, D: DSink>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut D, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
+fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
     let c0 = c.as_ptr() as usize;
@@ -5220,8 +5201,7 @@ fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
     let mut dz = Dz::new(idx_cfg(), c.len());
     let cap = if dz.on { c.len() / 4096 } else { c.len() / 64 };
     let mut m: Vec<E> = Vec::with_capacity(cap);
-    // records go to their event_id bucket as they are produced (no second pass over them)
-    let mut d = DSlots(Slots::new(EB, if dz.on { 2 } else { slot_len(c.len() / (64 * EB) + 16) }));
+    let mut d: Vec<DRec> = Vec::with_capacity(cap);
     let (mut fb, mut fbn, mut side) = (vec![], vec![], vec![]);
     let mut tm = now();
     static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -5231,7 +5211,7 @@ fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
         parse_events_sol(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side, &mut dz);
     }
     pt(0, &mut tm);
-    let (d, doff) = d.0.finish();
+    let (d, doff) = bucketize(&d, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize);
     dz.finish();
     pt(1, &mut tm);
     EvChunk { m, d, doff, dz, fb, fbn, side }
