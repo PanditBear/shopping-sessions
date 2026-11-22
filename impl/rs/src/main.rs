@@ -46,8 +46,7 @@ const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 1_800_000;
 const CHUNK: usize = 4 << 20;
-const EBB: u32 = 11;
-const EB: usize = 1 << EBB; // event dedup buckets (by event_id)
+const EBB: u32 = 11; // event dedup buckets (by event_id): 1 << ebb(), at least 1 << EBB
 const DDG: usize = 4; // event_id buckets per dedup task
 const PBB: u32 = 10;
 const PB: usize = 1 << PBB; // person buckets
@@ -62,7 +61,26 @@ fn mix(k: u64) -> u64 {
     k ^ (k >> 29)
 }
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
+/// log2 of the event_id bucket count, set once from the event bytes before any chunk is parsed
+static EBB_RT: AtomicU32 = AtomicU32::new(EBB);
+#[inline(always)]
+fn ebb() -> u32 {
+    EBB_RT.load(Relaxed)
+}
+/// event_id bucket bits for `bytes` of event files: EBB up to ~24M lines (88 bytes a line), above
+/// that the fewest bits that keep a bucket at most EBP lines, so one dedup table stays L2-sized
+fn ebb_for(bytes: usize) -> u32 {
+    const EBP: usize = 20_700;
+    let est = bytes / 88;
+    let mut b = EBB;
+    if est > 24_000_000 {
+        while b < 15 && est >> b > EBP {
+            b += 1;
+        }
+    }
+    b
+}
 static TIMING: AtomicBool = AtomicBool::new(false);
 static PROF: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
 const PROF_NAMES: [&str; 17] =
@@ -3607,7 +3625,7 @@ impl DX {
     }
 }
 
-/// hash of a Hex event id: the top EBB bits pick its bucket, bits 8.. its first table slot
+/// hash of a Hex event id: the top ebb() bits pick its bucket, bits 8.. its first table slot
 #[inline(always)]
 fn dx_hash(r: &DX) -> u64 {
     mix(r.hi.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ r.lo ^ ((r.lp >> 26) as u64) << 58)
@@ -4520,7 +4538,7 @@ fn ev_after<E: Ev>(
                         })
                     },
                     || {
-                (0..EB / DDG).into_par_iter().for_each(|g| {
+                (0..(1usize << ebb()) / DDG).into_par_iter().for_each(|g| {
                     let mut tm = now();
                     let totals: [usize; DDG] = std::array::from_fn(|i| {
                         ev_out.iter().map(|c| (c.doff[ndb + g * DDG + i + 1] - c.doff[ndb + g * DDG + i]) as usize).sum()
@@ -5370,7 +5388,7 @@ fn ev_after_idx<E: Ev>(
             },
             || {
                 // every other event_id: hash buckets by packed id, then exact bytes for the rest
-                let hb: Vec<Vec<E>> = (0..EB / DDG)
+                let hb: Vec<Vec<E>> = (0..(1usize << ebb()) / DDG)
                     .into_par_iter()
                     .map(|g| {
                         let mut tm = now();
@@ -5931,8 +5949,9 @@ fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
         }
     }
     pt(0, &mut tm);
-    let (d, doff) = bucketize(&d, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize);
-    let (dx, dxoff) = bucketize(&fb.x, EB, |r| (dx_hash(r) >> (64 - EBB)) as usize);
+    let eb = ebb();
+    let (d, doff) = bucketize(&d, 1 << eb, |r| (mix(r.eid) >> (64 - eb)) as usize);
+    let (dx, dxoff) = bucketize(&fb.x, 1 << eb, |r| (dx_hash(r) >> (64 - eb)) as usize);
     fb.x = Vec::new();
     dz.finish();
     pt(1, &mut tm);
@@ -6096,6 +6115,8 @@ fn main() {
     let ev_setup = std::thread::spawn(move || {
         let ev_files = csv_files(&ev_dir);
         let ev_chunks = all_chunks(&ev_files, ev_chunk(&ev_files));
+        let eb = std::env::var("SHOP_EBB").ok().and_then(|s| s.parse::<u32>().ok()).map(|b| b.clamp(2, 20));
+        EBB_RT.store(eb.unwrap_or_else(|| ebb_for(ev_files.iter().map(|f| f.len()).sum())), Relaxed);
         let _ = IDXC.set(idx_find(&ev_files, &ev_chunks));
         let _ = UKEYC.set(idx_cfg().and_then(|c| ukey_find(&ev_chunks, c.key)));
         ev_chunks
