@@ -4058,6 +4058,7 @@ struct SsW<E: Ev> {
     tmp_s: Vec<E::S>,
     runs: Vec<Run>,
     srt: Vec<SRun>,
+    srt2: Vec<SRun>,
     cnt: Vec<u32>,
     cl: Vec<ClickRec>,
     ctmp: Vec<ClickRec>,
@@ -4075,6 +4076,7 @@ impl<E: Ev> SsW<E> {
             tmp_s: vec![],
             runs: vec![],
             srt: vec![],
+            srt2: vec![],
             cnt: vec![],
             cl: vec![],
             ctmp: vec![],
@@ -4130,7 +4132,7 @@ impl<E: Ev> SsW<E> {
             }
         }
         pt(6, &mut tm);
-        srt.sort_unstable_by_key(|r| (r.d, r.k, r.src));
+        sort_sruns(srt, &mut self.srt2);
         pt(7, &mut tm);
         let nd = dparts.len();
         let src = |r: &SRun| -> *const u8 {
@@ -4202,6 +4204,58 @@ impl RunD {
     #[inline(always)]
     fn new(k: u64, off: usize, len: usize, ok: bool) -> Self {
         RunD { k, off: off as u32, lk: Self::lk(len, ok) }
+    }
+}
+
+/// Orders descriptors by (d, k, src): two stable counting passes on the NBK-bit digit (low 7
+/// bits, then the rest), then the rare equal-digit groups by (k, src).
+fn sort_sruns(a: &mut Vec<SRun>, b: &mut Vec<SRun>) {
+    let n = a.len();
+    if n < 48 {
+        isort_by(a, |x, y| (x.d, x.k, x.src) < (y.d, y.k, y.src));
+        return;
+    }
+    const LO: u32 = 7;
+    let hb = 1usize << (NBK - LO);
+    let mut c1 = [0u32; 128];
+    let mut c2 = vec![0u32; hb];
+    for r in a.iter() {
+        c1[(r.d & 127) as usize] += 1;
+        c2[(r.d >> LO) as usize] += 1;
+    }
+    let (mut s1, mut s2) = (0u32, 0u32);
+    for c in c1.iter_mut() {
+        let t = *c;
+        *c = s1;
+        s1 += t;
+    }
+    for c in c2.iter_mut() {
+        let t = *c;
+        *c = s2;
+        s2 += t;
+    }
+    b.clear();
+    b.resize(n, a[0]);
+    for r in a.iter() {
+        let c = &mut c1[(r.d & 127) as usize];
+        b[*c as usize] = *r;
+        *c += 1;
+    }
+    for r in b.iter() {
+        let c = &mut c2[(r.d >> LO) as usize];
+        a[*c as usize] = *r;
+        *c += 1;
+    }
+    let mut i = 0;
+    while i < n {
+        let mut j = i + 1;
+        while j < n && a[j].d == a[i].d {
+            j += 1;
+        }
+        if j - i > 1 {
+            isort_by(&mut a[i..j], |x, y| (x.k, x.src) < (y.k, y.src));
+        }
+        i = j;
     }
 }
 
