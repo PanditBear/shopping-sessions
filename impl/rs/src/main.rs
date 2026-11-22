@@ -3477,7 +3477,7 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
 /// `parse_events_sol` go through it).
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn ev_line<E: Ev>(f: &[B; 7], cx: &EvCtx, c0: usize, tci: &mut TsCache, tct: &mut TsCache, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Fb, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
+fn ev_line<E: Ev, O: EvOut<E>>(f: &[B; 7], cx: &EvCtx, c0: usize, tci: &mut TsCache, tct: &mut TsCache, snk: &mut O, fb: &mut Fb, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
     let &[eid, uid, ts, ing, et, pr, price] = f;
     if eid.is_empty() {
         return;
@@ -3517,14 +3517,64 @@ fn ev_line<E: Ev>(f: &[B; 7], cx: &EvCtx, c0: usize, tci: &mut TsCache, tct: &mu
         dz.put(i, ik, r, exact, ingest);
         return;
     }
-    let loc = m.len() as u32;
-    m.push(r);
+    let loc = snk.loc();
     if !exact {
         side.push((loc, ingest));
     }
     match k6 {
-        Some(k) => d.push(DRec { eid: k, ing: ik, loc }),
-        None => fb_put(cx.rs, d, fb, eid, ingest, ik, loc),
+        Some(k) => snk.put(k, ik, r),
+        None => fb_put_o(snk, cx.rs, fb, eid, ingest, ik, r, loc),
+    }
+}
+
+/// `fb_put` through a sink: a Hex id goes to `put_hex`, any other non-Short id to `put_oth`.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn fb_put_o<E: Ev, O: EvOut<E>>(snk: &mut O, rs: &RandomState, fb: &mut Fb, eid: B, ingest: i64, ik: u32, r: E, loc: u32) {
+    if let Some((hk, full)) = hex_full(eid) {
+        if loc <= DX_LOC {
+            snk.put_hex(hk, full, ik, r, fb);
+            return;
+        }
+    }
+    snk.put_oth(rs, eid, ingest, ik, r, fb);
+}
+
+/// Where the event parse writes each line's record (the store sites call only these four).
+/// `loc()` is the index the next record gets in its chunk; `put` stores a Short-id line (key `eid`),
+/// `put_hex` a Hex-id line (key `hk` = hex_key, digits `full`), `put_oth` any other line (its id bytes).
+/// Each call stores exactly one record and advances `loc()` by one.
+trait EvOut<E: Ev> {
+    fn loc(&self) -> u32;
+    fn put(&mut self, eid: u64, ik: u32, r: E);
+    fn put_hex(&mut self, hk: u64, full: u128, ik: u32, r: E, fb: &mut Fb);
+    fn put_oth(&mut self, rs: &RandomState, eid: B, ingest: i64, ik: u32, r: E, fb: &mut Fb);
+}
+
+/// The classic sink: records in `m`, dedup keys in `d` (loc = index in m), side data in `fb`.
+struct Md<'a, E>(&'a mut Vec<E>, &'a mut Vec<DRec>);
+impl<E: Ev> EvOut<E> for Md<'_, E> {
+    #[inline(always)]
+    fn loc(&self) -> u32 {
+        self.0.len() as u32
+    }
+    #[inline(always)]
+    fn put(&mut self, eid: u64, ik: u32, r: E) {
+        let loc = self.0.len() as u32;
+        self.0.push(r);
+        self.1.push(DRec { eid, ing: ik, loc });
+    }
+    #[inline(always)]
+    fn put_hex(&mut self, hk: u64, full: u128, ik: u32, r: E, fb: &mut Fb) {
+        let loc = self.0.len() as u32;
+        self.0.push(r);
+        fb.x.push(DX::new(full, (hk >> 56) as u8 & 63, ik, loc));
+    }
+    #[inline(always)]
+    fn put_oth(&mut self, rs: &RandomState, eid: B, ingest: i64, ik: u32, r: E, fb: &mut Fb) {
+        let loc = self.0.len() as u32;
+        self.0.push(r);
+        fb_put_other(rs, self.1, fb, eid, ingest, ik, loc);
     }
 }
 
@@ -4059,7 +4109,7 @@ unsafe fn ts25h(p: *const u8, ra: u64, rb: u64, rd: i64, c: &mut DayCache, hs: i
 /// as pointer and length, both ids packed in one vector, ISO times straight to seconds.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
 #[inline(never)]
-fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Fb, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
+fn parse_events_sol<E: Ev, O: EvOut<E>>(c: B, cx: &EvCtx, snk: &mut O, fb: &mut Fb, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
     use core::arch::x86_64::_bzhi_u64;
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
@@ -4231,8 +4281,7 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
                     continue 'ln;
                 }
             }
-            let loc = m.len() as u32;
-            m.push(r);
+            let loc = snk.loc();
             if !iex {
                 side.push((loc, ingest));
             }
@@ -4240,31 +4289,31 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
             // idk_x reads the 33 id bytes themselves
             let (ke, full, cls) = unsafe { idk_x(pe, ne) };
             if cls == 0 {
-                d.push(DRec { eid: ke, ing: ik, loc });
+                snk.put(ke, ik, r);
             } else if cls == 1 && loc <= DX_LOC {
-                fb.x.push(DX::new(full, (ke >> 56) as u8 & 63, ik, loc));
+                snk.put_hex(ke, full, ik, r, fb);
             } else {
-                fb_put_other(cx.rs, d, fb, sl(pe, ne), ingest, ik, loc);
+                snk.put_oth(cx.rs, sl(pe, ne), ingest, ik, r, fb);
             }
             continue 'ln;
         }
         sbuf.clear();
         pos = scan7_line(c, pos, &mut sbuf);
         for f in &sbuf {
-            ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side, dz);
+            ev_line(f, cx, c0, &mut tci, &mut tct, snk, fb, fbn, side, dz);
         }
     }
     if pos < len {
-        scan::<7>(&c[pos..], |f| ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side, dz));
+        scan::<7>(&c[pos..], |f| ev_line(f, cx, c0, &mut tci, &mut tct, snk, fb, fbn, side, dz));
     }
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
-fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Fb, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
+fn parse_events_sol<E: Ev, O: EvOut<E>>(c: B, cx: &EvCtx, snk: &mut O, fb: &mut Fb, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
     let c0 = c.as_ptr() as usize;
-    scan::<7>(c, |f| ev_line(f, cx, c0, &mut tci, &mut tct, m, d, fb, fbn, side, dz));
+    scan::<7>(c, |f| ev_line(f, cx, c0, &mut tci, &mut tct, snk, fb, fbn, side, dz));
 }
 
 /// Output buffers of one event-parse call.
@@ -4332,7 +4381,7 @@ fn sol_bench<E: Ev>(ev_chunks: &[B], cx: &EvCtx) {
             };
             let new = |b: &mut EvBufs<E>| {
                 let t = std::time::Instant::now();
-                parse_events_sol(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side, &mut Dz::off());
+                parse_events_sol(c, cx, &mut Md(&mut b.m, &mut b.d), &mut b.fb, &mut b.fbn, &mut b.side, &mut Dz::off());
                 t.elapsed().as_secs_f64()
             };
             if i % 2 == 0 {
@@ -4369,6 +4418,10 @@ struct EvChunk<E> {
     dxoff: Vec<u32>,
     fbn: Vec<(u64, u64)>,
     side: Vec<(u32, i64)>,
+    /// lines stored through the sink (F5: the chunk's loc count)
+    n: u32,
+    /// F5 only, first chunk: every thread's partitioned records
+    f5: Option<Box<F5All<E>>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4386,6 +4439,10 @@ fn ev_after<E: Ev>(
 ) -> Vec<(Vec<Vec<UD>>, CampAcc)> {
     if let Some(cfg) = idx_cfg() {
         return ev_after_idx(ev_out, tab, mf, click_out, ws, we, ncamp, d0, nd, tick, cfg);
+    }
+    let parts = 'p: {
+    if ev_out.first().is_some_and(|c| c.f5.is_some()) {
+        break 'p f5_dedup(ev_out, tab, mf, ws);
     }
     // dedup on event_id: every line has a global index (chunk base + its index in the chunk);
     // each event_id's losers are marked in the dead bitmap. Each task takes DDG consecutive
@@ -4535,6 +4592,8 @@ fn ev_after<E: Ev>(
     }
     let parts = resolve_parts(ev_out, &mbase, &dead, tab, mf);
     drop(dead);
+    parts
+    };
     tick("dedup done");
 
     let offs: Vec<&[u32]> = parts.iter().map(|x| &x.1[..]).collect();
@@ -4887,7 +4946,13 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
             (out, cnt, h)
         })
         .collect();
-    // regroup the hit lists by region (chunk order kept inside a region)
+    resolve_regroup(a, nr, tab)
+}
+
+/// The tail of `resolve_parts`: the filter hits of every part, regrouped by region, get their
+/// person keys region by region and become more parts (grouped by person bucket).
+fn resolve_regroup<E: Ev>(a: Vec<(Vec<E>, Vec<u32>, Vec<Vec<E>>)>, nr: usize, tab: &IdTab) -> Vec<(Vec<E>, Vec<u32>)> {
+    // regroup the hit lists by region (part order kept inside a region)
     let mut a0: Vec<(Vec<E>, Vec<u32>)> = Vec::with_capacity(a.len() + nr);
     let mut regs: Vec<Vec<Vec<E>>> = (0..nr).map(|_| Vec::with_capacity(a.len())).collect();
     for (out, cnt, h) in a {
@@ -5722,7 +5787,7 @@ fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
     if *OLD.get_or_init(|| std::env::var_os("SHOP_EVOLD").is_some()) {
         parse_events(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side);
     } else {
-        parse_events_sol(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side, &mut dz);
+        parse_events_sol(c, cx, &mut Md(&mut m, &mut d), &mut fb, &mut fbn, &mut side, &mut dz);
     }
     pt(0, &mut tm);
     let (d, doff) = bucketize(&d, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize);
@@ -5730,11 +5795,385 @@ fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
     fb.x = Vec::new();
     dz.finish();
     pt(1, &mut tm);
-    EvChunk { m, d, doff, dz, fb, dx, dxoff, fbn, side }
+    let n = m.len() as u32;
+    EvChunk { m, d, doff, dz, fb, dx, dxoff, fbn, side, n, f5: None }
 }
 
 fn ev_parse<E: Ev>(ev_chunks: &[B], cx: &EvCtx) -> Vec<EvChunk<E>> {
+    if idx_cfg().is_none() && f5_env() {
+        if let Some(v) = ev_parse_f5(ev_chunks, cx) {
+            return v;
+        }
+    }
     ev_chunks.par_iter().map(|&c| ev_chunk_parse(c, cx)).collect()
+}
+
+
+// ---- F5: the event parse writes each line's dedup record straight into hash partitions ----
+// A record is ER {eid key, ingest key, gk = chunk << F5LB | loc, the line's E}; partition
+// mix(eid) >> (64 - F5PB). Each rayon thread owns one TS (blocks of F5BLK rows carved from slabs),
+// so the parse needs no m / d staging and no bucketize pass. Dedup then takes a few partitions per
+// task: a seen-twice bitmap sends ids met once straight to the survivors, only the rest go
+// through the exact table.
+const F5PB: u32 = 10;
+const F5P: usize = 1 << F5PB;
+const F5BLK: usize = 512;
+const F5SLAB: usize = 1 << 16;
+const F5LB: u32 = 22;
+const F5LM: u32 = (1 << F5LB) - 1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ER<E> {
+    eid: u64,
+    ing: u32,
+    gk: u32,
+    e: E,
+}
+
+/// One thread's partitioned records: per partition (next free row, end of its current block),
+/// the start of every block it owns (all full except the last), and the slabs the blocks come from.
+struct TS<E> {
+    ce: Vec<(*mut ER<E>, *mut ER<E>)>,
+    blk: Vec<Vec<*mut ER<E>>>,
+    slabs: Vec<Vec<ER<E>>>,
+    sf: *mut ER<E>,
+    se: *mut ER<E>,
+}
+// SAFETY: the pointers only point into `slabs`, owned by the TS; rows are written by the owning
+// thread during the parse and only read (shared) afterwards
+unsafe impl<E: Send> Send for TS<E> {}
+unsafe impl<E: Sync> Sync for TS<E> {}
+
+impl<E: Ev> TS<E> {
+    fn new() -> Self {
+        let z = std::ptr::null_mut();
+        TS { ce: vec![(z, z); F5P], blk: (0..F5P).map(|_| Vec::new()).collect(), slabs: vec![], sf: z, se: z }
+    }
+    #[inline(always)]
+    fn put(&mut self, eid: u64, ing: u32, gk: u32, e: E) {
+        let p = (mix(eid) >> (64 - F5PB)) as usize;
+        // SAFETY: p < F5P = ce.len(); a full block gets a fresh one first, so c.0 < c.1 at the write
+        unsafe {
+            if self.ce.get_unchecked(p).0 == self.ce.get_unchecked(p).1 {
+                self.grow(p);
+            }
+            let c = self.ce.get_unchecked_mut(p);
+            c.0.write(ER { eid, ing, gk, e });
+            c.0 = c.0.add(1);
+        }
+    }
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, p: usize) {
+        if self.sf == self.se {
+            let mut v: Vec<ER<E>> = Vec::with_capacity(F5SLAB);
+            self.sf = v.as_mut_ptr();
+            // SAFETY: the slab holds F5SLAB rows
+            self.se = unsafe { self.sf.add(F5SLAB) };
+            self.slabs.push(v);
+        }
+        let b = self.sf;
+        // SAFETY: F5SLAB is a multiple of F5BLK, so a slab is cut into whole blocks
+        unsafe {
+            self.sf = b.add(F5BLK);
+            self.ce[p] = (b, b.add(F5BLK));
+        }
+        self.blk[p].push(b);
+    }
+    fn count(&self, p: usize) -> usize {
+        match self.blk[p].last() {
+            None => 0,
+            Some(&b) => (self.blk[p].len() - 1) * F5BLK + (self.ce[p].0 as usize - b as usize) / std::mem::size_of::<ER<E>>(),
+        }
+    }
+    /// partition p's rows, block by block
+    fn rows(&self, p: usize) -> impl Iterator<Item = &[ER<E>]> + '_ {
+        let bl = &self.blk[p];
+        let n = bl.len();
+        let cur = self.ce[p].0 as usize;
+        bl.iter().enumerate().map(move |(i, &b)| {
+            let len = if i + 1 == n { (cur - b as usize) / std::mem::size_of::<ER<E>>() } else { F5BLK };
+            // SAFETY: the first len rows of block b were written by put
+            unsafe { std::slice::from_raw_parts(b, len) }
+        })
+    }
+}
+
+/// Every thread's TS after the parse (kept in the first chunk's EvChunk).
+struct F5All<E> {
+    ts: Vec<TS<E>>,
+}
+
+/// The F5 sink of one chunk: records go to the thread's TS with gk = gb | loc. Hex digits stay in
+/// `fb.x` (lp = loc), Other id bytes in `fb.v` (loc), both in loc order, for the exact compare.
+/// Keys by class: Short = pack6 (no HBIT), Other = hash | HBIT without bit 62, Hex = hex_key (HBIT
+/// and bit 62) & hm (hm truncates the key under SHOP_HXCOL to force collisions; debug only).
+struct F5S<'a, E> {
+    ts: &'a mut TS<E>,
+    gb: u32,
+    n: u32,
+    hm: u64,
+}
+impl<E: Ev> EvOut<E> for F5S<'_, E> {
+    #[inline(always)]
+    fn loc(&self) -> u32 {
+        self.n
+    }
+    #[inline(always)]
+    fn put(&mut self, eid: u64, ik: u32, r: E) {
+        self.ts.put(eid, ik, self.gb | (self.n & F5LM), r);
+        self.n += 1;
+    }
+    #[inline(always)]
+    fn put_hex(&mut self, hk: u64, full: u128, ik: u32, r: E, fb: &mut Fb) {
+        fb.x.push(DX::new(full, (hk >> 56) as u8 & 63, ik, self.n & DX_LOC));
+        self.put(hk & self.hm, ik, r);
+    }
+    #[inline(always)]
+    fn put_oth(&mut self, rs: &RandomState, eid: B, ingest: i64, ik: u32, r: E, fb: &mut Fb) {
+        fb.v.push((pack(eid), ingest, self.n));
+        self.put((rs.hash_one(eid) | HBIT) & !(1 << 62), ik, r);
+    }
+}
+
+fn f5_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SHOP_EVOLD").is_none() && std::env::var("SHOP_F5").map_or(true, |v| v != "0"))
+}
+
+fn env_usize(k: &str, d: usize) -> usize {
+    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+}
+
+/// F5 parse of all chunks; None (caller reparses the classic way) when a chunk index or loc does
+/// not fit gk.
+fn ev_parse_f5<E: Ev>(ev_chunks: &[B], cx: &EvCtx) -> Option<Vec<EvChunk<E>>> {
+    if ev_chunks.is_empty() || ev_chunks.len() > (1usize << (32 - F5LB)) {
+        return None;
+    }
+    let nt = rayon::current_num_threads() + 1;
+    let st: Vec<std::sync::Mutex<TS<E>>> = (0..nt).map(|_| std::sync::Mutex::new(TS::new())).collect();
+    let hm = if std::env::var_os("SHOP_HXCOL").is_some() { HBIT | 1 << 62 | 63 << 56 | 3 } else { u64::MAX };
+    let mut v: Vec<EvChunk<E>> = ev_chunks
+        .par_iter()
+        .enumerate()
+        .map(|(ci, &c)| {
+            let ti = rayon::current_thread_index().map_or(nt - 1, |i| i.min(nt - 2));
+            let mut g = st[ti].lock().unwrap();
+            let mut tm = now();
+            let (mut fb, mut fbn, mut side) = (Fb::default(), vec![], vec![]);
+            let mut s = F5S { ts: &mut g, gb: (ci as u32) << F5LB, n: 0, hm };
+            parse_events_sol(c, cx, &mut s, &mut fb, &mut fbn, &mut side, &mut Dz::off());
+            let n = s.n;
+            pt(0, &mut tm);
+            EvChunk { m: Vec::new(), d: Vec::new(), doff: Vec::new(), dz: Dz::off(), fb, dx: Vec::new(), dxoff: Vec::new(), fbn, side, n, f5: None }
+        })
+        .collect();
+    if v.iter().any(|c| c.n > F5LM + 1) {
+        return None;
+    }
+    v[0].f5 = Some(Box::new(F5All { ts: st.into_iter().map(|m| m.into_inner().unwrap()).collect() }));
+    Some(v)
+}
+
+/// F5 dedup + mover split: same result sets as the dead-bitmap dedup and resolve_parts (winner per
+/// event_id = least (ingest key, exact ingest when any is inexact, gk), gk = file order).
+fn f5_dedup<E: Ev>(mut ev_out: Vec<EvChunk<E>>, tab: &IdTab, mf: &MoverF, ws: i64) -> Vec<(Vec<E>, Vec<u32>)> {
+    let st = ev_out[0].f5.take().unwrap();
+    let ev_out = ev_out;
+    let side_any = ev_out.iter().any(|c| !c.side.is_empty());
+    let ibase = ws.div_euclid(1000);
+    let exact = |gk: u32, k: u32| -> i64 {
+        let sd = &ev_out[(gk >> F5LB) as usize].side;
+        match sd.binary_search_by_key(&(gk & F5LM), |x| x.0) {
+            Ok(i) => sd[i].1,
+            Err(_) => (k as i64 - IOFF + ibase) * 1000,
+        }
+    };
+    let hx = |gk: u32| -> &DX {
+        let x = &ev_out[(gk >> F5LB) as usize].fb.x;
+        &x[x.binary_search_by_key(&(gk & F5LM), |r| r.lp & DX_LOC).unwrap()]
+    };
+    let fbb = |gk: u32| -> B {
+        let f = &ev_out[(gk >> F5LB) as usize].fb.v;
+        unpack(f[f.binary_search_by_key(&(gk & F5LM), |x| x.2).unwrap()].0)
+    };
+    // equal keys with HBIT: the same id only when the full ids match (Hex: class code + 128-bit
+    // digit value; Other: the bytes). Classes never share a key (bits 63 / 62 differ).
+    let same = |a: u32, b: u32, eid: u64| -> bool {
+        if eid & (1 << 62) != 0 {
+            let (x, y) = (hx(a), hx(b));
+            x.hi == y.hi && x.lo == y.lo && x.lp >> 26 == y.lp >> 26
+        } else {
+            fbb(a) == fbb(b)
+        }
+    };
+    let better = |k: u32, g: u32, ok: u32, og: u32| -> bool {
+        if k != ok {
+            return k < ok;
+        }
+        if side_any {
+            let (a, b) = (exact(g, k), exact(og, ok));
+            if a != b {
+                return a < b;
+            }
+        }
+        g < og
+    };
+    let rb = (tab.s.len() >> 16).clamp(1, 512).trailing_zeros();
+    let nr = 1usize << rb;
+    let reg = move |k: u64| -> usize {
+        if rb == 0 {
+            0
+        } else {
+            (mix(k) >> (64 - rb)) as usize
+        }
+    };
+    let gp = env_usize("SHOP_F5G", 4).clamp(1, F5P);
+    let use_b = std::env::var("SHOP_F5B").map_or(true, |v| v != "0");
+    let ts = &st.ts;
+    let a: Vec<(Vec<E>, Vec<u32>, Vec<Vec<E>>)> = (0..F5P.div_ceil(gp))
+        .into_par_iter()
+        .map(|t| {
+            let mut tm = now();
+            let mut sv: Vec<E> = Vec::new();
+            let mut cv: Vec<*const ER<E>> = Vec::new();
+            let mut bm: Vec<[u64; 2]> = Vec::new();
+            let mut tb: Vec<[u64; 2]> = Vec::new();
+            let mut tp: Vec<*const ER<E>> = Vec::new();
+            for p in t * gp..((t + 1) * gp).min(F5P) {
+                let n: usize = ts.iter().map(|s| s.count(p)).sum();
+                if n == 0 {
+                    continue;
+                }
+                sv.reserve(n);
+                cv.clear();
+                if use_b {
+                    let bits = (n * 16).next_power_of_two().max(64);
+                    let bmask = bits - 1;
+                    bm.clear();
+                    bm.resize(bits / 64, [0, 0]);
+                    for s in ts {
+                        for bl in s.rows(p) {
+                            for r in bl {
+                                let i = (mix(r.eid) >> 8) as usize & bmask;
+                                // SAFETY: i >> 6 < bits / 64 = bm.len()
+                                let w = unsafe { bm.get_unchecked_mut(i >> 6) };
+                                let b = 1u64 << (i & 63);
+                                w[1] |= w[0] & b;
+                                w[0] |= b;
+                            }
+                        }
+                    }
+                    for s in ts {
+                        for bl in s.rows(p) {
+                            for r in bl {
+                                let i = (mix(r.eid) >> 8) as usize & bmask;
+                                // SAFETY: as above
+                                let w = unsafe { bm.get_unchecked(i >> 6) };
+                                if w[1] & (1u64 << (i & 63)) != 0 {
+                                    cv.push(r);
+                                } else if r.e.key() != 0 {
+                                    sv.push(r.e);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for s in ts {
+                        for bl in s.rows(p) {
+                            cv.extend(bl.iter().map(|r| r as *const ER<E>));
+                        }
+                    }
+                }
+                if cv.is_empty() {
+                    continue;
+                }
+                let cap = (cv.len() * 2).max(16).next_power_of_two();
+                let mask = cap - 1;
+                tb.clear();
+                tb.resize(cap, [0, 0]);
+                tp.clear();
+                tp.resize(cap, std::ptr::null());
+                for &rp in &cv {
+                    // SAFETY: rp points at a row of a live TS
+                    let r = unsafe { &*rp };
+                    let pk = ((r.ing as u64) << 32) | r.gk as u64;
+                    let mut q = (mix(r.eid) >> 8) as usize & mask;
+                    loop {
+                        // SAFETY: q is masked to cap
+                        let o = unsafe { tb.get_unchecked_mut(q) };
+                        if o[0] == 0 {
+                            *o = [r.eid, pk];
+                            tp[q] = rp;
+                            break;
+                        }
+                        if o[0] == r.eid && (r.eid & HBIT == 0 || same(r.gk, o[1] as u32, r.eid)) {
+                            if better(r.ing, r.gk, (o[1] >> 32) as u32, o[1] as u32) {
+                                o[1] = pk;
+                                tp[q] = rp;
+                            }
+                            break;
+                        }
+                        q = (q + 1) & mask;
+                    }
+                }
+                for q in 0..cap {
+                    if tb[q][0] != 0 {
+                        // SAFETY: a full slot's pointer is a live row
+                        let e = unsafe { (*tp[q]).e };
+                        if e.key() != 0 {
+                            sv.push(e);
+                        }
+                    }
+                }
+            }
+            pt(2, &mut tm);
+            // mover filter: hits by region (person keys set later, region by region), misses by
+            // person bucket
+            let n = sv.len();
+            let mut cnt = vec![0u32; PB + 1];
+            let mut h: Vec<Vec<E>> = (0..nr).map(|_| Vec::with_capacity(n / 2 / nr + 8)).collect();
+            for i in 0..n {
+                if i + RPD < n {
+                    mf.pf(sv[i + RPD].key());
+                }
+                let k = sv[i].key();
+                if mf.hit(k) {
+                    // SAFETY: reg(k) < nr = h.len()
+                    unsafe { h.get_unchecked_mut(reg(k)) }.push(sv[i]);
+                    sv[i].set_key(0);
+                } else {
+                    cnt[pbk(k) + 1] += 1;
+                }
+            }
+            pt(4, &mut tm);
+            for p in 0..PB {
+                cnt[p + 1] += cnt[p];
+            }
+            let tot = cnt[PB] as usize;
+            let mut out: Vec<E> = Vec::with_capacity(tot);
+            {
+                let mut w = cnt.clone();
+                let sp = out.spare_capacity_mut();
+                for e in &sv {
+                    let k = e.key();
+                    if k != 0 {
+                        let p = pbk(k);
+                        sp[w[p] as usize].write(*e);
+                        w[p] += 1;
+                    }
+                }
+            }
+            // SAFETY: the scatter wrote exactly tot rows (cnt counted the same keys)
+            unsafe { out.set_len(tot) };
+            pt(5, &mut tm);
+            (out, cnt, h)
+        })
+        .collect();
+    drop(st);
+    resolve_regroup(a, nr, tab)
 }
 
 /// measurement aid: order-sensitive checksum of one parsed chunk, chained on h
@@ -6826,7 +7265,7 @@ mod tests {
     fn sol_cmp<E: Ev>(c: B, cx: &EvCtx) -> Result<(usize, usize), String> {
         let (mut a, mut b) = (EvBufs::<E>::new(), EvBufs::<E>::new());
         parse_events(c, cx, &mut a.m, &mut a.d, &mut a.fb, &mut a.fbn, &mut a.side);
-        parse_events_sol(c, cx, &mut b.m, &mut b.d, &mut b.fb, &mut b.fbn, &mut b.side, &mut Dz::off());
+        parse_events_sol(c, cx, &mut Md(&mut b.m, &mut b.d), &mut b.fb, &mut b.fbn, &mut b.side, &mut Dz::off());
         match a.diff(&b) {
             Some(e) => Err(e),
             None => Ok((a.m.len(), a.m.iter().filter(|e| e.pc().is_some()).count())),
