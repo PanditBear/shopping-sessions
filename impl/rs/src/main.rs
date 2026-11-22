@@ -40,6 +40,35 @@ mod hpa {
     }
 }
 
+// per-phase resource deltas (measurement only): user s, sys s, minflt, majflt, VmRSS MB
+mod ru {
+    #[cfg(target_os = "linux")]
+    extern "C" {
+        fn getrusage(who: i32, ru: *mut [i64; 18]) -> i32;
+    }
+    #[cfg(target_os = "linux")]
+    pub fn snap() -> [f64; 5] {
+        let mut r = [0i64; 18];
+        unsafe { getrusage(0, &mut r) };
+        let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let rss = s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+        [r[0] as f64 + r[1] as f64 * 1e-6, r[2] as f64 + r[3] as f64 * 1e-6, r[8] as f64, r[9] as f64, rss / 1024.0]
+    }
+    #[cfg(not(target_os = "linux"))]
+    pub fn snap() -> [f64; 5] {
+        [0.0; 5]
+    }
+    pub fn fmt(a: &[f64; 5], b: &[f64; 5]) -> String {
+        format!("RU u={:.3} s={:.3} minflt={} majflt={} rss={:.0}MB drss={:+.0}MB", b[0] - a[0], b[1] - a[1], b[2] - a[2], b[3] - a[3], b[4], b[4] - a[4])
+    }
+    pub static LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    pub fn mark(t0: std::time::Instant, label: &str, prev: &[f64; 5]) -> [f64; 5] {
+        let s = snap();
+        LOG.lock().unwrap().push(format!("  ck [{:.3}s] {label} {}", t0.elapsed().as_secs_f64(), fmt(prev, &s)));
+        s
+    }
+}
+
 type B = &'static [u8];
 
 const DAY: i64 = 86_400_000;
@@ -6078,9 +6107,13 @@ fn main() {
     let timing = std::env::var("SHOP_TIMING").is_ok();
     TIMING.store(timing, Relaxed);
     let t0 = std::time::Instant::now();
+    let ru_prev = std::sync::Mutex::new(ru::snap());
     let tick = |s: &str| {
         if timing {
-            eprintln!("[{:.2}s] {}", t0.elapsed().as_secs_f64(), s);
+            let n = ru::snap();
+            let mut p = ru_prev.lock().unwrap();
+            eprintln!("[{:.2}s] {} {}", t0.elapsed().as_secs_f64(), s, ru::fmt(&p, &n));
+            *p = n;
         }
         hpa::diag(s);
     };
@@ -6444,11 +6477,13 @@ fn main() {
     let mut tm = now();
     let mf = MoverF::build(&tab);
     pt(4, &mut tm);
+    let ck0 = ru::snap();
+    let ck1 = ru::mark(t0, "moverf built", &ck0);
     // the names of hashed user keys (one map insert per such line, serial) merge on one thread
     // while the others parse the clicks; the map is read only by the writers
     let (click_out, ()) = rayon::join(
         || -> Vec<(Vec<ClickRec>, Vec<u32>)> {
-            click_chunks
+            let r: Vec<(Vec<ClickRec>, Vec<u32>)> = click_chunks
             .par_iter()
             .map(|&c| {
                 let mut tmp: Vec<ClickRec> = Vec::with_capacity(c.len() / 40);
@@ -6495,13 +6530,27 @@ fn main() {
                 pt(10, &mut tm);
                 r
             })
-            .collect()
+            .collect();
+            ru::mark(t0, "parse+scatter threads done", &ck1);
+            r
         },
-        || match &ev_out {
-            Evs::L(v) => fbn_merge(v, &mut names_map),
-            Evs::W(v) => fbn_merge(v, &mut names_map),
+        || {
+            match &ev_out {
+                Evs::L(v) => fbn_merge(v, &mut names_map),
+                Evs::W(v) => fbn_merge(v, &mut names_map),
+            }
+            ru::mark(t0, &format!("fbn_merge done (names {})", names_map.len()), &ck1);
         },
     );
+    if timing {
+        let recs: usize = click_out.iter().map(|x| x.0.len()).sum();
+        let caps: usize = click_out.iter().map(|x| x.0.capacity()).sum();
+        let chunk_b: usize = click_chunks.iter().map(|c| c.len()).sum();
+        eprintln!("  ck chunks={} bytes={} recs={} rec_size={} out_cap_bytes={}", click_chunks.len(), chunk_b, recs, std::mem::size_of::<ClickRec>(), caps * std::mem::size_of::<ClickRec>());
+        for l in ru::LOG.lock().unwrap().drain(..) {
+            eprintln!("{l}");
+        }
+    }
     tick("clicks parsed");
 
     // person buckets
