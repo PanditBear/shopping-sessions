@@ -1800,6 +1800,7 @@ fn parse_clicks(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: 
     use core::arch::x86_64::_bzhi_u64;
     let mut tc = TsCache::new();
     let mut dc = DayCache::new();
+    let (mut cra, mut crb, mut crd) = (D0_A, D0_B, D0_S);
     let lo = c.as_ptr() as usize;
     // SAFETY (bzhi): BMI2 is enabled for this build
     let bzhi = |x: u64, n: u32| unsafe { _bzhi_u64(x, n) };
@@ -1865,7 +1866,11 @@ fn parse_clicks(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: 
             // before it and the 16 bytes from pt - 3 lie inside the window.
             let f = if nt == 20 && unsafe { *pt.add(19) } == b'Z' {
                 let (ta, tb) = unsafe { (ldp(pt), ldp(pt.add(3))) };
-                match unsafe { (day_get(ta, tb, pt, &mut dc), hms(pt.add(11))) } {
+                let dd = if (ta == cra) & (tb == crb) { Some(crd) } else { unsafe { day_get(ta, tb, pt, &mut dc) } };
+                if let Some(d) = dd {
+                    (cra, crb, crd) = (ta, tb, d);
+                }
+                match (dd, unsafe { hms(pt.add(11)) }) {
                     (Some(d), Some(h)) => Some((d + h) * 1000),
                     _ => None,
                 }
@@ -4074,6 +4079,8 @@ fn parse_events_sol<E: Ev, const DZ: bool>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: 
     let mut tct = TsCache::new();
     let mut dci = DayCache::new();
     let mut dct = DayCache::new();
+    // last valid ingest date key and its day start, kept across lines
+    let (mut ra, mut rb, mut rd) = (D0_A, D0_B, D0_S);
     let c0 = c.as_ptr() as usize;
     // SAFETY (bzhi): BMI2 is enabled for this build
     let bzhi = |x: u64, n: u32| unsafe { _bzhi_u64(x, n) };
@@ -4158,12 +4165,12 @@ fn parse_events_sol<E: Ev, const DZ: bool>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: 
             };
             // SAFETY (ldp, hms): a 20-byte field lies inside its window. (ra, rb, rd): the
             // ingest's date key and day start when it is a valid F1 date, else 2000-01-01's.
-            let (mut ra, mut rb, mut rd) = (D0_A, D0_B, D0_S);
             // SAFETY: pi + 19 and pt + 19 lie inside window B (readable, see above)
             let (his, hio, hts, hto) = unsafe { hms2(pi.add(11), pt.add(11)) };
             let iso_i = if ni == 20 && unsafe { *pi.add(19) } == b'Z' {
                 let (ia, ib) = unsafe { (ldp(pi), ldp(pi.add(3))) };
-                let (dd, hs) = unsafe { (day_get(ia, ib, pi, &mut dci), if hio { Some(his) } else { None }) };
+                let dd = if (ia == ra) & (ib == rb) { Some(rd) } else { unsafe { day_get(ia, ib, pi, &mut dci) } };
+                let hs = if hio { Some(his) } else { None };
                 Some(match dd {
                     Some(d) => {
                         (ra, rb, rd) = (ia, ib, d);
