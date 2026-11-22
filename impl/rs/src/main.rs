@@ -5762,6 +5762,126 @@ fn ukey_find(ev_chunks: &[B], ekey: u64) -> Option<u64> {
     })
 }
 
+// ---------- measurement aid: input memory cost of the event kernel (SHOP_MEMT, SHOP_RU) ----------
+// SHOP_MEMT=1: before the real parse of each event chunk, the kernel runs on sub-slices of SHOP_MEMSZ KB
+// (default 256) into scratch buffers, twice each. Even sub-slices start straight from the mapping
+// (cold); odd ones first get one byte read per 4 KB page (timed apart as "touch"), so their first pass
+// has the pages mapped but not cached. The second pass of each is cache warm. Sub-slice 0 of a chunk
+// is an untimed warm-up of the scratch buffers. SHOP_RU=1: minor faults of the real ev.scan and of
+// the whole process. Totals print at the end. The output is unchanged.
+static MEMT: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+const MT_COLD: usize = 0; // ns, then warm ns, lines, bytes, minflt
+const MT_MAP: usize = 5; // ns, then warm ns, lines, bytes, minflt
+const MT_TOUCH: usize = 10; // ns, then minflt
+const MT_RU: usize = 12; // real ev.scan minflt, majflt
+
+fn memt_on() -> bool {
+    static O: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *O.get_or_init(|| std::env::var("SHOP_MEMT").map_or(false, |v| v == "1"))
+}
+fn ru_on() -> bool {
+    static O: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *O.get_or_init(|| memt_on() || std::env::var("SHOP_RU").map_or(false, |v| v == "1"))
+}
+
+/// (minor, major) page faults of this thread (who = 1) or the process (who = 0); zeros off Linux
+fn faults(who: i32) -> (u64, u64) {
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn getrusage(who: i32, r: *mut [i64; 18]) -> i32;
+        }
+        let mut r = [0i64; 18];
+        // SAFETY: struct rusage on x86_64 Linux is 2 timevals then 14 longs (144 bytes)
+        if unsafe { getrusage(who, &mut r) } == 0 {
+            return (r[8] as u64, r[9] as u64);
+        }
+    }
+    let _ = who;
+    (0, 0)
+}
+
+fn memt_chunk<E: Ev>(c: B, cx: &EvCtx) {
+    let sz = std::env::var("SHOP_MEMSZ").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(256) << 10;
+    let mut subs: Vec<B> = vec![];
+    let mut a = 0;
+    while a < c.len() {
+        let mut b = (a + sz).min(c.len());
+        if b < c.len() {
+            b = memchr(b'\n', &c[b - 1..]).map_or(c.len(), |i| b - 1 + i + 1);
+        }
+        subs.push(&c[a..b]);
+        a = b;
+    }
+    let mut buf = EvBufs::<E>::new();
+    let mut run = |s: B, buf: &mut EvBufs<E>| {
+        buf.clear();
+        let (f0, _) = faults(1);
+        let t = std::time::Instant::now();
+        parse_events_sol(s, cx, &mut buf.m, &mut buf.d, &mut buf.fb, &mut buf.fbn, &mut buf.side, &mut Dz::off());
+        let ns = t.elapsed().as_nanos() as u64;
+        (ns, faults(1).0 - f0)
+    };
+    for (i, &s) in subs.iter().enumerate() {
+        if i == 0 {
+            run(s, &mut buf);
+            continue;
+        }
+        let base = if i % 2 == 0 { MT_COLD } else { MT_MAP };
+        if base == MT_MAP {
+            let (f0, _) = faults(1);
+            let t = std::time::Instant::now();
+            let mut acc = 0u8;
+            let mut j = 0;
+            while j < s.len() {
+                // SAFETY: j < s.len()
+                acc ^= unsafe { std::ptr::read_volatile(s.as_ptr().add(j)) };
+                j += 4096;
+            }
+            std::hint::black_box(acc);
+            MEMT[MT_TOUCH].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            MEMT[MT_TOUCH + 1].fetch_add(faults(1).0 - f0, Relaxed);
+        }
+        let (ns1, f1) = run(s, &mut buf);
+        let (ns2, _) = run(s, &mut buf);
+        MEMT[base].fetch_add(ns1, Relaxed);
+        MEMT[base + 1].fetch_add(ns2, Relaxed);
+        MEMT[base + 2].fetch_add(memchr::memchr_iter(b'\n', s).count() as u64, Relaxed);
+        MEMT[base + 3].fetch_add(s.len() as u64, Relaxed);
+        MEMT[base + 4].fetch_add(f1, Relaxed);
+    }
+}
+
+fn memt_report() {
+    if !ru_on() {
+        return;
+    }
+    let g = |i: usize| MEMT[i].load(Relaxed);
+    let (pmin, pmaj) = faults(0);
+    eprintln!("memt ru: ev.scan minflt {} majflt {}; process minflt {} majflt {}; pfd {}", g(MT_RU), g(MT_RU + 1), pmin, pmaj, pf_dist());
+    if !memt_on() {
+        return;
+    }
+    for (name, b) in [("cold", MT_COLD), ("mapped", MT_MAP)] {
+        let l = g(b + 2).max(1) as f64;
+        eprintln!(
+            "memt {name}: lines {} MB {:.1} first {:.2} ns/line, warm {:.2} ns/line, diff {:.2} ns/line ({:.1}% of first); first-pass minflt {} ({:.1} per MB); cpu s first {:.3} warm {:.3}",
+            g(b + 2),
+            g(b + 3) as f64 / 1e6,
+            g(b) as f64 / l,
+            g(b + 1) as f64 / l,
+            (g(b) as f64 - g(b + 1) as f64) / l,
+            100.0 * (g(b) as f64 - g(b + 1) as f64) / g(b).max(1) as f64,
+            g(b + 4),
+            g(b + 4) as f64 * 1e6 / g(b + 3).max(1) as f64,
+            g(b) as f64 / 1e9,
+            g(b + 1) as f64 / 1e9
+        );
+    }
+    let l = g(MT_MAP + 2).max(1) as f64;
+    eprintln!("memt touch (mapped side): {:.2} ns/line, minflt {}, cpu s {:.3}", g(MT_TOUCH) as f64 / l, g(MT_TOUCH + 1), g(MT_TOUCH) as f64 / 1e9);
+}
+
 /// Parses one chunk: dense records go straight to their buckets, the rest are grouped by event_id
 /// hash bucket.
 fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
@@ -5770,6 +5890,10 @@ fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
     let mut m: Vec<E> = Vec::with_capacity(cap);
     let mut d: Vec<DRec> = Vec::with_capacity(cap);
     let (mut fb, mut fbn, mut side) = (Fb::default(), vec![], vec![]);
+    if memt_on() {
+        memt_chunk::<E>(c, cx);
+    }
+    let ru = if ru_on() { Some(faults(1)) } else { None };
     let mut tm = now();
     static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *OLD.get_or_init(|| std::env::var_os("SHOP_EVOLD").is_some()) {
@@ -5778,6 +5902,11 @@ fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
         parse_events_sol(c, cx, &mut m, &mut d, &mut fb, &mut fbn, &mut side, &mut dz);
     }
     pt(0, &mut tm);
+    if let Some((a, b)) = ru {
+        let (a2, b2) = faults(1);
+        MEMT[MT_RU].fetch_add(a2 - a, Relaxed);
+        MEMT[MT_RU + 1].fetch_add(b2 - b, Relaxed);
+    }
     let (d, doff) = bucketize(&d, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize);
     let (dx, dxoff) = bucketize(&fb.x, EB, |r| (dx_hash(r) >> (64 - EBB)) as usize);
     fb.x = Vec::new();
@@ -6387,6 +6516,7 @@ fn main() {
         let v: Vec<String> = (0..PROF.len()).map(|i| format!("{}={:.2}", PROF_NAMES[i], PROF[i].load(Relaxed) as f64 / 1e9)).collect();
         eprintln!("prof(cpu s): {}", v.join(" "));
     }
+    memt_report();
     if timing {
         eprintln!("epoch main={:.3} end={:.3}", ep0, ep());
     }
