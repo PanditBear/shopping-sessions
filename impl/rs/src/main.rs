@@ -3686,11 +3686,14 @@ unsafe fn pack6x2(pa: *const u8, na: usize, pb: *const u8, nb: usize) -> (u64, b
     // pairs -> 12 bits, quads -> 24 bits: dwords 0..2 of a lane hold codes 0-3, 4-7, 8-11
     let w = _mm256_maddubs_epi16(c, _mm256_set1_epi16(0x0140));
     let dw = _mm256_madd_epi16(w, _mm256_set1_epi32(0x0001_1000));
-    let lo = _mm256_castsi256_si128(dw);
-    let hi = _mm256_extracti128_si256(dw, 1);
-    let k3 = |q: u64, d2: u32| ((q & 0xFFFF_FFFF) << 36) | ((q >> 32) << 12) | (d2 as u64 >> 12);
-    let ka = k3(_mm_cvtsi128_si64(lo) as u64, _mm_extract_epi32(lo, 2) as u32);
-    let kb = k3(_mm_cvtsi128_si64(hi) as u64, _mm_extract_epi32(hi, 2) as u32);
+    // Assemble both packed keys in vector lanes before extracting them.
+    let mid = _mm256_and_si256(_mm256_srli_epi64(dw, 20), _mm256_set1_epi64x(0x0000_000f_ffff_f000));
+    let keys = _mm256_or_si256(
+        _mm256_or_si256(_mm256_slli_epi64(dw, 36), mid),
+        _mm256_srli_epi64(_mm256_srli_si256(dw, 8), 12),
+    );
+    let ka = _mm_cvtsi128_si64(_mm256_castsi256_si128(keys)) as u64;
+    let kb = _mm_cvtsi128_si64(_mm256_extracti128_si256(keys, 1)) as u64;
     let oka = (bad & 0xFFFF) == 0 && na.wrapping_sub(1) < 10;
     let okb = (bad >> 16) == 0 && nb.wrapping_sub(1) < 10;
     (ka, oka, kb, okb)
