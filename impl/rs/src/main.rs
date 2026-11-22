@@ -4429,17 +4429,17 @@ fn ev_after_idx<E: Ev>(
                         let mut lg: Vec<u64> = Vec::new();
                         // em outlives the task (sessionize reads its runs), so size it once from the
                         // record counts instead of growing it by doubling
-                        let ub: usize = (g * G..((g + 1) * G).min(ndb))
-                            .map(|b| {
-                                ev_out
-                                    .iter()
-                                    .map(|c| {
-                                        let (sa, _, oa, _) = c.dz.seg(b);
-                                        sa.len() + oa.len()
-                                    })
-                                    .sum::<usize>()
-                            })
-                            .sum();
+                        let mut bcnt = [0usize; G];
+                        for b in g * G..((g + 1) * G).min(ndb) {
+                            bcnt[b - g * G] = ev_out
+                                .iter()
+                                .map(|c| {
+                                    let (sa, _, oa, _) = c.dz.seg(b);
+                                    sa.len() + oa.len()
+                                })
+                                .sum::<usize>();
+                        }
+                        let ub: usize = bcnt.iter().sum();
                         let mut em: Vec<E::S> = Vec::with_capacity(ub);
                         let mut ds: Vec<RunD> = Vec::new();
                         // open run: person key, start in em, ts sorted so far, last ts
@@ -4448,13 +4448,7 @@ fn ev_after_idx<E: Ev>(
                         for b in g * G..((g + 1) * G).min(ndb) {
                             lb.clear();
                             lg.clear();
-                            let bn: usize = ev_out
-                                .iter()
-                                .map(|c| {
-                                    let (sa, _, oa, _) = c.dz.seg(b);
-                                    sa.len() + oa.len()
-                                })
-                                .sum();
+                            let bn: usize = bcnt[b - g * G];
                             lb.reserve(bn);
                             if dside_any {
                                 lg.reserve(bn);
