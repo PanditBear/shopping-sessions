@@ -5629,18 +5629,45 @@ fn idx_find(ev_files: &[B], ev_chunks: &[B]) -> Option<IdxCfg> {
     }
     let need = (xs.len() * 3).div_ceil(4);
     let fits = |k: u64| xs.iter().filter(|&&x| ((x ^ k).wrapping_mul(GC1I) & GM) < lim).count() >= need;
+    // One pass tries the pairs p = 0..np at once; the key is the one of the smallest p that has a
+    // fit, at its smallest i (as separate passes p = 0, 1, 2 would give). Runs of SUB indices are
+    // first screened by a branch-free loop that vectorizes; most runs have no candidate at all.
+    let np = 3.min(xs.len() - 1);
+    let ds: [u64; 3] = std::array::from_fn(|p| xs[p.min(np - 1)] ^ xs[p.min(np - 1) + 1]);
+    let hit = |d: u64, t: u64| ((d ^ t).wrapping_mul(GC1I) & GM) < lim;
+    let later = [AtomicU64::new(u64::MAX), AtomicU64::new(u64::MAX)];
+    const SUB: u64 = 512;
     let blk = 1u64 << 16;
-    let key = (0..3.min(xs.len() - 1)).find_map(|p| {
-        let (x0, d) = (xs[p], xs[p] ^ xs[p + 1]);
-        (0..lim.div_ceil(blk)).into_par_iter().find_map_first(|b| {
-            (b * blk..((b + 1) * blk).min(lim)).find_map(|i| {
+    let k0 = (0..lim.div_ceil(blk)).into_par_iter().find_map_first(|b| {
+        let (mut s, hi) = (b * blk, ((b + 1) * blk).min(lim));
+        while s < hi {
+            let e = (s + SUB).min(hi);
+            let mut any = false;
+            for i in s..e {
                 let t = i.wrapping_mul(GC1) & GM;
-                if ((d ^ t).wrapping_mul(GC1I) & GM) < lim && fits(x0 ^ t) {
-                    Some(x0 ^ t)
-                } else {
-                    None
+                any |= hit(ds[0], t) | hit(ds[1], t) | hit(ds[2], t);
+            }
+            if any {
+                for i in s..e {
+                    let t = i.wrapping_mul(GC1) & GM;
+                    if hit(ds[0], t) && fits(xs[0] ^ t) {
+                        return Some(xs[0] ^ t);
+                    }
+                    for p in 1..np {
+                        if hit(ds[p], t) && fits(xs[p] ^ t) {
+                            later[p - 1].fetch_min(i, Relaxed);
+                        }
+                    }
                 }
-            })
+            }
+            s = e;
+        }
+        None
+    });
+    let key = k0.or_else(|| {
+        (1..np).find_map(|p| {
+            let i = later[p - 1].load(Relaxed);
+            (i != u64::MAX).then(|| xs[p] ^ (i.wrapping_mul(GC1) & GM))
         })
     })?;
     let sh = (64 - (lim / 2048).max(1).leading_zeros()).clamp(10, 15);
@@ -5876,6 +5903,17 @@ fn main() {
     let ws = manifest_ts(&mf, "window_start").unwrap_or(0);
     let we = manifest_ts(&mf, "window_end").unwrap_or(0);
 
+    // the event files, chunks and id keys need nothing else: find them on their own thread while
+    // products, campaigns and links load (joined before the pool runs the two branches below)
+    let ev_dir = data.join("events");
+    let ev_setup = std::thread::spawn(move || {
+        let ev_files = csv_files(&ev_dir);
+        let ev_chunks = all_chunks(&ev_files, ev_chunk(&ev_files));
+        let _ = IDXC.set(idx_find(&ev_files, &ev_chunks));
+        let _ = UKEYC.set(idx_cfg().and_then(|c| ukey_find(&ev_chunks, c.key)));
+        ev_chunks
+    });
+
     // products
     let mut prod_raw: Vec<(B, B)> = vec![];
     if let Some(f) = leak_file(&data.join("products.csv")) {
@@ -5946,6 +5984,12 @@ fn main() {
         })
         .collect();
     tick("links parsed");
+    let ev_chunks = ev_setup.join().unwrap();
+    match idx_cfg() {
+        Some(c) => tick(&format!("idx key found=1 lim={} sh={} ndb={}", c.lim, c.sh, c.ndb)),
+        None => tick("idx key found=0"),
+    }
+    tick(&format!("user key found={}", UKEYC.get().copied().flatten().is_some() as u8));
     // links (serial union-find) overlaps the parallel event parse; events do not need the id table
     let ((mut tab, root, bk, nl, nroot, mut names_map), ev_out) = rayon::join(
         || {
@@ -6076,15 +6120,6 @@ fn main() {
             (t, root, bk, nl, nroot, names_map)
         },
         || {
-            let ev_files = csv_files(&data.join("events"));
-            let ev_chunks = all_chunks(&ev_files, ev_chunk(&ev_files));
-            let _ = IDXC.set(idx_find(&ev_files, &ev_chunks));
-            match idx_cfg() {
-                Some(c) => tick(&format!("idx key found=1 lim={} sh={} ndb={}", c.lim, c.sh, c.ndb)),
-                None => tick("idx key found=0"),
-            }
-            let _ = UKEYC.set(idx_cfg().and_then(|c| ukey_find(&ev_chunks, c.key)));
-            tick(&format!("user key found={}", UKEYC.get().copied().flatten().is_some() as u8));
             let cx = EvCtx { prod: &prod, unknown_cat, ws, we, ibase: ws.div_euclid(1000), rs: &rs };
             if std::env::var_os("SHOP_PARSE").is_some() {
                 if lean {
