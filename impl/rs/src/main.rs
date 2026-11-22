@@ -2880,8 +2880,9 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
         cm(if rev32 { 1 } else { 2 }, "revenue_cents"),
         cm(6, "top_category"),
     ];
-    // which chunks to compress, bit i = column i; default user_id and revenue_cents
-    let zm: u32 = std::env::var("SHOP_ZCOLS").ok().and_then(|v| v.parse().ok()).unwrap_or(17);
+    // which chunks to compress, bit i = column i. Default revenue_cents only: mostly zeros, so zstd
+    // shrinks it about 7x for almost no work; the other chunks are already dictionary/bit-packed
+    let zm: u32 = std::env::var("SHOP_ZCOLS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
     for (i, c) in cols.iter_mut().enumerate() {
         c.z = (zm >> i) & 1 == 1;
     }
