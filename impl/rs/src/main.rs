@@ -1939,11 +1939,35 @@ struct CampAcc {
     d0: i64,
     nd: usize,
     map: CampMap,
+    /// Deferred dense adds (in-walk sessionize): replayed in batches so the walk's tables and
+    /// this accumulator do not evict each other.
+    lg: Vec<CaLog>,
+    defer: bool,
 }
+#[derive(Clone, Copy)]
+struct CaLog {
+    i: u32,
+    p: u32,
+    r: u64,
+}
+const CA_TCH: u32 = 1 << 31;
 impl CampAcc {
+    fn replay(&mut self) {
+        for l in self.lg.drain(..) {
+            if l.i & CA_TCH != 0 {
+                let x = &mut self.tch[(l.i & !CA_TCH) as usize];
+                *x = x.wrapping_add(1);
+            } else {
+                let e = &mut self.dense[l.i as usize];
+                e.s = e.s.wrapping_add(1);
+                e.p = e.p.wrapping_add(l.p);
+                e.r = e.r.wrapping_add(l.r);
+            }
+        }
+    }
     fn new(ncamp1: usize, d0: i64, nd: usize) -> Self {
         let n = if nd > 0 && nd * ncamp1 <= (1 << 22) { nd * ncamp1 } else { 0 };
-        CampAcc { dense: vec![CaCell::default(); n], tch: vec![0; n], d0, nd, map: CampMap::new() }
+        CampAcc { dense: vec![CaCell::default(); n], tch: vec![0; n], d0, nd, map: CampMap::new(), lg: Vec::new(), defer: false }
     }
     /// Dense index of (c, d), if the cell is dense.
     #[inline(always)]
@@ -1956,54 +1980,81 @@ impl CampAcc {
         }
     }
     /// Count one session attributed to campaign c that started on day d.
+    /// NEG takes the session back. Counters wrap, so a partial accumulator may hold a negative
+    /// count that the final merge cancels exactly.
     #[inline(always)]
-    fn sess(&mut self, c: u32, d: i64, purch: bool, rev: u64) {
+    fn sess<const NEG: bool>(&mut self, c: u32, d: i64, purch: bool, rev: u64) {
         match self.di(d) {
             Some(di) => {
-                let e = &mut self.dense[c as usize * self.nd + di];
-                e.s += 1;
-                e.p += purch as u32;
-                e.r += rev;
+                let i = c as usize * self.nd + di;
+                if !NEG && self.defer {
+                    self.lg.push(CaLog { i: i as u32, p: purch as u32, r: rev });
+                    return;
+                }
+                let e = &mut self.dense[i];
+                if NEG {
+                    e.s = e.s.wrapping_sub(1);
+                    e.p = e.p.wrapping_sub(purch as u32);
+                    e.r = e.r.wrapping_sub(rev);
+                } else {
+                    e.s += 1;
+                    e.p += purch as u32;
+                    e.r += rev;
+                }
             }
             None => {
                 let e = self.map.entry(((c as u64) << 32) | (d as u32 as u64)).or_insert([0; 4]);
-                e[0] += 1;
-                e[1] += purch as u64;
-                e[2] += rev;
+                if NEG {
+                    e[0] = e[0].wrapping_sub(1);
+                    e[1] = e[1].wrapping_sub(purch as u64);
+                    e[2] = e[2].wrapping_sub(rev);
+                } else {
+                    e[0] += 1;
+                    e[1] += purch as u64;
+                    e[2] += rev;
+                }
             }
         }
     }
     /// One touch for every campaign in `act` on day d.
     #[inline(always)]
-    fn touch(&mut self, act: &[u32], d: i64) {
+    fn touch<const NEG: bool>(&mut self, act: &[u32], d: i64) {
         match self.di(d) {
             Some(di) => {
                 let nd = self.nd;
+                if !NEG && self.defer {
+                    for &c in act {
+                        self.lg.push(CaLog { i: (c as usize * nd + di) as u32 | CA_TCH, p: 0, r: 0 });
+                    }
+                    return;
+                }
                 let t = &mut self.tch[..];
                 for &c in act {
-                    t[c as usize * nd + di] += 1;
+                    let x = &mut t[c as usize * nd + di];
+                    *x = if NEG { x.wrapping_sub(1) } else { *x + 1 };
                 }
             }
             None => {
                 for &c in act {
-                    self.map.entry(((c as u64) << 32) | (d as u32 as u64)).or_insert([0; 4])[3] += 1;
+                    let x = &mut self.map.entry(((c as u64) << 32) | (d as u32 as u64)).or_insert([0; 4])[3];
+                    *x = if NEG { x.wrapping_sub(1) } else { *x + 1 };
                 }
             }
         }
     }
     fn merge(&mut self, o: &CampAcc) {
         for (a, b) in self.dense.iter_mut().zip(o.dense.iter()) {
-            a.s += b.s;
-            a.p += b.p;
-            a.r += b.r;
+            a.s = a.s.wrapping_add(b.s);
+            a.p = a.p.wrapping_add(b.p);
+            a.r = a.r.wrapping_add(b.r);
         }
         for (a, b) in self.tch.iter_mut().zip(o.tch.iter()) {
-            *a += *b;
+            *a = a.wrapping_add(*b);
         }
         for (&k, v) in &o.map {
             let e = self.map.entry(k).or_insert([0; 4]);
             for i in 0..4 {
-                e[i] += v[i];
+                e[i] = e[i].wrapping_add(v[i]);
             }
         }
     }
@@ -2015,7 +2066,11 @@ impl CampAcc {
             }
         }
         for (&k, &v) in &self.map {
-            rows.push(((k >> 32) as u32, k as u32 as i32, v));
+            // a cell counted and then taken back (in-walk sessionize) sums to zero; a real cell
+            // always holds a session or a touch
+            if v != [0; 4] {
+                rows.push(((k >> 32) as u32, k as u32 as i32, v));
+            }
         }
         rows.sort_by_key(|r| (r.0, r.1));
         rows
@@ -2473,7 +2528,7 @@ fn process_bucket<E: Ev>(
             let et = e.rts() as i64 + base;
             if first || et - prev > GAP {
                 if in_sess {
-                    cm.sess(s_camp, s_day, s_purch, s_rev);
+                    cm.sess::<false>(s_camp, s_day, s_purch, s_rev);
                 }
                 first = false;
                 in_sess = true;
@@ -2508,7 +2563,7 @@ fn process_bucket<E: Ev>(
                 } else {
                     organic
                 };
-                cm.touch(&win.active, d);
+                cm.touch::<false>(&win.active, d);
                 if day.day != d {
                     flush_day(&mut day, uds);
                     day.day = d;
@@ -2528,7 +2583,7 @@ fn process_bucket<E: Ev>(
             }
         }
         if in_sess {
-            cm.sess(s_camp, s_day, s_purch, s_rev);
+            cm.sess::<false>(s_camp, s_day, s_purch, s_rev);
         }
         flush_day(&mut day, uds);
         for &c in &win.active {
@@ -4010,7 +4065,7 @@ fn ev_after<E: Ev>(
     tick("dedup done");
 
     let offs: Vec<&[u32]> = parts.iter().map(|x| &x.1[..]).collect();
-    let cost = pb_cost(&offs, click_out);
+    let cost = pb_cost(&offs, click_out, 0);
     lpt_run(&cost, || SsW::new(ncamp, d0, nd), |p, w: &mut SsW<E>| {
         w.gather(p, &parts, click_out);
         let mut uds = Vec::new();
@@ -4036,6 +4091,8 @@ struct SsW<E: Ev> {
     cnt: Vec<u32>,
     cl: Vec<ClickRec>,
     ctmp: Vec<ClickRec>,
+    /// persons whose in-walk sessionize was taken back here
+    ret: Vec<u64>,
 }
 
 impl<E: Ev> SsW<E> {
@@ -4053,6 +4110,7 @@ impl<E: Ev> SsW<E> {
             cnt: vec![],
             cl: vec![],
             ctmp: vec![],
+            ret: vec![],
         }
     }
     /// Collects person bucket p's lines and clicks from every chunk.
@@ -4073,12 +4131,8 @@ impl<E: Ev> SsW<E> {
     /// (digit, key, part, offset) (the order process_runs used to rebuild from the gathered
     /// lines), then copies each run's lines into evs in that order. Runs of one person end up
     /// adjacent and are joined into one Run (sorted if every piece is sorted and the seams are).
-    fn gather_rd(&mut self, p: usize, dparts: &[RdPart<E::S>], rest: &(Vec<E>, Vec<u32>), click_out: &[(Vec<ClickRec>, Vec<u32>)]) {
+    fn gather_rd(&mut self, p: usize, dparts: &[RdPart<E::S>], rest: &(Vec<E>, Vec<u32>), ci: &ClickIdx, organic: u32, base: i64) {
         let mut tm = now();
-        self.cl.clear();
-        for (v, o) in click_out.iter() {
-            self.cl.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
-        }
         let srt = &mut self.srt;
         srt.clear();
         for (t, (_, dv, o, _)) in dparts.iter().enumerate() {
@@ -4100,7 +4154,7 @@ impl<E: Ev> SsW<E> {
                     ok &= rv[j].rts() >= rv[j - 1].rts();
                     j += 1;
                 }
-                srt.push(SRun { d: dg(k) as u32, lk: RunD::lk(j - i, ok), k, src: t | i as u64 });
+                srt.push(SRun { d: dg(k) as u32, lk: RunD::lk(j - i, ok, false), k, src: t | i as u64 });
                 i = j;
             }
         }
@@ -4117,6 +4171,52 @@ impl<E: Ev> SsW<E> {
                 rest.0.as_ptr().wrapping_add(off) as *const u8
             }
         };
+        // runs sessionized in the walk: a person whose only run is done is finished; a person with
+        // a done run and other runs gets that run taken back here (same lines, same clicks,
+        // negated counts; its walk rows are dropped by the caller) and is sessionized below from
+        // all its runs
+        if srt.iter().any(|r| r.lk & LK_DONE != 0) {
+            let n = srt.len();
+            let (mut i, mut o) = (0usize, 0usize);
+            let mut day = DayAcc { key: 0, day: 0, sessions: 0, events: 0, rev: 0, cats: vec![] };
+            let mut junk: Vec<UD> = Vec::new();
+            while i < n {
+                let k = srt[i].k;
+                let mut j = i + 1;
+                while j < n && srt[j].k == k {
+                    j += 1;
+                }
+                let ndone = srt[i..j].iter().filter(|r| r.lk & LK_DONE != 0).count();
+                if ndone == 0 || j > i + 1 {
+                    if ndone > 0 {
+                        let cs = ci.clicks(k);
+                        for r in &srt[i..j] {
+                            if r.lk & LK_DONE == 0 {
+                                continue;
+                            }
+                            // done runs come only from the dense walk
+                            let off = r.src as u32 as usize;
+                            let v = &dparts[(r.src >> 32) as usize].0[off..off + (r.lk >> 2) as usize];
+                            let pes: &[E::S] = if r.lk & LK_OK != 0 {
+                                v
+                            } else {
+                                self.tmp_s.clear();
+                                self.tmp_s.extend_from_slice(v);
+                                self.tmp_s.sort_by_key(|e| e.rts());
+                                &self.tmp_s[..]
+                            };
+                            person_sess::<E::S, true>(pes, k, cs, &mut self.win, organic, &mut day, &mut junk, &mut self.cm, base);
+                            junk.clear();
+                        }
+                        self.ret.push(k);
+                    }
+                    srt.copy_within(i..j, o);
+                    o += j - i;
+                }
+                i = j;
+            }
+            srt.truncate(o);
+        }
         let evs = &mut self.evs_s;
         let runs = &mut self.runs;
         evs.clear();
@@ -4130,8 +4230,8 @@ impl<E: Ev> SsW<E> {
             let r = &srt[i];
             let t = (r.src >> 32) as usize;
             let off = r.src as u32 as usize;
-            let n = (r.lk >> 1) as usize;
-            let ok = r.lk & 1 != 0;
+            let n = (r.lk >> 2) as usize;
+            let ok = r.lk & LK_OK != 0;
             let s = evs.len();
             if t < nd {
                 let v = &dparts[t].0[off..off + n];
@@ -4160,7 +4260,7 @@ impl<E: Ev> SsW<E> {
 }
 
 /// Run descriptor of the dense dedup walk: person key, offset of the run in its task's lines,
-/// length << 1 | (run sorted by ts).
+/// length << 2 | (already sessionized in the walk) << 1 | (run sorted by ts).
 #[derive(Clone, Copy)]
 struct RunD {
     k: u64,
@@ -4168,15 +4268,18 @@ struct RunD {
     lk: u32,
 }
 
+const LK_OK: u32 = 1;
+const LK_DONE: u32 = 2;
+
 impl RunD {
     #[inline(always)]
-    fn lk(len: usize, ok: bool) -> u32 {
-        debug_assert!(len < 1 << 31);
-        ((len as u32) << 1) | ok as u32
+    fn lk(len: usize, ok: bool, done: bool) -> u32 {
+        assert!(len < 1 << 30);
+        ((len as u32) << 2) | ((done as u32) << 1) | ok as u32
     }
     #[inline(always)]
-    fn new(k: u64, off: usize, len: usize, ok: bool) -> Self {
-        RunD { k, off: off as u32, lk: Self::lk(len, ok) }
+    fn new(k: u64, off: usize, len: usize, ok: bool, done: bool) -> Self {
+        RunD { k, off: off as u32, lk: Self::lk(len, ok, done) }
     }
 }
 
@@ -4204,7 +4307,9 @@ fn rd_scatter(ds: &[RunD]) -> (Vec<RunD>, Vec<u32>, Vec<u32>) {
     for r in ds {
         let p = pbk(r.k);
         cnt[p + 1] += 1;
-        eo[p + 1] += r.lk >> 1;
+        if r.lk & LK_DONE == 0 {
+            eo[p + 1] += r.lk >> 2;
+        }
     }
     for p in 0..PB {
         cnt[p + 1] += cnt[p];
@@ -4226,7 +4331,9 @@ fn rd_scatter(ds: &[RunD]) -> (Vec<RunD>, Vec<u32>, Vec<u32>) {
 
 /// Estimated sessionize work of each person bucket: its lines plus twice its clicks (a click
 /// costs about two lines: radix sort plus window upkeep).
-fn pb_cost(offs: &[&[u32]], click_out: &[(Vec<ClickRec>, Vec<u32>)]) -> Vec<u64> {
+/// `csh`: clicks weigh 2 >> csh lines each (their sort runs before the dedup when in-walk
+/// sessionize is on, so only the merge walk is left here).
+fn pb_cost(offs: &[&[u32]], click_out: &[(Vec<ClickRec>, Vec<u32>)], csh: u32) -> Vec<u64> {
     const BLK: usize = 64;
     let mut cost = vec![0u64; PB];
     cost.par_chunks_mut(BLK).enumerate().for_each(|(b, c)| {
@@ -4238,7 +4345,7 @@ fn pb_cost(offs: &[&[u32]], click_out: &[(Vec<ClickRec>, Vec<u32>)]) -> Vec<u64>
         }
         for (_, o) in click_out.iter() {
             for (i, x) in c.iter_mut().enumerate() {
-                *x += 2 * (o[lo + i + 1] - o[lo + i]) as u64;
+                *x += (2 * (o[lo + i + 1] - o[lo + i]) as u64) >> csh;
             }
         }
     });
@@ -4332,6 +4439,190 @@ fn pb_scatter<E: Ev>(em: &[E]) -> (Vec<E>, Vec<u32>) {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// In-walk sessionize (SHOP_W1, default on): a run that ends inside a dense dedup task (not the
+/// task's first or last run) and has at most `w1_max()` lines is sessionized right away, while its
+/// lines are hot, and its descriptor is marked LK_DONE. Exactness: every descriptor still reaches
+/// gather_rd, which sees all of a person's runs; a person whose only run is done is skipped there,
+/// any other person with a done run has that run taken back (person_sess with NEG on the same lines
+/// and clicks) and its walk rows dropped, then is sessionized from all its runs as before.
+fn w1_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("SHOP_W1").map(|v| v != "0").unwrap_or(true))
+}
+fn w1_defer() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("SHOP_W1DEFER").map(|v| v != "0").unwrap_or(true))
+}
+
+fn w1_max() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("SHOP_W1MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(1 << 16))
+}
+
+/// Clicks sorted once per person bucket by (digit, key, ts), and where each (bucket, digit) range
+/// ends inside its bucket, so a person's clicks are found with one table read.
+struct ClickIdx {
+    ckb: Vec<Vec<ClickRec>>,
+    dge: Vec<u32>,
+}
+
+impl ClickIdx {
+    fn build(click_out: &[(Vec<ClickRec>, Vec<u32>)]) -> Self {
+        const ND: usize = 1 << NBK;
+        let mut dge = vec![0u32; PB * ND];
+        let ckb: Vec<Vec<ClickRec>> = dge
+            .par_chunks_mut(ND)
+            .enumerate()
+            .map_init(
+                || (Vec::new(), Vec::new()),
+                |(tmp, cnt), (p, de)| {
+                    let mut cl: Vec<ClickRec> = Vec::with_capacity(click_out.iter().map(|(_, o)| (o[p + 1] - o[p]) as usize).sum());
+                    for (v, o) in click_out.iter() {
+                        cl.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
+                    }
+                    sort_clicks(&mut cl, tmp, cnt);
+                    for c in &cl {
+                        de[dg(c.key)] += 1;
+                    }
+                    let mut a = 0u32;
+                    for x in de.iter_mut() {
+                        a += *x;
+                        *x = a;
+                    }
+                    cl
+                },
+            )
+            .collect();
+        ClickIdx { ckb, dge }
+    }
+    #[inline(always)]
+    fn slot(k: u64) -> usize {
+        (pbk(k) << NBK) | dg(k)
+    }
+    /// The digit range of key k in its bucket (start, end).
+    #[inline(always)]
+    fn drange(&self, k: u64) -> (usize, usize) {
+        let i = Self::slot(k);
+        let s = if i & ((1 << NBK) - 1) == 0 { 0 } else { self.dge[i - 1] as usize };
+        (s, self.dge[i] as usize)
+    }
+    /// The clicks of key k inside its digit range [s, e) (ordered by ts).
+    #[inline(always)]
+    fn of(&self, k: u64, s: usize, e: usize) -> &[ClickRec] {
+        let v = &self.ckb[pbk(k)][s..e];
+        let mut a = 0;
+        while a < v.len() && v[a].key != k {
+            a += 1;
+        }
+        let mut b = a;
+        while b < v.len() && v[b].key == k {
+            b += 1;
+        }
+        &v[a..b]
+    }
+    #[inline(always)]
+    fn clicks(&self, k: u64) -> &[ClickRec] {
+        let (s, e) = self.drange(k);
+        self.of(k, s, e)
+    }
+}
+
+/// One pool thread's in-walk sessionize state.
+struct WalkAcc<E> {
+    cm: CampAcc,
+    win: Win,
+    day: DayAcc,
+    uds: Vec<UD>,
+    tmp: Vec<E>,
+}
+
+impl<E: Tp> WalkAcc<E> {
+    fn new(ncamp: usize, d0: i64, nd: usize) -> Self {
+        WalkAcc {
+            cm: {
+                let mut c = CampAcc::new(ncamp + 1, d0, nd);
+                c.defer = w1_defer();
+                c
+            },
+            win: Win { cnt: vec![0; ncamp + 1], pos: vec![0; ncamp + 1], active: vec![] },
+            day: DayAcc { key: 0, day: 0, sessions: 0, events: 0, rev: 0, cats: vec![] },
+            uds: Vec::new(),
+            tmp: Vec::new(),
+        }
+    }
+}
+
+/// A done run waiting in the walk's two-stage pipeline: key, start and length in em, ts sorted,
+/// and (second stage) its digit range in the click index.
+#[derive(Clone, Copy)]
+struct WRun {
+    k: u64,
+    s: usize,
+    l: usize,
+    ok: bool,
+    cs: usize,
+    ce: usize,
+}
+
+/// Runs a done run through the walk pipeline: stage 1 prefetches its click table slot, stage 2
+/// reads the slot and prefetches its clicks, stage 3 sessionizes it. `em` is the task's line
+/// buffer (runs before the current write position are complete).
+struct WPipe {
+    q0: Option<WRun>,
+    q1: Option<WRun>,
+}
+
+impl WPipe {
+    #[inline(always)]
+    fn push<E: Tp>(&mut self, r: Option<WRun>, em: *const E, ci: &ClickIdx, wa: &mut WalkAcc<E>, organic: u32, base: i64) {
+        if let Some(x) = self.q1.take() {
+            Self::sess(x, em, ci, wa, organic, base);
+        }
+        if let Some(mut y) = self.q0.take() {
+            let (s, e) = ci.drange(y.k);
+            y.cs = s;
+            y.ce = e;
+            if e > s {
+                prefetch(ci.ckb[pbk(y.k)].as_ptr().wrapping_add(s) as *const u8);
+            }
+            self.q1 = Some(y);
+        }
+        if let Some(r) = r {
+            prefetch(ci.dge.as_ptr().wrapping_add(ClickIdx::slot(r.k)) as *const u8);
+            self.q0 = Some(r);
+        }
+    }
+    fn flush<E: Tp>(&mut self, em: *const E, ci: &ClickIdx, wa: &mut WalkAcc<E>, organic: u32, base: i64) {
+        self.push(None, em, ci, wa, organic, base);
+        self.push(None, em, ci, wa, organic, base);
+    }
+    #[inline(always)]
+    fn sess<E: Tp>(x: WRun, em: *const E, ci: &ClickIdx, wa: &mut WalkAcc<E>, organic: u32, base: i64) {
+        let t0 = now();
+        // SAFETY: [s, s + l) was written by the walk before this run was queued
+        let v: &[E] = unsafe { std::slice::from_raw_parts(em.add(x.s), x.l) };
+        let pes: &[E] = if x.ok {
+            v
+        } else {
+            wa.tmp.clear();
+            wa.tmp.extend_from_slice(v);
+            wa.tmp.sort_by_key(|e| e.rts());
+            &wa.tmp[..]
+        };
+        let cs = ci.of(x.k, x.cs, x.ce);
+        person_sess::<E, false>(pes, x.k, cs, &mut wa.win, organic, &mut wa.day, &mut wa.uds, &mut wa.cm, base);
+        if wa.cm.lg.len() >= 16384 {
+            wa.cm.replay();
+        }
+        if let Some(t) = t0 {
+            W1NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        }
+    }
+}
+
+/// Time spent sessionizing inside the walk (part of dd.resolve; SHOP_TIMING only).
+static W1NS: AtomicU64 = AtomicU64::new(0);
+
 fn ev_after_idx<E: Ev>(
     ev_out: Vec<EvChunk<E>>,
     tab: &IdTab,
@@ -4362,6 +4653,15 @@ fn ev_after_idx<E: Ev>(
         let all: usize = dense + ev_out.iter().map(|c| c.d.len() + c.fb.len()).sum::<usize>();
         tick(&format!("idx dense records {dense} of {all} ({:.5}) overflow {ov} slots {slots}", dense as f64 / all.max(1) as f64));
     }
+    let w1 = w1_on();
+    let wmax = w1_max();
+    let organic = ncamp as u32;
+    let mut tmc = now();
+    let ci = ClickIdx::build(click_out);
+    pt(11, &mut tmc);
+    let nthr = rayon::current_num_threads().max(1);
+    let wacc: Vec<std::sync::Mutex<Option<WalkAcc<E::S>>>> = (0..nthr).map(|_| std::sync::Mutex::new(None)).collect();
+    let wover: std::sync::Mutex<Vec<WalkAcc<E::S>>> = std::sync::Mutex::new(Vec::new());
     let (dparts, rest): (Vec<RdPart<E::S>>, (Vec<E>, Vec<u32>)) = {
         let side_any = ev_out.iter().any(|c| !c.side.is_empty());
         let dside_any = ev_out.iter().any(|c| !c.dz.dside.is_empty());
@@ -4417,6 +4717,10 @@ fn ev_after_idx<E: Ev>(
                             .sum();
                         let mut em: Vec<E::S> = Vec::with_capacity(ub);
                         let mut ds: Vec<RunD> = Vec::new();
+                        let ti = rayon::current_thread_index().unwrap_or(0) % nthr;
+                        let mut wa: Option<WalkAcc<E::S>> =
+                            if w1 { Some(wacc[ti].lock().unwrap().take().unwrap_or_else(|| WalkAcc::new(ncamp, d0, nd))) } else { None };
+                        let mut wp = WPipe { q0: None, q1: None };
                         // open run: person key, start in em, ts sorted so far, last ts
                         let (mut rk, mut rs, mut rok, mut lts) = (0u64, 0usize, true, 0u64);
                         let mut pc = PkCache { k: [0; 4], p: [0; 4], n: 0 };
@@ -4522,7 +4826,16 @@ fn ev_after_idx<E: Ev>(
                                             let ts = e.rts();
                                             if pk != rk || en == rs {
                                                 if en > rs {
-                                                    ds.push(RunD::new(rk, rs, en - rs, rok));
+                                                    // a run that ends here and is not the task's first is
+                                                    // whole inside this task unless the person has lines
+                                                    // elsewhere (gather_rd checks that)
+                                                    let l = en - rs;
+                                                    let done = w1 && rs > 0 && l <= wmax;
+                                                    ds.push(RunD::new(rk, rs, l, rok, done));
+                                                    if done {
+                                                        let r = WRun { k: rk, s: rs, l, ok: rok, cs: 0, ce: 0 };
+                                                        wp.push(Some(r), emp as *const E::S, &ci, wa.as_mut().unwrap(), organic, ws);
+                                                    }
                                                 }
                                                 rk = pk;
                                                 rs = en;
@@ -4544,7 +4857,16 @@ fn ev_after_idx<E: Ev>(
                             pt(4, &mut tm);
                         }
                         if em.len() > rs {
-                            ds.push(RunD::new(rk, rs, em.len() - rs, rok));
+                            ds.push(RunD::new(rk, rs, em.len() - rs, rok, false));
+                        }
+                        if let Some(mut w) = wa.take() {
+                            wp.flush(em.as_ptr(), &ci, &mut w, organic, ws);
+                            let mut sl = wacc[ti].lock().unwrap();
+                            if sl.is_none() {
+                                *sl = Some(w);
+                            } else {
+                                wover.lock().unwrap().push(w);
+                            }
                         }
                         let (dv, dof, eo) = rd_scatter(&ds);
                         pt(5, &mut tm);
@@ -4653,16 +4975,46 @@ fn ev_after_idx<E: Ev>(
     tick("dedup done");
 
     let offs: Vec<&[u32]> = dparts.iter().map(|x| &x.3[..]).chain(std::iter::once(&rest.1[..])).collect();
-    let cost = pb_cost(&offs, click_out);
-    lpt_run(&cost, || SsW::new(ncamp, d0, nd), |p, w: &mut SsW<E>| {
-        w.gather_rd(p, &dparts, &rest, click_out);
+    let cost = pb_cost(&offs, click_out, 3);
+    let ws_ = lpt_run(&cost, || SsW::new(ncamp, d0, nd), |p, w: &mut SsW<E>| {
+        w.gather_rd(p, &dparts, &rest, &ci, organic, ws);
         let mut uds = Vec::new();
-        process_runs(&w.evs_s, &mut w.tmp_s, &w.runs, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut uds, &mut w.cm, ws);
+        process_runs(&w.evs_s, &mut w.tmp_s, &w.runs, &ci.ckb[p], &mut w.win, organic, &mut uds, &mut w.cm, ws);
         w.out.push(uds);
-    })
-    .into_iter()
-    .map(|w| (w.out, w.cm))
-    .collect()
+    });
+    let mut ret: Vec<u64> = ws_.iter().flat_map(|w| w.ret.iter().copied()).collect();
+    if TIMING.load(Relaxed) {
+        let (mut dl, mut al) = (0u64, 0u64);
+        for (_, dv, _, _) in &dparts {
+            for r in dv {
+                al += (r.lk >> 2) as u64;
+                if r.lk & LK_DONE != 0 {
+                    dl += (r.lk >> 2) as u64;
+                }
+            }
+        }
+        tick(&format!("w1 walk-sessionized lines {dl} of {al} dense, taken back persons {}, walk sessionize {:.2} cpu-s", ret.len(), W1NS.load(Relaxed) as f64 / 1e9));
+    }
+    let mut res: Vec<(Vec<Vec<UD>>, CampAcc)> = ws_.into_iter().map(|w| (w.out, w.cm)).collect();
+    // the walk's rows, minus those of the persons taken back in gather_rd
+    ret.sort_unstable();
+    let mut bits = vec![0u64; 1 << 10];
+    for &k in &ret {
+        let h = mix(k) as usize & 0xFFFF;
+        bits[h >> 6] |= 1 << (h & 63);
+    }
+    let walk = wacc.into_iter().filter_map(|m| m.into_inner().unwrap()).chain(wover.into_inner().unwrap());
+    for mut w in walk {
+        if !ret.is_empty() {
+            w.uds.retain(|u| {
+                let h = mix(u.key) as usize & 0xFFFF;
+                bits[h >> 6] >> (h & 63) & 1 == 0 || ret.binary_search(&u.key).is_err()
+            });
+        }
+        w.cm.replay();
+        res.push((vec![w.uds], w.cm));
+    }
+    res
 }
 
 /// A stretch of one person's lines in a bucket: digit, person key, start, length, ts sorted.
@@ -4683,9 +5035,7 @@ fn process_runs<E: Tp>(
     evs: &[E],
     tmp: &mut Vec<E>,
     runs: &[Run],
-    cnt: &mut Vec<u32>,
-    clicks: &mut Vec<ClickRec>,
-    ctmp: &mut Vec<ClickRec>,
+    clicks: &[ClickRec],
     win: &mut Win,
     organic: u32,
     uds: &mut Vec<UD>,
@@ -4693,8 +5043,6 @@ fn process_runs<E: Tp>(
     base: i64,
 ) {
     let mut tm = now();
-    sort_clicks(clicks, ctmp, cnt);
-    pt(11, &mut tm);
     let mut ci = 0;
     let mut day = DayAcc { key: 0, day: 0, sessions: 0, events: 0, rev: 0, cats: vec![] };
     let mut a = 0;
@@ -4722,7 +5070,7 @@ fn process_runs<E: Tp>(
         while cj < clicks.len() && clicks[cj].key == pid {
             cj += 1;
         }
-        person_sess(pes, pid, &clicks[ci..cj], win, organic, &mut day, uds, cm, base);
+        person_sess::<E, false>(pes, pid, &clicks[ci..cj], win, organic, &mut day, uds, cm, base);
         ci = cj;
         a = b;
     }
@@ -4733,7 +5081,7 @@ fn process_runs<E: Tp>(
 /// process_bucket.
 #[allow(clippy::too_many_arguments)]
 #[inline]
-fn person_sess<E: Tp>(
+fn person_sess<E: Tp, const NEG: bool>(
     pes: &[E],
     pid: u64,
     cs: &[ClickRec],
@@ -4758,7 +5106,7 @@ fn person_sess<E: Tp>(
         let et = e.rts() as i64 + base;
         if first || et - prev > GAP {
             if in_sess {
-                cm.sess(s_camp, s_day, s_purch, s_rev);
+                cm.sess::<NEG>(s_camp, s_day, s_purch, s_rev);
             }
             first = false;
             in_sess = true;
@@ -4793,7 +5141,7 @@ fn person_sess<E: Tp>(
             } else {
                 organic
             };
-            cm.touch(&win.active, d);
+            cm.touch::<NEG>(&win.active, d);
             if day.day != d {
                 flush_day(day, uds);
                 day.day = d;
@@ -4813,7 +5161,7 @@ fn person_sess<E: Tp>(
         }
     }
     if in_sess {
-        cm.sess(s_camp, s_day, s_purch, s_rev);
+        cm.sess::<NEG>(s_camp, s_day, s_purch, s_rev);
     }
     flush_day(day, uds);
     for &c in &win.active {
@@ -7031,12 +7379,14 @@ mod ck_sort_tests {
             let (u1, c1, _) = run(&|u, c, cl| {
                 let (mut tmp, mut cnt, mut ct) = (vec![], vec![], vec![]);
                 let mut win = Win { cnt: vec![0; ncamp + 1], pos: vec![0; ncamp + 1], active: vec![] };
-                process_runs(&full, &mut tmp, &runs, &mut cnt, cl, &mut ct, &mut win, ncamp as u32, u, c, 0);
+                sort_clicks(cl, &mut ct, &mut cnt);
+                process_runs(&full, &mut tmp, &runs, cl, &mut win, ncamp as u32, u, c, 0);
             });
             let (u2, c2, _) = run(&|u, c, cl| {
                 let (mut tmp, mut cnt, mut ct) = (vec![], vec![], vec![]);
                 let mut win = Win { cnt: vec![0; ncamp + 1], pos: vec![0; ncamp + 1], active: vec![] };
-                process_runs(&slim, &mut tmp, &runs, &mut cnt, cl, &mut ct, &mut win, ncamp as u32, u, c, 0);
+                sort_clicks(cl, &mut ct, &mut cnt);
+                process_runs(&slim, &mut tmp, &runs, cl, &mut win, ncamp as u32, u, c, 0);
             });
             assert_eq!(u1.len(), u2.len());
             for (a, b) in u1.iter().zip(&u2) {
