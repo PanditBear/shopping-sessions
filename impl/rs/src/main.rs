@@ -2122,13 +2122,183 @@ fn isort_by<T: Copy>(v: &mut [T], less: impl Fn(&T, &T) -> bool) {
     }
 }
 
+thread_local! {
+    static TS_KEYS: std::cell::RefCell<(Vec<u64>, Vec<u64>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// Bits of the quantized ts in `sort_evs_ts`.
+const TSB: u32 = 22;
+
+/// Fast path of `sort_evs` for input in random ts order: one pass packs
+/// dg(key) | ts >> q (TSB bits) | index into u64s and counts three digits, two 11-bit LSD passes
+/// order the u64s by quantized ts, and one counting scatter by dg moves the records. Each dg
+/// range is then ts-ordered up to the quantum: a one-key range gets an insertion fixup on rts,
+/// a multi-key range a stable split by key and the same fixup. Returns false when the fields do
+/// not fit in 64 bits.
+fn sort_evs_ts<E: Ev>(evs: &mut Vec<E>, tmp: &mut Vec<E>, h: &mut Vec<u32>, span: i64) -> bool {
+    let n = evs.len();
+    if span < 0 {
+        return false;
+    }
+    let sb = 64 - (span as u64).leading_zeros();
+    let ib = (64 - ((n - 1) as u64).leading_zeros()).max(1);
+    if ib + TSB + NBK > 64 {
+        return false;
+    }
+    let q = sb.saturating_sub(TSB);
+    let ds = ib + TSB;
+    let im = (1u64 << ib) - 1;
+    TS_KEYS.with(|c| {
+        let (ka, kb) = &mut *c.borrow_mut();
+        h.clear();
+        h.resize(2048 * 2 + (1 << NBK), 0);
+        let h = &mut h[..];
+        ka.clear();
+        ka.reserve(n);
+        kb.clear();
+        kb.reserve(n);
+        // SAFETY: every slot of ka is written below; kb is fully written by a pass before it
+        // is read (a skipped pass leaves src = ka).
+        unsafe {
+            ka.set_len(n);
+            kb.set_len(n);
+        }
+        for (i, e) in evs.iter().enumerate() {
+            let t = e.rts() >> q;
+            let d = dg(e.key()) as u64;
+            // SAFETY: i < n = ka.len(); the indexes are masked below the histogram sizes.
+            unsafe {
+                *ka.get_unchecked_mut(i) = (d << ds) | (t << ib) | i as u64;
+                *h.get_unchecked_mut((t & 2047) as usize) += 1;
+                *h.get_unchecked_mut(2048 + ((t >> 11) & 2047) as usize) += 1;
+                *h.get_unchecked_mut(4096 + d as usize) += 1;
+            }
+        }
+        let (mut src, mut dst) = (&mut ka[..], &mut kb[..]);
+        for (off, sh) in [(0usize, ib), (2048, ib + 11)] {
+            let hj = &mut h[off..off + 2048];
+            if hj.iter().any(|&c| c as usize == n) {
+                continue;
+            }
+            let mut s = 0u32;
+            for x in hj.iter_mut() {
+                let c = *x;
+                *x = s;
+                s += c;
+            }
+            for &k in src.iter() {
+                let d = ((k >> sh) & 2047) as usize;
+                // SAFETY: d < 2048; the prefix sums keep every position below n.
+                unsafe {
+                    let p = hj.get_unchecked_mut(d);
+                    *dst.get_unchecked_mut(*p as usize) = k;
+                    *p += 1;
+                }
+            }
+            std::mem::swap(&mut src, &mut dst);
+        }
+        let hj = &mut h[4096..4096 + (1 << NBK)];
+        let mut s = 0u32;
+        for x in hj.iter_mut() {
+            let c = *x;
+            *x = s;
+            s += c;
+        }
+        tmp.clear();
+        tmp.reserve(n);
+        // SAFETY: the scatter below writes each of the n slots exactly once.
+        unsafe { tmp.set_len(n) };
+        for &k in src.iter() {
+            let d = (k >> ds) as usize;
+            // SAFETY: k & im < n; d < 2^NBK; positions stay below n.
+            unsafe {
+                let e = *evs.get_unchecked((k & im) as usize);
+                let p = hj.get_unchecked_mut(d);
+                *tmp.get_unchecked_mut(*p as usize) = e;
+                *p += 1;
+            }
+        }
+        std::mem::swap(evs, tmp);
+        let mut s = 0usize;
+        for &e in hj.iter() {
+            let e = e as usize;
+            if e - s > 1 {
+                let r = &mut evs[s..e];
+                let k0 = r[0].key();
+                let mut mk = false;
+                let mut ok = true;
+                for w in 1..r.len() {
+                    mk |= r[w].key() != k0;
+                    ok &= r[w].rts() >= r[w - 1].rts();
+                }
+                if mk {
+                    fix_multi(r);
+                } else if !ok {
+                    isort_by(r, |a, b| a.rts() < b.rts());
+                }
+            }
+            s = e;
+        }
+    });
+    true
+}
+
+/// Range whose records are nearly ts-ordered but hold several keys: stable split by key rank,
+/// then an insertion fixup on rts per key. More than 16 keys or 4096 records: `sort_small`.
+fn fix_multi<E: Ev>(r: &mut [E]) {
+    let m = r.len();
+    let mut uk = [0u64; 16];
+    let mut nk = 0usize;
+    for e in r.iter() {
+        let k = e.key();
+        if !uk[..nk].contains(&k) {
+            if nk == 16 || m > 4096 {
+                sort_small(r);
+                return;
+            }
+            uk[nk] = k;
+            nk += 1;
+        }
+    }
+    let uk = &mut uk[..nk];
+    uk.sort_unstable();
+    let slot = |k: u64| uk.iter().position(|&x| x == k).unwrap_or(0);
+    let mut c = [0usize; 17];
+    for e in r.iter() {
+        c[slot(e.key()) + 1] += 1;
+    }
+    for i in 0..nk {
+        c[i + 1] += c[i];
+    }
+    let mut buf = [const { MaybeUninit::<E>::uninit() }; 4096];
+    let mut pos = c;
+    for e in r.iter() {
+        let s = slot(e.key());
+        buf[pos[s]].write(*e);
+        pos[s] += 1;
+    }
+    for (o, b) in r.iter_mut().zip(&buf[..m]) {
+        // SAFETY: the split wrote each of the first m slots exactly once (the counts sum to m).
+        *o = unsafe { b.assume_init() };
+    }
+    for i in 0..nk {
+        let g = &mut r[c[i]..c[i + 1]];
+        if g.windows(2).any(|w| w[1].rts() < w[0].rts()) {
+            isort_by(g, |a, b| a.rts() < b.rts());
+        }
+    }
+}
+
 /// Sort by (dg(key), key, ts); equal (key, ts) pairs may end up in any order. `span` bounds
 /// every rts. A counting pass on the digit, then per range: a range shorter than RADIX_MIN with
 /// few keys is ordered as packed u64s (`pack_sort`), a long one-key range with `radix_rts`.
-fn sort_evs<E: Ev>(evs: &mut [E], tmp: &mut Vec<E>, cnt: &mut Vec<u32>, span: i64) {
+fn sort_evs<E: Ev>(evs: &mut Vec<E>, tmp: &mut Vec<E>, cnt: &mut Vec<u32>, span: i64) {
     let n = evs.len();
     if n < 256 {
         evs.sort_unstable_by_key(|e| (dg(e.key()), k128(e)));
+        return;
+    }
+    if sort_evs_ts(evs, tmp, cnt, span) {
         return;
     }
     hk_scatter(evs, tmp, cnt, |e| e.key());
@@ -2452,7 +2622,7 @@ fn sort_one_clicker(src: &[ClickRec], out: &mut [ClickRec], pk: &mut Vec<u64>) -
 
 #[allow(clippy::too_many_arguments)]
 fn process_bucket<E: Ev>(
-    evs: &mut [E],
+    evs: &mut Vec<E>,
     tmp: &mut Vec<E>,
     cnt: &mut Vec<u32>,
     clicks: &mut Vec<ClickRec>,
@@ -7185,6 +7355,58 @@ mod ck_sort_tests {
             for (a, b) in c1.dense.iter().zip(&c2.dense) {
                 assert_eq!((a.s, a.p, a.r), (b.s, b.p, b.r));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod ev_sort_tests {
+    use super::*;
+
+    fn rnd(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    #[test]
+    fn sort_evs_matches_reference() {
+        let mut s = 0x0bad_cafe_1234_5679u64;
+        // (events, distinct keys, ts span, reversed input)
+        let cases: [(usize, u64, u64, bool); 9] = [
+            (300, 3, 2_000_000_000, false),
+            (5000, 1, 5_000_000, true),
+            (20000, 500, 4_000_000_000, false),
+            (10000, 1, 1000, false),
+            (60000, 200_000, 86_400_000, false),
+            (40000, 30, 10, true),
+            (256, 1, 0, false),
+            (100_000, 20_000, 3_600_000, false),
+            (9000, 8000, 1 << 31, true),
+        ];
+        for &(n, nk, span, rev) in cases.iter() {
+            let mut keys: Vec<u64> = (0..nk).map(|_| rnd(&mut s) | 1).collect();
+            if nk > 100 {
+                // many keys on a few digits: multi-key ranges, some above 16 keys
+                let d0: Vec<u64> = keys.iter().copied().filter(|&k| dg(k) < 4).collect();
+                keys.extend(d0.iter().cycle().take(nk as usize / 4));
+            }
+            let mut v: Vec<EvL> = (0..n)
+                .map(|j| EvL::mk(keys[(rnd(&mut s) % keys.len() as u64) as usize], rnd(&mut s) % (span + 1), j as u32 & 0xffffff, 0))
+                .collect();
+            if rev {
+                v.sort_by(|a, b| b.rts().cmp(&a.rts()));
+            }
+            let full = |v: &mut Vec<EvL>| v.sort_by_key(|e| (dg(e.key()), e.key(), e.rts(), e.meta));
+            let mut want = v.clone();
+            full(&mut want);
+            let (mut tmp, mut cnt) = (vec![], vec![]);
+            let mut a = v.clone();
+            sort_evs(&mut a, &mut tmp, &mut cnt, span as i64);
+            assert!(a.windows(2).all(|w| (dg(w[0].key()), w[0].key(), w[0].rts()) <= (dg(w[1].key()), w[1].key(), w[1].rts())), "order n={n} nk={nk}");
+            full(&mut a);
+            assert!(a.iter().zip(&want).all(|(x, y)| x.key() == y.key() && x.rts() == y.rts() && x.meta == y.meta), "perm n={n} nk={nk}");
         }
     }
 }
