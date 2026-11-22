@@ -1528,6 +1528,10 @@ trait Tp: Copy + Send + Sync {
     fn rts(&self) -> u64;
     /// (price, category) of a purchase
     fn pc(&self) -> Option<(u64, u32)>;
+    #[inline(always)]
+    fn isp(&self) -> bool {
+        self.pc().is_some()
+    }
 }
 
 trait Ev: Tp {
@@ -1893,6 +1897,9 @@ struct Win {
     cnt: Vec<u32>,
     pos: Vec<u32>,
     active: Vec<u32>,
+    /// person_sess scratch: session-start and purchase line indices of one person
+    sl: Vec<u32>,
+    pl: Vec<u32>,
 }
 impl Win {
     #[inline]
@@ -1921,36 +1928,39 @@ impl Win {
 
 type CampMap = AHashMap<u64, [u64; 4]>;
 
-/// One dense (campaign, day) cell: sessions, purchases (u32: each is at most the number of kept
-/// lines, which is below u32::MAX) and revenue.
+/// Purchases and revenue of one dense (campaign, day) cell (u32 purchases: each is at most the
+/// number of kept lines, which is below u32::MAX).
 #[derive(Clone, Copy, Default)]
-struct CaCell {
-    s: u32,
+struct CaPr {
     p: u32,
     r: u64,
 }
 
-/// (campaign, day) accumulator: dense when the window is small, a map otherwise. The touch count
-/// lives in its own u32 array (`tch`, same index as `dense`): it is bumped for every active campaign
-/// at every session start, so its array is kept small enough to stay in L2.
+/// (campaign, day) accumulator: dense when the window is small, a map otherwise. Dense cells are
+/// day-major (index day * nc + campaign) and split by how often they are hit: the session count
+/// (`ss`) and the touch count (`tch`, bumped for every active campaign at every session start) are
+/// u32 arrays, so one day's slice of each is a few KB; purchases and revenue (`pr`) are only
+/// touched by sessions with a purchase.
 struct CampAcc {
-    dense: Vec<CaCell>,
+    ss: Vec<u32>,
     tch: Vec<u32>,
+    pr: Vec<CaPr>,
     d0: i64,
     nd: usize,
+    nc: usize,
     map: CampMap,
 }
 impl CampAcc {
     fn new(ncamp1: usize, d0: i64, nd: usize) -> Self {
         let n = if nd > 0 && nd * ncamp1 <= (1 << 22) { nd * ncamp1 } else { 0 };
-        CampAcc { dense: vec![CaCell::default(); n], tch: vec![0; n], d0, nd, map: CampMap::new() }
+        CampAcc { ss: vec![0; n], tch: vec![0; n], pr: vec![CaPr::default(); n], d0, nd, nc: ncamp1, map: CampMap::new() }
     }
-    /// Dense index of (c, d), if the cell is dense.
+    /// Dense row offset (day * nc) of day d, if the day is dense.
     #[inline(always)]
     fn di(&self, d: i64) -> Option<usize> {
         let di = d - self.d0;
-        if !self.dense.is_empty() && di >= 0 && (di as usize) < self.nd {
-            Some(di as usize)
+        if !self.ss.is_empty() && di >= 0 && (di as usize) < self.nd {
+            Some(di as usize * self.nc)
         } else {
             None
         }
@@ -1959,11 +1969,14 @@ impl CampAcc {
     #[inline(always)]
     fn sess(&mut self, c: u32, d: i64, purch: bool, rev: u64) {
         match self.di(d) {
-            Some(di) => {
-                let e = &mut self.dense[c as usize * self.nd + di];
-                e.s += 1;
-                e.p += purch as u32;
-                e.r += rev;
+            Some(o) => {
+                let i = o + c as usize;
+                self.ss[i] += 1;
+                if purch {
+                    let e = &mut self.pr[i];
+                    e.p += 1;
+                    e.r += rev;
+                }
             }
             None => {
                 let e = self.map.entry(((c as u64) << 32) | (d as u32 as u64)).or_insert([0; 4]);
@@ -1977,11 +1990,10 @@ impl CampAcc {
     #[inline(always)]
     fn touch(&mut self, act: &[u32], d: i64) {
         match self.di(d) {
-            Some(di) => {
-                let nd = self.nd;
-                let t = &mut self.tch[..];
+            Some(o) => {
+                let t = &mut self.tch[o..o + self.nc];
                 for &c in act {
-                    t[c as usize * nd + di] += 1;
+                    t[c as usize] += 1;
                 }
             }
             None => {
@@ -1992,8 +2004,10 @@ impl CampAcc {
         }
     }
     fn merge(&mut self, o: &CampAcc) {
-        for (a, b) in self.dense.iter_mut().zip(o.dense.iter()) {
-            a.s += b.s;
+        for (a, b) in self.ss.iter_mut().zip(o.ss.iter()) {
+            *a += *b;
+        }
+        for (a, b) in self.pr.iter_mut().zip(o.pr.iter()) {
             a.p += b.p;
             a.r += b.r;
         }
@@ -2009,9 +2023,10 @@ impl CampAcc {
     }
     fn rows(&self) -> Vec<(u32, i32, [u64; 4])> {
         let mut rows: Vec<(u32, i32, [u64; 4])> = vec![];
-        for (i, (v, &t)) in self.dense.iter().zip(self.tch.iter()).enumerate() {
-            if v.s != 0 || t != 0 {
-                rows.push(((i / self.nd) as u32, (self.d0 + (i % self.nd) as i64) as i32, [v.s as u64, v.p as u64, v.r, t as u64]));
+        for i in 0..self.ss.len() {
+            let (s, t, v) = (self.ss[i], self.tch[i], self.pr[i]);
+            if s != 0 || t != 0 {
+                rows.push(((i % self.nc) as u32, (self.d0 + (i / self.nc) as i64) as i32, [s as u64, v.p as u64, v.r, t as u64]));
             }
         }
         for (&k, &v) in &self.map {
@@ -4042,7 +4057,7 @@ impl<E: Ev> SsW<E> {
     fn new(ncamp: usize, d0: i64, nd: usize) -> Self {
         SsW {
             cm: CampAcc::new(ncamp + 1, d0, nd),
-            win: Win { cnt: vec![0; ncamp + 1], pos: vec![0; ncamp + 1], active: vec![] },
+            win: Win { cnt: vec![0; ncamp + 1], pos: vec![0; ncamp + 1], active: vec![], sl: vec![], pl: vec![] },
             out: vec![],
             evs: vec![],
             tmp: vec![],
@@ -4747,74 +4762,95 @@ fn person_sess<E: Tp>(
     let (mut lo, mut hi) = (0usize, 0usize);
     day.key = pid;
     day.day = 0;
-    let mut prev = 0i64;
-    let mut first = true;
-    let mut s_camp = 0u32;
-    let mut s_day = 0i64;
-    let mut s_rev = 0u64;
-    let mut s_purch = false;
-    let mut in_sess = false;
-    for e in pes {
-        let et = e.rts() as i64 + base;
-        if first || et - prev > GAP {
-            if in_sess {
-                cm.sess(s_camp, s_day, s_purch, s_rev);
+    let n = pes.len();
+    let mut sl = std::mem::take(&mut win.sl);
+    let mut pl = std::mem::take(&mut win.pl);
+    sl.clear();
+    pl.clear();
+    sl.reserve(n + 1);
+    pl.reserve(n + 1);
+    // branch-free pass: every session start (gap > GAP, and line 0) and every purchase line
+    let mut ns = 0usize;
+    let mut np = 0usize;
+    if n > 0 {
+        let sp = sl.as_mut_ptr();
+        let pp = pl.as_mut_ptr();
+        let mut prev = pes[0].rts().wrapping_sub(GAP as u64 + 1);
+        for (i, e) in pes.iter().enumerate() {
+            let r = e.rts();
+            // SAFETY: ns, np <= i < n and both have capacity n + 1
+            unsafe {
+                *sp.add(ns) = i as u32;
+                *pp.add(np) = i as u32;
             }
-            first = false;
-            in_sess = true;
-            let s = et;
-            let d = s.div_euclid(DAY);
-            s_day = d;
-            s_rev = 0;
-            s_purch = false;
-            while hi < cs.len() && cs[hi].ts <= s {
-                win.add(cs[hi].camp);
-                hi += 1;
+            ns += (r.wrapping_sub(prev) as i64 > GAP) as usize;
+            np += e.isp() as usize;
+            prev = r;
+        }
+        // SAFETY: ns, np <= n, capacity n + 1
+        unsafe {
+            *sp.add(ns) = n as u32;
+            *pp.add(np) = u32::MAX;
+            sl.set_len(ns + 1);
+            pl.set_len(np + 1);
+        }
+    }
+    let mut pj = 0usize;
+    for q in 0..ns {
+        let (a, b) = (sl[q] as usize, sl[q + 1] as usize);
+        let s = pes[a].rts() as i64 + base;
+        let d = s.div_euclid(DAY);
+        while hi < cs.len() && cs[hi].ts <= s {
+            win.add(cs[hi].camp);
+            hi += 1;
+        }
+        while lo < hi && cs[lo].ts < s - WEEK {
+            win.remove(cs[lo].camp);
+            lo += 1;
+        }
+        let s_camp = if hi > lo {
+            // the clicks at the latest ts; ties are not in click_id order
+            let t = cs[hi - 1].ts;
+            let c0 = cs[hi - 1].camp;
+            let mut g = hi - 1;
+            let mut mixed = false;
+            while g > lo && cs[g - 1].ts == t {
+                g -= 1;
+                mixed |= cs[g].camp != c0;
             }
-            while lo < hi && cs[lo].ts < s - WEEK {
-                win.remove(cs[lo].camp);
-                lo += 1;
-            }
-            s_camp = if hi > lo {
-                // the clicks at the latest ts; ties are not in click_id order
-                let t = cs[hi - 1].ts;
-                let c0 = cs[hi - 1].camp;
-                let mut g = hi - 1;
-                let mut mixed = false;
-                while g > lo && cs[g - 1].ts == t {
-                    g -= 1;
-                    mixed |= cs[g].camp != c0;
-                }
-                if mixed {
-                    min_cid_camp(&cs[g..hi])
-                } else {
-                    c0
-                }
+            if mixed {
+                min_cid_camp(&cs[g..hi])
             } else {
-                organic
-            };
-            cm.touch(&win.active, d);
-            if day.day != d {
-                flush_day(day, uds);
-                day.day = d;
+                c0
             }
-            day.sessions += 1;
+        } else {
+            organic
+        };
+        cm.touch(&win.active, d);
+        if day.day != d {
+            flush_day(day, uds);
+            day.day = d;
         }
-        prev = et;
-        day.events += 1;
-        if let Some((p, ecat)) = e.pc() {
-            day.rev += p;
-            s_rev += p;
-            s_purch = true;
-            match day.cats.iter_mut().find(|x| x.0 == ecat) {
-                Some(x) => x.1 += p,
-                None => day.cats.push((ecat, p)),
+        day.sessions += 1;
+        day.events += (b - a) as u32;
+        let mut s_rev = 0u64;
+        let mut s_purch = false;
+        while (pl[pj] as usize) < b {
+            if let Some((p, ecat)) = pes[pl[pj] as usize].pc() {
+                day.rev += p;
+                s_rev += p;
+                s_purch = true;
+                match day.cats.iter_mut().find(|x| x.0 == ecat) {
+                    Some(x) => x.1 += p,
+                    None => day.cats.push((ecat, p)),
+                }
             }
+            pj += 1;
         }
+        cm.sess(s_camp, d, s_purch, s_rev);
     }
-    if in_sess {
-        cm.sess(s_camp, s_day, s_purch, s_rev);
-    }
+    win.sl = sl;
+    win.pl = pl;
     flush_day(day, uds);
     for &c in &win.active {
         win.cnt[c as usize] = 0;
@@ -7030,12 +7066,12 @@ mod ck_sort_tests {
             };
             let (u1, c1, _) = run(&|u, c, cl| {
                 let (mut tmp, mut cnt, mut ct) = (vec![], vec![], vec![]);
-                let mut win = Win { cnt: vec![0; ncamp + 1], pos: vec![0; ncamp + 1], active: vec![] };
+                let mut win = Win { cnt: vec![0; ncamp + 1], pos: vec![0; ncamp + 1], active: vec![], sl: vec![], pl: vec![] };
                 process_runs(&full, &mut tmp, &runs, &mut cnt, cl, &mut ct, &mut win, ncamp as u32, u, c, 0);
             });
             let (u2, c2, _) = run(&|u, c, cl| {
                 let (mut tmp, mut cnt, mut ct) = (vec![], vec![], vec![]);
-                let mut win = Win { cnt: vec![0; ncamp + 1], pos: vec![0; ncamp + 1], active: vec![] };
+                let mut win = Win { cnt: vec![0; ncamp + 1], pos: vec![0; ncamp + 1], active: vec![], sl: vec![], pl: vec![] };
                 process_runs(&slim, &mut tmp, &runs, &mut cnt, cl, &mut ct, &mut win, ncamp as u32, u, c, 0);
             });
             assert_eq!(u1.len(), u2.len());
@@ -7043,8 +7079,9 @@ mod ck_sort_tests {
                 assert_eq!((a.key, a.day, a.sessions, a.events, a.rev, a.top), (b.key, b.day, b.sessions, b.events, b.rev, b.top));
             }
             assert_eq!(c1.tch, c2.tch);
-            for (a, b) in c1.dense.iter().zip(&c2.dense) {
-                assert_eq!((a.s, a.p, a.r), (b.s, b.p, b.r));
+            assert_eq!(c1.ss, c2.ss);
+            for (a, b) in c1.pr.iter().zip(&c2.pr) {
+                assert_eq!((a.p, a.r), (b.p, b.r));
             }
         }
     }
