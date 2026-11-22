@@ -1935,7 +1935,8 @@ fn parse_clicks(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: 
         let c2 = blsr(c1);
         let e2 = c2.trailing_zeros();
         let c3 = blsr(c2);
-        let (x, bad) = quote_bad(bzhi(qa, l), ca | na);
+        // no quote byte in the window: quote_bad(0, c) is (0, 0) for every c
+        let (x, bad) = if qa == 0 { (0, 0) } else { quote_bad(bzhi(qa, l), ca | na) };
         'slow: {
             // l: the newline; e0..e2: the commas; xq: whether each field opens with a quote;
             // win: the readable bytes at p
