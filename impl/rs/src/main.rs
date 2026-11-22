@@ -3411,7 +3411,7 @@ struct EvCtx<'a> {
 /// the line is invalid) and a dedup entry: packed event_id in `d`, others in `fb`; ingest times
 /// with an inexact key go to `side`. User ids with no packed key are noted in `fbn`.
 #[inline(never)]
-fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>) {
+fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Fb, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>) {
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
     let c0 = c.as_ptr() as usize;
@@ -3477,7 +3477,7 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
 /// `parse_events_sol` go through it).
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn ev_line<E: Ev>(f: &[B; 7], cx: &EvCtx, c0: usize, tci: &mut TsCache, tct: &mut TsCache, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
+fn ev_line<E: Ev>(f: &[B; 7], cx: &EvCtx, c0: usize, tci: &mut TsCache, tct: &mut TsCache, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Fb, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
     let &[eid, uid, ts, ing, et, pr, price] = f;
     if eid.is_empty() {
         return;
@@ -3528,12 +3528,109 @@ fn ev_line<E: Ev>(f: &[B; 7], cx: &EvCtx, c0: usize, tci: &mut TsCache, tct: &mu
     }
 }
 
-/// An event_id that pack6 rejects: its record goes to the hash buckets with key hash | HBIT (pack6 keys
-/// keep bits 63..60 clear), and its bytes stay in `fb` (in loc order) for the exact compare on key matches.
+/// An event_id that pack6 rejects. A Hex id (idkey-spec section 2) goes whole into `fb.x`: its prefix code
+/// and 128-bit value are the exact key of the Hex dedup table (`dx_table`), no byte compare. Any other id
+/// goes to the hash buckets with key hash | HBIT (pack6 keys keep bits 63..60 clear), and its bytes stay in
+/// `fb.v` (in loc order) for the exact compare on key matches.
 #[inline(never)]
-fn fb_put(rs: &RandomState, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, eid: B, ingest: i64, ik: u32, loc: u32) {
+fn fb_put(rs: &RandomState, d: &mut Vec<DRec>, fb: &mut Fb, eid: B, ingest: i64, ik: u32, loc: u32) {
+    // hex_full checks n == 33 and the prefix first, so other ids pay two compares
+    if let Some((_, full)) = hex_full(eid) {
+        if loc <= DX_LOC {
+            fb.x.push(DX::new(full, CODE[eid[0] as usize], ik, loc));
+            return;
+        }
+    }
+    fb_put_other(rs, d, fb, eid, ingest, ik, loc);
+}
+
+/// An event_id that is neither Short nor (storable) Hex: hash bucket record plus its bytes in `fb.v`.
+#[inline(never)]
+fn fb_put_other(rs: &RandomState, d: &mut Vec<DRec>, fb: &mut Fb, eid: B, ingest: i64, ik: u32, loc: u32) {
     d.push(DRec { eid: rs.hash_one(eid) | HBIT, ing: ik, loc });
-    fb.push((pack(eid), ingest, loc));
+    fb.v.push((pack(eid), ingest, loc));
+}
+
+/// Event ids that pack6 rejects: Other ids `v` (packed bytes, ingest, loc; loc order), Hex ids `x` (loc order).
+#[derive(PartialEq, Default)]
+struct Fb {
+    v: Vec<(u64, i64, u32)>,
+    x: Vec<DX>,
+}
+
+/// One line with a Hex event_id: the 32 hex digits as hi:lo, the ingest key and lp = loc | prefix code << 26
+/// (the code is 1..=63, so lp >> 26 != 0).
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct DX {
+    hi: u64,
+    lo: u64,
+    ing: u32,
+    lp: u32,
+}
+/// largest loc a DX can hold (26 bits)
+const DX_LOC: u32 = (1 << 26) - 1;
+impl DX {
+    /// the DX of a Hex id with digit value `full` and prefix code `c0` (non-zero), line `loc` <= DX_LOC
+    #[inline(always)]
+    fn new(full: u128, c0: u8, ik: u32, loc: u32) -> DX {
+        DX { hi: (full >> 64) as u64, lo: full as u64, ing: ik, lp: loc | (c0 as u32) << 26 }
+    }
+}
+
+/// hash of a Hex event id: the top EBB bits pick its bucket, bits 8.. its first table slot
+#[inline(always)]
+fn dx_hash(r: &DX) -> u64 {
+    mix(r.hi.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ r.lo ^ ((r.lp >> 26) as u64) << 58)
+}
+
+/// The Hex event ids of dedup bucket b, every chunk in order and each chunk's in loc order. Slot: [hi, lo,
+/// ingest key << 32 | global index of the current winner, prefix code] (code != 0 marks a full slot); the
+/// key (code, hi, lo) is the whole id, so equal keys are copies. On a match `better(g, ing, og, oing)` says
+/// whether the new line g beats the slot's line og; the loser goes to `lose`. Returns the table length used
+/// (the winners are the full slots of `tb[..len]`).
+#[inline(always)]
+fn dx_table<E>(ev_out: &[EvChunk<E>], mbase: &[u32], b: usize, tb: &mut Vec<[u64; 4]>, better: &impl Fn(u32, u32, u32, u32) -> bool, mut lose: impl FnMut(u32)) -> usize {
+    let total: usize = ev_out.iter().map(|c| (c.dxoff[b + 1] - c.dxoff[b]) as usize).sum();
+    if total == 0 {
+        return 0;
+    }
+    let cap = (total * 2).max(16).next_power_of_two();
+    if tb.len() < cap {
+        tb.resize(cap, [0; 4]);
+    }
+    let t = &mut tb[..cap];
+    t.fill([0; 4]);
+    let mask = cap - 1;
+    for (ci, c) in ev_out.iter().enumerate() {
+        let mb = mbase[ci];
+        for r in &c.dx[c.dxoff[b] as usize..c.dxoff[b + 1] as usize] {
+            let gi = mb + (r.lp & DX_LOC);
+            let pre = (r.lp >> 26) as u64;
+            let pk = ((r.ing as u64) << 32) | gi as u64;
+            let mut p = (dx_hash(r) >> 8) as usize & mask;
+            loop {
+                // SAFETY: p is masked to cap
+                let o = unsafe { t.get_unchecked_mut(p) };
+                if o[3] == 0 {
+                    *o = [r.hi, r.lo, pk, pre];
+                    break;
+                }
+                if o[0] == r.hi && o[1] == r.lo && o[3] == pre {
+                    let ok = (o[2] >> 32) as u32;
+                    let og = o[2] as u32;
+                    if better(gi, r.ing, og, ok) {
+                        o[2] = pk;
+                        lose(og);
+                    } else {
+                        lose(gi);
+                    }
+                    break;
+                }
+                p = (p + 1) & mask;
+            }
+        }
+    }
+    cap
 }
 
 /// Person key of a valid line's user id: the packed id, or else a hash with HBIT set (noted in
@@ -3618,6 +3715,117 @@ unsafe fn pack6x1(pa: *const u8, na: usize) -> (u64, bool) {
     let d2 = _mm_extract_epi32(dw, 2) as u32;
     let k = ((q & 0xFFFF_FFFF) << 36) | ((q >> 32) << 12) | (d2 as u64 >> 12);
     (k, bad == 0 && na.wrapping_sub(1) < 10)
+}
+
+// ---------- id classes (Short / Hex / Other) ----------
+// Short: pack6 ids (1..=10 bytes of [0-9A-Z_a-z]). Hex: 33 bytes, a CODE prefix byte and 32
+// lowercase hex digits. Other: the rest. A Hex key is HBIT | 1<<62 | prefix code << 56 | the top
+// 56 bits of the digits; the full 128-bit value goes to a side list (see idk_ref).
+
+/// Key of a Hex id from its prefix code `c0` (CODE value, non-zero) and digit value `f`.
+#[inline(always)]
+fn hex_key(c0: u8, f: u128) -> u64 {
+    HBIT | (1u64 << 62) | ((c0 as u64) << 56) | (f >> 72) as u64
+}
+
+/// Scalar reference of the id classes: (key, full, cls), cls 0 Short (key = pack6, full 0),
+/// 1 Hex (key = hex_key, full = the 32 digits as a number), 2 Other (key and full 0).
+fn idk_ref(b: &[u8]) -> (u64, u128, u8) {
+    if let Some(k) = pack6(b) {
+        return (k, 0, 0);
+    }
+    if b.len() == 33 && CODE[b[0] as usize] != 0 && b[1..].iter().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')) {
+        let mut f = 0u128;
+        for &c in &b[1..] {
+            f = (f << 4) | (if c <= b'9' { c - b'0' } else { c - b'a' + 10 }) as u128;
+        }
+        return (hex_key(CODE[b[0] as usize], f), f, 1);
+    }
+    (0, 0, 2)
+}
+
+/// The 32 bytes at `p` read as lowercase hex digits: (value, ok); ok iff every byte is [0-9a-f].
+/// The value (big-endian digit order) is only meaningful when ok.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn hex32(p: *const u8) -> (u128, bool) {
+    use core::arch::x86_64::*;
+    let x = _mm256_loadu_si256(p as *const __m256i);
+    let d = _mm256_sub_epi8(x, _mm256_set1_epi8(b'0' as i8));
+    let l = _mm256_sub_epi8(x, _mm256_set1_epi8(b'a' as i8));
+    let isd = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+    let isl = _mm256_cmpeq_epi8(_mm256_min_epu8(l, _mm256_set1_epi8(5)), l);
+    let ok = _mm256_movemask_epi8(_mm256_or_si256(isd, isl)) == -1;
+    // digit values: '0'..'9' -> 0..9, 'a'..'f' -> 10..15 ('a' - '0' - 10 = 39)
+    let v = _mm256_sub_epi8(d, _mm256_and_si256(isl, _mm256_set1_epi8(39)));
+    // 16 * first + second per byte pair, then the 8 pair bytes of each lane in reverse order
+    let w = _mm256_maddubs_epi16(v, _mm256_set1_epi16(0x0110));
+    let r = _mm256_shuffle_epi8(
+        w,
+        _mm256_setr_epi8(14, 12, 10, 8, 6, 4, 2, 0, -1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0, -1, -1, -1, -1, -1, -1, -1, -1),
+    );
+    let hi = _mm256_extract_epi64(r, 0) as u64;
+    let lo = _mm256_extract_epi64(r, 2) as u64;
+    (((hi as u128) << 64) | lo as u128, ok)
+}
+
+/// The full value of a Hex id given as a slice, or None when it is not Hex. Reads only `b`.
+#[inline(always)]
+fn hex_full(b: &[u8]) -> Option<(u64, u128)> {
+    if b.len() != 33 || CODE[b[0] as usize] == 0 {
+        return None;
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        // SAFETY: b[1..33] is 32 readable bytes
+        let (f, ok) = unsafe { hex32(b.as_ptr().add(1)) };
+        ok.then(|| (hex_key(CODE[b[0] as usize], f), f))
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        let (k, f, c) = idk_ref(b);
+        (c == 1).then_some((k, f))
+    }
+}
+
+/// Class, key and full value of one id of `n >= 1` bytes at `p` (as idk_ref). Reads 16 bytes
+/// at p, and 33 when n == 33; the caller guarantees they are readable.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn idk_x(p: *const u8, n: usize) -> (u64, u128, u8) {
+    let (k, ok) = pack6x1(p, n);
+    if ok {
+        return (k, 0, 0);
+    }
+    if n == 33 {
+        let c0 = CODE[*p as usize];
+        let (f, okh) = hex32(p.add(1));
+        if okh & (c0 != 0) {
+            return (hex_key(c0, f), f, 1);
+        }
+    }
+    (0, 0, 2)
+}
+
+/// `idk_x` of two ids (event_id and user_id), same contract per id.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn idk_x2(pa: *const u8, na: usize, pb: *const u8, nb: usize) -> ((u64, u128, u8), (u64, u128, u8)) {
+    let (ka, oka, kb, okb) = pack6x2(pa, na, pb, nb);
+    let one = |p: *const u8, n: usize, k: u64, ok: bool| {
+        if ok {
+            return (k, 0u128, 0u8);
+        }
+        if n == 33 {
+            let c0 = CODE[*p as usize];
+            let (f, okh) = hex32(p.add(1));
+            if okh & (c0 != 0) {
+                return (hex_key(c0, f), f, 1);
+            }
+        }
+        (0, 0, 2)
+    };
+    (one(pa, na, ka, oka), one(pb, nb, kb, okb))
 }
 
 /// `pack6x1` stays for the event-id miss path; this is the hot-path fused pass.
@@ -3851,7 +4059,7 @@ unsafe fn ts25h(p: *const u8, ra: u64, rb: u64, rd: i64, c: &mut DayCache, hs: i
 /// as pointer and length, both ids packed in one vector, ISO times straight to seconds.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
 #[inline(never)]
-fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
+fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Fb, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
     use core::arch::x86_64::_bzhi_u64;
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
@@ -4028,12 +4236,15 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
             if !iex {
                 side.push((loc, ingest));
             }
-            // SAFETY: 16 bytes from pe are readable (see pack6x2's callers above)
-            let (ke, okk) = unsafe { pack6x1(pe, ne) };
-            if okk {
+            // SAFETY: 16 bytes from pe are readable (see pack6x2's callers above), and when ne == 33
+            // idk_x reads the 33 id bytes themselves
+            let (ke, full, cls) = unsafe { idk_x(pe, ne) };
+            if cls == 0 {
                 d.push(DRec { eid: ke, ing: ik, loc });
+            } else if cls == 1 && loc <= DX_LOC {
+                fb.x.push(DX::new(full, (ke >> 56) as u8 & 63, ik, loc));
             } else {
-                fb_put(cx.rs, d, fb, sl(pe, ne), ingest, ik, loc);
+                fb_put_other(cx.rs, d, fb, sl(pe, ne), ingest, ik, loc);
             }
             continue 'ln;
         }
@@ -4049,7 +4260,7 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
-fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
+fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: &mut Fb, fbn: &mut Vec<(u64, u64)>, side: &mut Vec<(u32, i64)>, dz: &mut Dz<E>) {
     let mut tci = TsCache::new();
     let mut tct = TsCache::new();
     let c0 = c.as_ptr() as usize;
@@ -4060,18 +4271,19 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
 struct EvBufs<E> {
     m: Vec<E>,
     d: Vec<DRec>,
-    fb: Vec<(u64, i64, u32)>,
+    fb: Fb,
     fbn: Vec<(u64, u64)>,
     side: Vec<(u32, i64)>,
 }
 impl<E: Ev> EvBufs<E> {
     fn new() -> Self {
-        EvBufs { m: Vec::with_capacity(CHUNK / 32), d: Vec::with_capacity(CHUNK / 32), fb: vec![], fbn: vec![], side: vec![] }
+        EvBufs { m: Vec::with_capacity(CHUNK / 32), d: Vec::with_capacity(CHUNK / 32), fb: Fb::default(), fbn: vec![], side: vec![] }
     }
     fn clear(&mut self) {
         self.m.clear();
         self.d.clear();
-        self.fb.clear();
+        self.fb.v.clear();
+        self.fb.x.clear();
         self.fbn.clear();
         self.side.clear();
     }
@@ -4090,7 +4302,7 @@ impl<E: Ev> EvBufs<E> {
             return Some(format!("d differs ({} vs {})", self.d.len(), o.d.len()));
         }
         if self.fb != o.fb {
-            return Some(format!("fb differs ({} vs {})", self.fb.len(), o.fb.len()));
+            return Some(format!("fb differs ({}+{} vs {}+{})", self.fb.v.len(), self.fb.x.len(), o.fb.v.len(), o.fb.x.len()));
         }
         if self.fbn != o.fbn {
             return Some(format!("fbn differs ({} vs {})", self.fbn.len(), o.fbn.len()));
@@ -4151,7 +4363,10 @@ struct EvChunk<E> {
     d: Vec<DRec>,
     doff: Vec<u32>,
     dz: Dz<E>,
-    fb: Vec<(u64, i64, u32)>,
+    fb: Fb,
+    /// the Hex event ids (`Fb::x`) grouped by `dx_hash` bucket, with offsets like `d` / `doff`
+    dx: Vec<DX>,
+    dxoff: Vec<u32>,
     fbn: Vec<(u64, u64)>,
     side: Vec<(u32, i64)>,
 }
@@ -4204,9 +4419,11 @@ fn ev_after<E: Ev>(
         let fbb = |g: u32| -> B {
             let c = mbase.partition_point(|&b| b <= g) - 1;
             let loc = g - mbase[c];
-            let f = &ev_out[c].fb;
+            let f = &ev_out[c].fb.v;
             unpack(f[f.binary_search_by_key(&loc, |x| x.2).unwrap()].0)
         };
+        // does line g (ingest key k) beat line og (key ok) for the same event_id: smaller ingest, then exact ingest
+        let better = |g: u32, k: u32, og: u32, ok: u32| k < ok || (k == ok && side_any && exact(g, k) < exact(og, ok));
         let (ndb, dsh) = idx_cfg().map_or((0, 0), |c| (c.ndb, c.sh));
         rayon::join(
             || {
@@ -4260,6 +4477,7 @@ fn ev_after<E: Ev>(
                     let maxcap = (totals.iter().max().unwrap() * 2).max(16).next_power_of_two();
                     // slot: (event_id, ingest key << 32 | global index of the current winner)
                     let mut tbuf: Vec<[u64; 2]> = vec![[0, 0]; maxcap];
+                    let mut xbuf: Vec<[u64; 4]> = Vec::new();
                     for (i, &total) in totals.iter().enumerate() {
                         let b = ndb + g * DDG + i;
                         let cap = (total * 2).max(16).next_power_of_two();
@@ -4300,6 +4518,7 @@ fn ev_after<E: Ev>(
                                 }
                             }
                         }
+                        dx_table(&ev_out, &mbase, g * DDG + i, &mut xbuf, &better, &kill);
                     }
                     pt(2, &mut tm);
                 })
@@ -4310,7 +4529,7 @@ fn ev_after<E: Ev>(
         );
         if TIMING.load(Relaxed) {
             let dense: usize = ev_out.iter().map(|c| c.doff[ndb] as usize).sum();
-            let all: usize = ev_out.iter().map(|c| c.d.len() + c.fb.len()).sum();
+            let all: usize = ev_out.iter().map(|c| c.d.len() + c.fb.v.len() + c.dx.len()).sum();
             tick(&format!("idx dense records {dense} of {all} ({:.5})", dense as f64 / all.max(1) as f64));
         }
     }
@@ -4790,7 +5009,7 @@ fn ev_after_idx<E: Ev>(
         let dense: usize = ev_out.iter().map(|c| c.dz.len()).sum();
         let ov: usize = ev_out.iter().map(|c| c.dz.ov.len()).sum();
         let slots: usize = ev_out.iter().map(|c| c.dz.slots()).sum();
-        let all: usize = dense + ev_out.iter().map(|c| c.d.len() + c.fb.len()).sum::<usize>();
+        let all: usize = dense + ev_out.iter().map(|c| c.d.len() + c.fb.v.len() + c.dx.len()).sum::<usize>();
         tick(&format!("idx dense records {dense} of {all} ({:.5}) overflow {ov} slots {slots}", dense as f64 / all.max(1) as f64));
     }
     let (dparts, rest): (Vec<RdPart<E::S>>, (Vec<E>, Vec<u32>)) = {
@@ -4819,9 +5038,11 @@ fn ev_after_idx<E: Ev>(
         let fbb = |g: u32| -> B {
             let c = mbase.partition_point(|&b| b <= g) - 1;
             let loc = g - mbase[c];
-            let f = &ev_out[c].fb;
+            let f = &ev_out[c].fb.v;
             unpack(f[f.binary_search_by_key(&loc, |x| x.2).unwrap()].0)
         };
+        // does line g (ingest key k) beat line og (key ok) for the same event_id: smaller ingest, then exact ingest
+        let better = |g: u32, k: u32, og: u32, ok: u32| k < ok || (k == ok && side_any && exact(g, k) < exact(og, ok));
         let line = |g: u32| -> E {
             let c = mbase.partition_point(|&b| b <= g) - 1;
             ev_out[c].m[(g - mbase[c]) as usize]
@@ -5003,12 +5224,21 @@ fn ev_after_idx<E: Ev>(
                                 .map(|c| (c.doff[g * DDG + i + 1] - c.doff[g * DDG + i]) as usize)
                                 .sum()
                         });
-                        if totals.iter().all(|&x| x == 0) {
+                        let xany = ev_out.iter().any(|c| c.dxoff[g * DDG] != c.dxoff[(g + 1) * DDG]);
+                        if totals.iter().all(|&x| x == 0) && !xany {
                             return em;
                         }
                         let maxcap = (totals.iter().max().unwrap() * 2).max(16).next_power_of_two();
                         let mut tbuf: Vec<[u64; 2]> = vec![[0, 0]; maxcap];
+                        let mut xbuf: Vec<[u64; 4]> = Vec::new();
                         for (i, &total) in totals.iter().enumerate() {
+                            // Hex event ids: one winner per full slot (the order of `em` is free)
+                            let xn = dx_table(&ev_out, &mbase, g * DDG + i, &mut xbuf, &better, |_| {});
+                            for o in &xbuf[..xn] {
+                                if o[3] != 0 {
+                                    em.push(line(o[2] as u32));
+                                }
+                            }
                             if total == 0 {
                                 continue;
                             }
@@ -5479,7 +5709,7 @@ fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
     let cap = if dz.on { c.len() / 4096 } else { c.len() / 64 };
     let mut m: Vec<E> = Vec::with_capacity(cap);
     let mut d: Vec<DRec> = Vec::with_capacity(cap);
-    let (mut fb, mut fbn, mut side) = (vec![], vec![], vec![]);
+    let (mut fb, mut fbn, mut side) = (Fb::default(), vec![], vec![]);
     let mut tm = now();
     static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *OLD.get_or_init(|| std::env::var_os("SHOP_EVOLD").is_some()) {
@@ -5489,9 +5719,11 @@ fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
     }
     pt(0, &mut tm);
     let (d, doff) = bucketize(&d, EB, |r| (mix(r.eid) >> (64 - EBB)) as usize);
+    let (dx, dxoff) = bucketize(&fb.x, EB, |r| (dx_hash(r) >> (64 - EBB)) as usize);
+    fb.x = Vec::new();
     dz.finish();
     pt(1, &mut tm);
-    EvChunk { m, d, doff, dz, fb, fbn, side }
+    EvChunk { m, d, doff, dz, fb, dx, dxoff, fbn, side }
 }
 
 fn ev_parse<E: Ev>(ev_chunks: &[B], cx: &EvCtx) -> Vec<EvChunk<E>> {
@@ -5514,8 +5746,14 @@ fn hash_chunk<E: Ev>(mut h: u64, r: &EvChunk<E>) -> u64 {
     for &x in &r.doff {
         add(x as u64);
     }
-    for x in &r.fb {
+    for x in &r.fb.v {
         add(x.0 ^ (x.1 as u64) ^ ((x.2 as u64) << 40));
+    }
+    for x in &r.dx {
+        add(x.hi ^ x.lo.rotate_left(17) ^ ((x.ing as u64) << 1) ^ ((x.lp as u64) << 32));
+    }
+    for &x in &r.dxoff {
+        add(x as u64);
     }
     for x in &r.fbn {
         add(x.0 ^ x.1);
@@ -6105,6 +6343,92 @@ mod tests {
         }
         fn chance(&mut self, pct: u64) -> bool {
             self.below(100) < pct
+        }
+    }
+
+    /// One id class check on `b` placed at the start of a 64-byte buffer padded with `pad`.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    fn idk_check(b: &[u8], pad: u8, other: &[u8]) {
+        let r = idk_ref(b);
+        let mut buf = [pad; 128];
+        buf[..b.len()].copy_from_slice(b);
+        let mut buf2 = [pad; 128];
+        buf2[..other.len()].copy_from_slice(other);
+        let norm = |x: (u64, u128, u8)| if x.2 == 2 { (0, 0, 2) } else { x };
+        let x = unsafe { idk_x(buf.as_ptr(), b.len()) };
+        assert_eq!(norm(x), norm(r), "idk_x {:?}", String::from_utf8_lossy(b));
+        let (xa, xb) = unsafe { idk_x2(buf.as_ptr(), b.len(), buf2.as_ptr(), other.len()) };
+        assert_eq!(norm(xa), norm(r));
+        assert_eq!(norm(xb), norm(idk_ref(other)));
+        let (xa, xb) = unsafe { idk_x2(buf2.as_ptr(), other.len(), buf.as_ptr(), b.len()) };
+        assert_eq!(norm(xb), norm(r));
+        assert_eq!(norm(xa), norm(idk_ref(other)));
+        match r.2 {
+            0 => assert_eq!(Some(r.0), pack6(b)),
+            1 => {
+                assert_eq!(hex_full(b), Some((r.0, r.1)));
+                assert_eq!(r.0 >> 62, 3);
+                assert_eq!((r.0 >> 56) & 63, CODE[b[0] as usize] as u64);
+            }
+            _ => assert_eq!(hex_full(b), None),
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    fn idk_classes_match_ref() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let alpha: Vec<u8> = (0u8..=255).filter(|&c| CODE[c as usize] != 0).collect();
+        let hexd = b"0123456789abcdef";
+        let mut cases: Vec<Vec<u8>> = vec![
+            b"u".to_vec(),
+            b"u0123456789abcdef0123456789abcdef".to_vec(),
+            b"uffffffffffffffffffffffffffffffff".to_vec(),
+            b"u00000000000000000000000000000000".to_vec(),
+            b"_ffffffffffffffffffffffffffffffff".to_vec(),
+            b"zffffffffffffffffffffffffffffffff".to_vec(),
+            b"u0123456789ABCDEF0123456789abcdef".to_vec(),
+            b"-0123456789abcdef0123456789abcdef".to_vec(),
+            b"u0123456789abcdef0123456789abcdeg".to_vec(),
+            b"u0123456789abcdef0123456789abcde/".to_vec(),
+            b"u0123456789abcdef0123456789abcde:".to_vec(),
+            b"u0123456789abcdef0123456789abcde`".to_vec(),
+            b"u0123456789abcdef0123456789abcde\xe1".to_vec(),
+            b"u0123456789abcdef0123456789abcde".to_vec(),
+            b"u0123456789abcdef0123456789abcdef0".to_vec(),
+            b"0123456789abcdef0123456789abcdef0".to_vec(),
+        ];
+        for n in 1..=12 {
+            for _ in 0..50 {
+                cases.push((0..n).map(|_| alpha[rng.below(alpha.len() as u64) as usize]).collect());
+            }
+        }
+        for _ in 0..3000 {
+            let mut v: Vec<u8> = vec![alpha[rng.below(alpha.len() as u64) as usize]];
+            v.extend((0..32).map(|_| hexd[rng.below(16) as usize]));
+            if rng.chance(30) {
+                let i = rng.below(33) as usize;
+                v[i] = rng.below(256) as u8;
+            }
+            if rng.chance(5) {
+                let n = 31 + rng.below(5) as usize;
+                v.resize(n, b'a');
+            }
+            cases.push(v);
+        }
+        for c in &cases {
+            for pad in [0u8, b'a', b',', 0xff] {
+                let other = &cases[rng.below(cases.len() as u64) as usize];
+                idk_check(c, pad, other);
+            }
+        }
+        // key order equals byte order within Hex ids of one prefix length
+        let mut hx: Vec<&Vec<u8>> = cases.iter().filter(|c| idk_ref(c).2 == 1).collect();
+        assert!(hx.len() > 1500);
+        hx.sort();
+        for w in hx.windows(2) {
+            let (a, b) = (idk_ref(w[0]), idk_ref(w[1]));
+            assert!((a.0, a.1) <= (b.0, b.1));
         }
     }
 
@@ -7560,5 +7884,38 @@ mod ev_sort_tests {
             full(&mut a);
             assert!(a.iter().zip(&want).all(|(x, y)| x.key() == y.key() && x.rts() == y.rts() && x.meta == y.meta), "perm n={n} nk={nk}");
         }
+    }
+}
+
+#[cfg(test)]
+mod idk_tests {
+    use super::*;
+
+    #[test]
+    fn idk_ref_classes() {
+        // Short ids: pack6
+        for id in ["e1", "E0ab_9", "x123456789"] {
+            assert_eq!(idk_ref(id.as_bytes()), (pack6(id.as_bytes()).unwrap(), 0, 0));
+        }
+        // Hex ids: prefix + 32 lowercase hex digits
+        let h = "e0123456789abcdef00112233445566ff";
+        let full = 0x0123456789abcdef00112233445566ffu128;
+        let key = HBIT | 1 << 62 | (CODE[b'e' as usize] as u64) << 56 | (full >> 72) as u64;
+        assert_eq!(idk_ref(h.as_bytes()), (key, full, 1));
+        assert_eq!(idk_ref(b"Zffffffffffffffffffffffffffffffff"), (HBIT | 1 << 62 | (CODE[b'Z' as usize] as u64) << 56 | (u128::MAX >> 72) as u64, u128::MAX, 1));
+        // numeric key order equals byte order for Hex ids
+        let (ka, _, _) = idk_ref(b"a00000000000000000000000000000000");
+        let (kb, _, _) = idk_ref(b"a00000000000001000000000000000000");
+        assert!(ka < kb);
+        // Other: upper-case hex, wrong length, bad prefix, non-hex
+        for id in ["e0123456789ABCDEF00112233445566ff", "e0123456789abcdef00112233445566f", "-0123456789abcdef00112233445566ff", "e0123456789abcdeg00112233445566ff", "e0123456789abcdef00112233445566ff0", "abcdefghijk"] {
+            assert_eq!(idk_ref(id.as_bytes()).2, 2, "{id}");
+        }
+        // DX round trip: hi/lo/code give back the id bytes
+        let (_, f, _) = idk_ref(h.as_bytes());
+        let x = DX { hi: (f >> 64) as u64, lo: f as u64, ing: 7, lp: 5 | (CODE[b'e' as usize] as u32) << 26 };
+        let back = format!("{}{:016x}{:016x}", DECODE[(x.lp >> 26) as usize] as char, x.hi, x.lo);
+        assert_eq!(back, h);
+        assert_eq!(x.lp & DX_LOC, 5);
     }
 }
