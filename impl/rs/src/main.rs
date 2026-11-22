@@ -2982,12 +2982,11 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
     cols
 }
 
-fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names) {
+fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names, rev32: bool) {
     let mut tm = now();
     const RG: usize = 1 << 20;
     let total: usize = groups.iter().map(|g| g.len()).sum();
     let mut f = Pqf::new(total * 6 + 4096);
-    let rev32 = std::env::var_os("SHOP_REV64").is_none() && groups.iter().all(|g| g.iter().all(|r| r.rev <= i32::MAX as u64));
     // split the groups into row groups of at most RG rows
     let mut rgs: Vec<(Vec<Cm>, usize)> = vec![];
     let mut cur: Vec<&[UD]> = vec![];
@@ -5715,10 +5714,13 @@ fn main() {
         files[k].push(g);
     }
     let any_rows = files.iter().any(|g| g.iter().any(|x| !x.is_empty()));
+    // one revenue width for every file of the table, so all part files share a schema
+    let rev32 = std::env::var_os("SHOP_REV64").is_none()
+        && files.par_iter().all(|g| g.iter().all(|x| x.iter().all(|r| r.rev <= i32::MAX as u64)));
     rayon::join(
         || {
             files.par_iter().enumerate().filter(|(i, g)| g.iter().any(|x| !x.is_empty()) || (*i == 0 && !any_rows)).for_each(|(i, g)| {
-                write_user_daily(&ud_dir.join(format!("part-{i}.parquet")), g, &cat_names, &names);
+                write_user_daily(&ud_dir.join(format!("part-{i}.parquet")), g, &cat_names, &names, rev32);
             })
         },
         || write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows, &camp_names, &channels),
