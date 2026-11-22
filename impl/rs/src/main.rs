@@ -4176,7 +4176,12 @@ fn parse_events_sol<E: Ev, const DZ: bool>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: 
             // ingest's date key and day start when it is a valid F1 date, else 2000-01-01's.
             let (mut ra, mut rb, mut rd) = (D0_A, D0_B, D0_S);
             // SAFETY: pi + 19 and pt + 19 lie inside window B (readable, see above)
-            let (his, hio, hts, hto) = unsafe { hms2(pi.add(11), pt.add(11)) };
+            let (his, hio, hts, hto) = if nt == 20 || nt == 25 {
+                unsafe { hms2(pi.add(11), pt.add(11)) }
+            } else {
+                let h = unsafe { hms(pi.add(11)) };
+                (h.unwrap_or(0), h.is_some(), 0, false)
+            };
             let iso_i = if ni == 20 && unsafe { *pi.add(19) } == b'Z' {
                 let (ia, ib) = unsafe { (ldp(pi), ldp(pi.add(3))) };
                 let (dd, hs) = unsafe { (day_get(ia, ib, pi, &mut dci), if hio { Some(his) } else { None }) };
