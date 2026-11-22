@@ -1,0 +1,111 @@
+name: bench (linux, scorer docker flags)
+on:
+  workflow_dispatch:
+    inputs:
+      refs:
+        default: "none"
+      runs:
+        default: "5"
+      probe:
+        default: "0"
+      perf:
+        default: "0"
+      events:
+        default: "60000000"
+      clicks:
+        default: "15000000"
+permissions:
+  contents: read
+jobs:
+  perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: toolchain
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends musl-tools bc
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get install -y -q --no-install-recommends linux-tools-common "linux-tools-$(uname -r)" \
+            || sudo apt-get install -y -q --no-install-recommends linux-tools-common linux-tools-azure \
+            || sudo apt-get install -y -q --no-install-recommends linux-tools-common linux-tools-generic || true
+          sudo apt-get install -y -q --no-install-recommends linux-perf || true
+          command -v perf || ls /usr/lib/linux-tools/*/perf || true
+      - name: perf
+        env:
+          EV: ${{ github.event.inputs.events || '60000000' }}
+          CK: ${{ github.event.inputs.clicks || '15000000' }}
+        run: |
+          set +e; set -uo pipefail
+          W=/tmp/pf; mkdir -p $W; R=$W/rep; mkdir -p $R
+          { echo "== machine"; lscpu | grep -E 'Model name|^CPU\(s\)|Thread|L1d|L2|L3|Hypervisor'; free -g | head -2; uname -r; } 2>&1 | tee $R/machine.txt
+          P=$(command -v perf || ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1 || true); echo "perf=$P" | tee -a $R/machine.txt
+          $P --version 2>&1 | tee -a $R/machine.txt
+          sudo sysctl kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 2>&1 | tee -a $R/machine.txt
+          curl -sSfL -o $W/gen.zip https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
+          echo "13724cadbac5a99d847e27cea911cd2e338ff972b46c2039da87452011bb101e  $W/gen.zip" | sha256sum -c --quiet
+          (cd $W && unzip -q -o gen.zip && cd generator && cargo build --release -q)
+          G=$(find $W -path '*release/generate' -type f | head -1)
+          echo "sha: $(git rev-parse HEAD)" | tee -a $R/machine.txt
+          (cd impl/rs && CC_x86_64_unknown_linux_musl=musl-gcc RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes" \
+             CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CARGO_PROFILE_RELEASE_STRIP=none CARGO_TARGET_DIR=$W/tgtp \
+             cargo build --release --locked -q --target x86_64-unknown-linux-musl) && cp $W/tgtp/x86_64-unknown-linux-musl/release/shop $W/shop-prof
+          ls -l $W/shop-prof
+          D=$W/data; $G --seed 7 --events $EV --clicks $CK --output $D --threads 4 >/dev/null
+          o=$(mktemp -d); s2=$(mktemp -d)
+          E="DATA_DIR=$D OUTPUT_DIR=$o SCRATCH_DIR=$s2 NCPU=4 SHOP_TIMING=1"
+          echo "== warm-up"; sudo env $E $W/shop-prof 2>&1 | grep -E 'written|prof'
+          echo "== perf stat"
+          sudo env $E $P stat -e task-clock,cycles,instructions,branches,branch-misses,cache-references,cache-misses,page-faults -o $R/stat.txt $W/shop-prof 2> $R/stat.ticks.txt
+          cat $R/stat.txt $R/stat.ticks.txt | tee -a $R/stat.all.txt | tail -40
+          for n in 1 2; do
+            EVT=cycles; SA="-F 1999"; [ $n = 2 ] && { EVT=branch-misses; SA="-c 10000"; }
+            sudo env $E $P record -q $SA -e $EVT -g -o $W/perf$n.data $W/shop-prof >/dev/null 2>$R/rec$n.ticks.txt || true
+            if [ ! -s $W/perf$n.data ] || grep -qi 'not supported\|cannot open\|failed' $R/rec$n.ticks.txt; then
+              head -5 $R/rec$n.ticks.txt; EVT=cpu-clock; SA="-F 1999"
+              sudo env $E $P record -q -F 1999 -e cpu-clock -g -o $W/perf$n.data $W/shop-prof >/dev/null 2>$R/rec$n.ticks.txt
+            fi
+            echo "event run$n: $EVT" | tee -a $R/machine.txt
+          done
+          sudo chmod a+r $W/perf*.data
+          for n in 1 2; do
+            sudo $P report -i $W/perf$n.data --stdio -n --no-children -g none --sort dso,symbol 2>/dev/null | grep -v '^#' | grep -v '^$' | head -60 > $R/overall$n.self.txt
+            sudo $P report -i $W/perf$n.data --stdio -n --no-children -g none --sort srcline 2>/dev/null | grep -v '^#' | grep -v '^$' | head -60 > $R/overall$n.srcline.txt
+            sudo $P report -i $W/perf$n.data --stdio -n --children -g none --sort symbol 2>/dev/null | grep -v '^#' | grep -v '^$' | head -40 > $R/overall$n.children.txt
+            sudo $P report -i $W/perf$n.data --stdio -n --no-children -g none --sort comm 2>/dev/null | grep -v '^#' | grep -v '^$' | head -12 > $R/overall$n.comm.txt
+          done
+          for n in 1 2; do
+            T0=$(sudo $P script -i $W/perf$n.data -F time 2>/dev/null | sed -n 1p | tr -d ' :')
+            echo "T0=$T0" > $R/phase$n.t0.txt
+            grep -E '^\[[0-9.]+s\]' $R/rec$n.ticks.txt > $R/phase$n.ticks.txt
+            prev=0.0; i=0
+            while IFS= read -r line; do
+              t=$(echo "$line" | sed -E 's/^\[([0-9.]+)s\].*/\1/'); lab=$(echo "$line" | sed -E 's/^\[[0-9.]+s\] *//' | cut -c1-40)
+              i=$((i+1))
+              a=$(echo "$T0 + $prev" | bc -l); b=$(echo "$T0 + $t" | bc -l)
+              echo "### run$n phase $i: $prev .. $t s  (ends at: $lab)" >> $R/phases$n.txt
+              sudo $P report -i $W/perf$n.data --stdio -n --no-children -g none --sort symbol --time $a,$b 2>/dev/null | grep -v '^#' | grep -v '^$' | head -18 >> $R/phases$n.txt
+              prev=$t
+            done < $R/phase$n.ticks.txt
+          done
+          for n in 1; do
+            T0=$(sed 's/T0=//' $R/phase$n.t0.txt)
+            for w in "events parsed|clicks parsed|clk" "dedup done|sessionized|ses" "clicks parsed|dedup done|ded"; do
+              l1=$(echo "$w" | cut -d'|' -f1); l2=$(echo "$w" | cut -d'|' -f2); nm=$(echo "$w" | cut -d'|' -f3)
+              t1=$(grep "$l1" $R/rec$n.ticks.txt | head -1 | sed -E 's/^\[([0-9.]+)s\].*/\1/'); t2=$(grep "$l2" $R/rec$n.ticks.txt | head -1 | sed -E 's/^\[([0-9.]+)s\].*/\1/')
+              a=$(echo "$T0 + $t1" | bc -l); b=$(echo "$T0 + $t2" | bc -l)
+              sudo $P report -i $W/perf$n.data --stdio -n --no-children -g none --sort srcline --time $a,$b 2>/dev/null | grep -v '^#' | grep -v '^$' | head -45 > $R/win-$nm.srcline.txt
+            done
+          done
+          for n in 1 2; do
+            sudo $P script -i $W/perf$n.data --no-inline -F time,ip,sym 2>/dev/null | gzip -6 > $R/script$n.txt.gz
+          done
+          echo "== done"; ls -l $R; head -70 $R/overall2.self.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: down29-perf
+          path: /tmp/pf/rep
