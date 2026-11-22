@@ -3297,7 +3297,7 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
             }
             match pack6(eid) {
                 Some(k) => d.push(DRec { eid: k, ing: ik, loc }),
-                None => fb.push((pack(eid), ingest, loc)),
+                None => fb_put(cx.rs, d, fb, eid, ingest, ik, loc),
             }
         }
     });
@@ -3354,8 +3354,16 @@ fn ev_line<E: Ev>(f: &[B; 7], cx: &EvCtx, c0: usize, tci: &mut TsCache, tct: &mu
     }
     match k6 {
         Some(k) => d.push(DRec { eid: k, ing: ik, loc }),
-        None => fb.push((pack(eid), ingest, loc)),
+        None => fb_put(cx.rs, d, fb, eid, ingest, ik, loc),
     }
+}
+
+/// An event_id that pack6 rejects: its record goes to the hash buckets with key hash | HBIT (pack6 keys
+/// keep bits 63..60 clear), and its bytes stay in `fb` (in loc order) for the exact compare on key matches.
+#[inline(never)]
+fn fb_put(rs: &RandomState, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, eid: B, ingest: i64, ik: u32, loc: u32) {
+    d.push(DRec { eid: rs.hash_one(eid) | HBIT, ing: ik, loc });
+    fb.push((pack(eid), ingest, loc));
 }
 
 /// Person key of a valid line's user id: the packed id, or else a hash with HBIT set (noted in
@@ -3592,6 +3600,26 @@ unsafe fn hms(p: *const u8) -> Option<i64> {
     Some((h * 60 + ((v >> 24) & 0xFF) as i64) * 60 + ((v >> 48) & 0xFF) as i64)
 }
 
+/// `hms` of the 8 bytes at `a` and of the 8 bytes at `b` in one vector: (seconds, ok) for each,
+/// with ok exactly when `hms` gives Some (then the seconds are its value). Per byte, the digit
+/// value (colons xored to 0) must not exceed 2, 9, 0, 5, 9, 0, 5, 9; the hour test is the sum
+/// test (minutes and seconds are at most 59 then).
+#[inline(always)]
+unsafe fn hms2(a: *const u8, b: *const u8) -> (i64, bool, i64, bool) {
+    use core::arch::x86_64::*;
+    let t = _mm_set_epi64x(ldp(b) as i64, ldp(a) as i64);
+    let v = _mm_xor_si128(_mm_sub_epi8(t, _mm_set1_epi8(b'0' as i8)), _mm_setr_epi8(0, 0, 10, 0, 0, 10, 0, 0, 0, 0, 10, 0, 0, 10, 0, 0));
+    let over = _mm_subs_epu8(v, _mm_setr_epi8(2, 9, 0, 5, 9, 0, 5, 9, 2, 9, 0, 5, 9, 0, 5, 9));
+    let z = _mm_movemask_epi8(_mm_cmpeq_epi8(over, _mm_setzero_si128())) as u32;
+    // words: HH, 10*M1, M2, SS (colon bytes weigh 0); then HH*3600 + M1*600 and M2*60 + SS
+    let w = _mm_maddubs_epi16(v, _mm_setr_epi8(10, 1, 0, 10, 1, 0, 10, 1, 10, 1, 0, 10, 1, 0, 10, 1));
+    let d = _mm_madd_epi16(w, _mm_setr_epi16(3600, 60, 60, 1, 3600, 60, 60, 1));
+    let s = _mm_add_epi32(d, _mm_srli_epi64(d, 32));
+    let sa = _mm_cvtsi128_si32(s) as u32;
+    let sb = _mm_extract_epi32(s, 2) as u32;
+    (sa as i64, ((z & 0xFF) == 0xFF) & (sa < 86_400), sb as i64, (z >> 8 == 0xFF) & (sb < 86_400))
+}
+
 /// `ts_num` of the 13 bytes at `p`, read as one 16-byte vector from `p - 3` (those 3 bytes are
 /// masked off, so they act as leading zeros): digit test, then 2-, 4- and 8-digit sums.
 #[inline(always)]
@@ -3617,6 +3645,13 @@ unsafe fn ts13(p: *const u8) -> Option<i64> {
 /// start. The 8 bytes "SS+HH:MM" get one range test per byte (',' sits between '+' and '-').
 #[inline(always)]
 unsafe fn ts25(p: *const u8, ra: u64, rb: u64, rd: i64, c: &mut DayCache) -> Option<i64> {
+    let h = hms(p.add(11));
+    ts25h(p, ra, rb, rd, c, h.unwrap_or(0), h.is_some())
+}
+
+/// `ts25`, given `hms(p + 11)` as (seconds, ok).
+#[inline(always)]
+unsafe fn ts25h(p: *const u8, ra: u64, rb: u64, rd: i64, c: &mut DayCache, hs: i64, hok: bool) -> Option<i64> {
     const LO: u64 = u64::from_le_bytes(*b"00+00:00");
     const HI: u64 = u64::from_le_bytes([0x7F - b'5', 0x7F - b'9', 0x7F - b'-', 0x7F - b'9', 0x7F - b'9', 0x7F - b':', 0x7F - b'5', 0x7F - b'9']);
     let w = ldp(p.add(17));
@@ -3632,7 +3667,10 @@ unsafe fn ts25(p: *const u8, ra: u64, rb: u64, rd: i64, c: &mut DayCache) -> Opt
     }
     let (a, b) = (ldp(p), ldp(p.add(3)));
     let d = if (a == ra) & (b == rb) { rd } else { day_get(a, b, p, c)? };
-    let h = hms(p.add(11))?;
+    if !hok {
+        return None;
+    }
+    let h = hs;
     let off = (oh * 60 + om) * 60_000;
     Some((d + h) * 1000 - if sg == b'-' { -off } else { off })
 }
@@ -3728,9 +3766,11 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
             // SAFETY (ldp, hms): a 20-byte field lies inside its window. (ra, rb, rd): the
             // ingest's date key and day start when it is a valid F1 date, else 2000-01-01's.
             let (mut ra, mut rb, mut rd) = (D0_A, D0_B, D0_S);
+            // SAFETY: pi + 19 and pt + 19 lie inside the 128 readable bytes at p
+            let (his, hio, hts, hto) = unsafe { hms2(pi.add(11), pt.add(11)) };
             let iso_i = if ni == 20 && unsafe { *pi.add(19) } == b'Z' {
                 let (ia, ib) = unsafe { (ldp(pi), ldp(pi.add(3))) };
-                let (dd, hs) = unsafe { (day_get(ia, ib, pi, &mut dci), hms(pi.add(11))) };
+                let (dd, hs) = unsafe { (day_get(ia, ib, pi, &mut dci), if hio { Some(his) } else { None }) };
                 Some(match dd {
                     Some(d) => {
                         (ra, rb, rd) = (ia, ib, d);
@@ -3769,10 +3809,10 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
                             None => break 'v,
                         }
                     };
-                    match unsafe { hms(pt.add(11)) } {
-                        Some(h) => (d + h) * 1000,
-                        None => break 'v,
+                    if !hto {
+                        break 'v;
                     }
+                    (d + hts) * 1000
                 } else if nt == 13 {
                     // SAFETY: ts is the third field and the ids are not empty here, so the 3
                     // bytes before it and the 16 bytes from pt - 3 lie inside the window
@@ -3782,7 +3822,7 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
                     }
                 } else {
                     // SAFETY (ts25): a 25-byte field lies inside its window
-                    let f = if nt == 25 { unsafe { ts25(pt, ra, rb, rd, &mut dct) } } else { None };
+                    let f = if nt == 25 { unsafe { ts25h(pt, ra, rb, rd, &mut dct, hts, hto) } } else { None };
                     match f.or_else(|| parse_ts_c(sl(pt, nt), &mut tct)) {
                         Some(t) => t,
                         None => break 'v,
@@ -3823,7 +3863,7 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
             if okk {
                 d.push(DRec { eid: ke, ing: ik, loc });
             } else {
-                fb.push((pack(sl(pe, ne)), ingest, loc));
+                fb_put(cx.rs, d, fb, sl(pe, ne), ingest, ik, loc);
             }
             continue 'ln;
         }
@@ -3990,6 +4030,13 @@ fn ev_after<E: Ev>(
                 Err(_) => (k as i64 - IOFF + ibase) * 1000,
             }
         };
+        // the bytes of line g's event_id when pack6 rejected it (its record sits in `fb`, loc order)
+        let fbb = |g: u32| -> B {
+            let c = mbase.partition_point(|&b| b <= g) - 1;
+            let loc = g - mbase[c];
+            let f = &ev_out[c].fb;
+            unpack(f[f.binary_search_by_key(&loc, |x| x.2).unwrap()].0)
+        };
         let (ndb, dsh) = idx_cfg().map_or((0, 0), |c| (c.ndb, c.sh));
         rayon::join(
             || {
@@ -4064,6 +4111,10 @@ fn ev_after<E: Ev>(
                                         break;
                                     }
                                     if o[0] == r.eid {
+                                        if r.eid & HBIT != 0 && fbb(gi) != fbb(o[1] as u32) {
+                                            p = (p + 1) & mask;
+                                            continue;
+                                        }
                                         let ok = (o[1] >> 32) as u32;
                                         let og = o[1] as u32;
                                         let win = r.ing < ok || (r.ing == ok && side_any && exact(gi, r.ing) < exact(og, ok));
@@ -4085,30 +4136,7 @@ fn ev_after<E: Ev>(
                     },
                 );
             },
-            || {
-                // events whose event_id has no packed key: exact byte comparison
-                let mut tm = now();
-                let mut m: AHashMap<B, (i64, u32)> = AHashMap::new();
-                for (ci, c) in ev_out.iter().enumerate() {
-                    for &(e, ing, loc) in &c.fb {
-                        let gi = mbase[ci] + loc;
-                        match m.get_mut(unpack(e)) {
-                            Some(o) => {
-                                if ing < o.0 {
-                                    kill(o.1);
-                                    *o = (ing, gi);
-                                } else {
-                                    kill(gi);
-                                }
-                            }
-                            None => {
-                                m.insert(unpack(e), (ing, gi));
-                            }
-                        }
-                    }
-                }
-                pt(3, &mut tm);
-            },
+            || {},
         );
         if TIMING.load(Relaxed) {
             let dense: usize = ev_out.iter().map(|c| c.doff[ndb] as usize).sum();
@@ -4550,6 +4578,13 @@ fn ev_after_idx<E: Ev>(
                 Err(_) => (k as i64 - IOFF + ibase) * 1000,
             }
         };
+        // the bytes of line g's event_id when pack6 rejected it (its record sits in `fb`, loc order)
+        let fbb = |g: u32| -> B {
+            let c = mbase.partition_point(|&b| b <= g) - 1;
+            let loc = g - mbase[c];
+            let f = &ev_out[c].fb;
+            unpack(f[f.binary_search_by_key(&loc, |x| x.2).unwrap()].0)
+        };
         let line = |g: u32| -> E {
             let c = mbase.partition_point(|&b| b <= g) - 1;
             ev_out[c].m[(g - mbase[c]) as usize]
@@ -4759,6 +4794,10 @@ fn ev_after_idx<E: Ev>(
                                             break;
                                         }
                                         if o[0] == r.eid {
+                                            if r.eid & HBIT != 0 && fbb(gi) != fbb(o[1] as u32) {
+                                                p = (p + 1) & mask;
+                                                continue;
+                                            }
                                             let ok = (o[1] >> 32) as u32;
                                             let og = o[1] as u32;
                                             if r.ing < ok || (r.ing == ok && side_any && exact(gi, r.ing) < exact(og, ok)) {
@@ -4781,24 +4820,7 @@ fn ev_after_idx<E: Ev>(
                     })
                     .collect();
                 let mut tm = now();
-                let mut m: AHashMap<B, (i64, u32)> = AHashMap::new();
-                for (ci, c) in ev_out.iter().enumerate() {
-                    for &(e, ing, loc) in &c.fb {
-                        let gi = mbase[ci] + loc;
-                        match m.get_mut(unpack(e)) {
-                            Some(o) => {
-                                if ing < o.0 {
-                                    *o = (ing, gi);
-                                }
-                            }
-                            None => {
-                                m.insert(unpack(e), (ing, gi));
-                            }
-                        }
-                    }
-                }
                 let mut em: Vec<E> = hb.into_iter().flatten().collect();
-                em.extend(m.values().map(|&(_, g)| line(g)));
                 pt(3, &mut tm);
                 let mut pc = PkCache { k: [0; 4], p: [0; 4], n: 0 };
                 em.retain_mut(|e| {
@@ -6860,6 +6882,39 @@ mod pack_simd_tests {
             ok += want.is_some() as u32;
         }
         assert!(ok > 50_000 && fast > 50_000, "{ok} {fast}");
+    }
+
+    #[test]
+    fn hms2_matches_hms() {
+        let mut x = 0x4A5D_2EED_0DD5_1234u64;
+        let mut nx = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alpha = b"0123456789:/;,+-Z 9";
+        let mut buf = [0u8; 16];
+        let mut ok = 0u32;
+        for i in 0..1_000_000u32 {
+            for h in 0..2 {
+                let s = (nx() % 86_400 + if nx() % 8 == 0 { 86_400 + nx() % 20_000 } else { 0 }) as u32;
+                let t = format!("{:02}:{:02}:{:02}", (s / 3600) % 100, s / 60 % 60, s % 60);
+                buf[8 * h..8 * h + 8].copy_from_slice(t.as_bytes());
+            }
+            let k = if i % 3 == 0 { 0 } else { 1 + nx() % 3 };
+            for _ in 0..k {
+                let at = (nx() % 16) as usize;
+                buf[at] = if nx() % 100 < 70 { alpha[(nx() % alpha.len() as u64) as usize] } else { nx() as u8 };
+            }
+            // SAFETY: both 8-byte reads lie inside buf
+            let (sa, oa, sb, ob) = unsafe { hms2(buf.as_ptr(), buf.as_ptr().add(8)) };
+            let (wa, wb) = unsafe { (hms(buf.as_ptr()), hms(buf.as_ptr().add(8))) };
+            assert_eq!(if oa { Some(sa) } else { None }, wa, "{:?}", &buf[..8]);
+            assert_eq!(if ob { Some(sb) } else { None }, wb, "{:?}", &buf[8..]);
+            ok += oa as u32 + ob as u32;
+        }
+        assert!(ok > 300_000, "{ok}");
     }
 
     #[test]
