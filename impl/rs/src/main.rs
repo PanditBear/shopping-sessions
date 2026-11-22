@@ -5606,6 +5606,29 @@ fn idx_cfg() -> Option<IdxCfg> {
     IDXC.get().copied().flatten()
 }
 
+/// True when at least 1/32 of the first (up to 512) lines of `c` have an event_id or user_id made of
+/// a prefix letter and 32 hex digits (quoted or not). The index scramble never gives such IDs, and
+/// data that has them has no key to find, so the brute-force search is skipped (the key decides
+/// only the speed, never the output).
+fn hex_ids_seen(c: &[u8]) -> bool {
+    let is_hex = |f: &[u8]| {
+        let f = f.strip_prefix(b"\"").and_then(|f| f.strip_suffix(b"\"")).unwrap_or(f);
+        f.len() == 33 && f[1..].iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+    };
+    let (mut pos, mut lines, mut hex) = (0usize, 0usize, 0usize);
+    while lines < 512 {
+        let Some(e) = memchr(b'\n', &c[pos..]) else { break };
+        let line = &c[pos..pos + e];
+        lines += 1;
+        pos += e + 1;
+        let mut it = line.splitn(3, |&b| b == b',');
+        if it.next().is_some_and(|f| is_hex(f)) || it.next().is_some_and(|f| is_hex(f)) {
+            hex += 1;
+        }
+    }
+    hex >= 4 && hex * 32 >= lines
+}
+
 /// Recovers the event_id key from the first canonical IDs of the first chunk: an index guess for
 /// one sample fixes the key, which must put most other samples below the size bound too. None
 /// (every record keeps the hash path) when SHOP_NOIDX is set or no key fits.
@@ -5614,6 +5637,9 @@ fn idx_find(ev_files: &[B], ev_chunks: &[B]) -> Option<IdxCfg> {
         return None;
     }
     let c = *ev_chunks.first()?;
+    if hex_ids_seen(c) {
+        return None;
+    }
     let total: usize = ev_files.iter().map(|f| f.len()).sum();
     let mut xs: Vec<u64> = vec![];
     let (mut pos, mut lines) = (0usize, 0usize);
@@ -5911,7 +5937,8 @@ fn main() {
     let we = manifest_ts(&mf, "window_end").unwrap_or(0);
 
     // the event files, chunks and id keys need nothing else: find them on their own thread while
-    // products, campaigns and links load (joined before the pool runs the two branches below)
+    // products load (joined before the pool runs the two branches below; campaigns and links load
+    // in the links branch while the other threads parse events)
     let ev_dir = data.join("events");
     let ev_setup = std::thread::spawn(move || {
         let ev_files = csv_files(&ev_dir);
@@ -5952,54 +5979,54 @@ fn main() {
     }
     let prod = IdLookup::new(b"p", &prod_items);
 
-    // campaigns
-    let mut camp_items: Vec<(B, u32)> = vec![];
-    let mut camp_names: Vec<B> = vec![];
-    let mut channels: Vec<B> = vec![];
-    if let Some(f) = leak_file(&data.join("campaigns.csv")) {
-        let mut seen: AHashMap<B, u32> = AHashMap::new();
-        for c in chunks(f, CHUNK) {
-            scan::<2>(c, |&[id, ch]| {
-                if !seen.contains_key(id) {
-                    seen.insert(id, camp_names.len() as u32);
-                    camp_items.push((id, camp_names.len() as u32));
-                    camp_names.push(id);
-                    channels.push(ch);
-                }
-            });
-        }
-    }
-    let camp = IdLookup::new(b"c_", &camp_items);
-    let ncamp = camp_names.len();
-    camp_names.push(b"organic");
-    channels.push(b"organic");
-
-    tick("prod/camp loaded");
+    tick("prod loaded");
     let rs = hasher();
-
-    let link_chunks = all_chunks(&csv_files(&data.join("links")), CHUNK);
-    let link_pairs: Vec<Vec<[u64; 4]>> = link_chunks
-        .par_iter()
-        .map(|&c| {
-            let mut v = vec![];
-            scan::<2>(c, |&[a, b]| {
-                if !a.is_empty() && !b.is_empty() {
-                    v.push([ukey(&rs, a), pack(a), ukey(&rs, b), pack(b)]);
-                }
-            });
-            v
-        })
-        .collect();
-    tick("links parsed");
     let ev_chunks = ev_setup.join().unwrap();
     match idx_cfg() {
         Some(c) => tick(&format!("idx key found=1 lim={} sh={} ndb={}", c.lim, c.sh, c.ndb)),
         None => tick("idx key found=0"),
     }
     tick(&format!("user key found={}", UKEYC.get().copied().flatten().is_some() as u8));
-    // links (serial union-find) overlaps the parallel event parse; events do not need the id table
-    let ((mut tab, root, bk, nl, nroot, mut names_map), ev_out) = rayon::join(
+    // campaigns, links load and the serial union-find overlap the parallel event parse; events do not
+    // need the id table
+    let ((mut tab, root, bk, nl, nroot, mut names_map, camp, ncamp, camp_names, channels), ev_out) = rayon::join(
         || {
+            // campaigns
+            let mut camp_items: Vec<(B, u32)> = vec![];
+            let mut camp_names: Vec<B> = vec![];
+            let mut channels: Vec<B> = vec![];
+            if let Some(f) = leak_file(&data.join("campaigns.csv")) {
+                let mut seen: AHashMap<B, u32> = AHashMap::new();
+                for c in chunks(f, CHUNK) {
+                    scan::<2>(c, |&[id, ch]| {
+                        if !seen.contains_key(id) {
+                            seen.insert(id, camp_names.len() as u32);
+                            camp_items.push((id, camp_names.len() as u32));
+                            camp_names.push(id);
+                            channels.push(ch);
+                        }
+                    });
+                }
+            }
+            let camp = IdLookup::new(b"c_", &camp_items);
+            let ncamp = camp_names.len();
+            camp_names.push(b"organic");
+            channels.push(b"organic");
+            tick("camp loaded");
+            let link_chunks = all_chunks(&csv_files(&data.join("links")), CHUNK);
+            let link_pairs: Vec<Vec<[u64; 4]>> = link_chunks
+                .par_iter()
+                .map(|&c| {
+                    let mut v = vec![];
+                    scan::<2>(c, |&[a, b]| {
+                        if !a.is_empty() && !b.is_empty() {
+                            v.push([ukey(&rs, a), pack(a), ukey(&rs, b), pack(b)]);
+                        }
+                    });
+                    v
+                })
+                .collect();
+            tick("links parsed");
             let occ: usize = link_pairs.iter().map(|v| v.len()).sum::<usize>() * 2;
             let mut names_map: AHashMap<u64, u64> = AHashMap::new();
             let (mut t, root, bk, nl, nroot) = {
@@ -6124,7 +6151,7 @@ fn main() {
             };
             drop(link_pairs);
             tick("links done");
-            (t, root, bk, nl, nroot, names_map)
+            (t, root, bk, nl, nroot, names_map, camp, ncamp, camp_names, channels)
         },
         || {
             let cx = EvCtx { prod: &prod, unknown_cat, ws, we, ibase: ws.div_euclid(1000), rs: &rs };
