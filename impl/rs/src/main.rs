@@ -3377,6 +3377,117 @@ unsafe fn pack6x1(pa: *const u8, na: usize) -> (u64, bool) {
     (k, bad == 0 && na.wrapping_sub(1) < 10)
 }
 
+// ---------- id classes (Short / Hex / Other) ----------
+// Short: pack6 ids (1..=10 bytes of [0-9A-Z_a-z]). Hex: 33 bytes, a CODE prefix byte and 32
+// lowercase hex digits. Other: the rest. A Hex key is HBIT | 1<<62 | prefix code << 56 | the top
+// 56 bits of the digits; the full 128-bit value goes to a side list (see idk_ref).
+
+/// Key of a Hex id from its prefix code `c0` (CODE value, non-zero) and digit value `f`.
+#[inline(always)]
+fn hex_key(c0: u8, f: u128) -> u64 {
+    HBIT | (1u64 << 62) | ((c0 as u64) << 56) | (f >> 72) as u64
+}
+
+/// Scalar reference of the id classes: (key, full, cls), cls 0 Short (key = pack6, full 0),
+/// 1 Hex (key = hex_key, full = the 32 digits as a number), 2 Other (key and full 0).
+fn idk_ref(b: &[u8]) -> (u64, u128, u8) {
+    if let Some(k) = pack6(b) {
+        return (k, 0, 0);
+    }
+    if b.len() == 33 && CODE[b[0] as usize] != 0 && b[1..].iter().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')) {
+        let mut f = 0u128;
+        for &c in &b[1..] {
+            f = (f << 4) | (if c <= b'9' { c - b'0' } else { c - b'a' + 10 }) as u128;
+        }
+        return (hex_key(CODE[b[0] as usize], f), f, 1);
+    }
+    (0, 0, 2)
+}
+
+/// The 32 bytes at `p` read as lowercase hex digits: (value, ok); ok iff every byte is [0-9a-f].
+/// The value (big-endian digit order) is only meaningful when ok.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn hex32(p: *const u8) -> (u128, bool) {
+    use core::arch::x86_64::*;
+    let x = _mm256_loadu_si256(p as *const __m256i);
+    let d = _mm256_sub_epi8(x, _mm256_set1_epi8(b'0' as i8));
+    let l = _mm256_sub_epi8(x, _mm256_set1_epi8(b'a' as i8));
+    let isd = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+    let isl = _mm256_cmpeq_epi8(_mm256_min_epu8(l, _mm256_set1_epi8(5)), l);
+    let ok = _mm256_movemask_epi8(_mm256_or_si256(isd, isl)) == -1;
+    // digit values: '0'..'9' -> 0..9, 'a'..'f' -> 10..15 ('a' - '0' - 10 = 39)
+    let v = _mm256_sub_epi8(d, _mm256_and_si256(isl, _mm256_set1_epi8(39)));
+    // 16 * first + second per byte pair, then the 8 pair bytes of each lane in reverse order
+    let w = _mm256_maddubs_epi16(v, _mm256_set1_epi16(0x0110));
+    let r = _mm256_shuffle_epi8(
+        w,
+        _mm256_setr_epi8(14, 12, 10, 8, 6, 4, 2, 0, -1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0, -1, -1, -1, -1, -1, -1, -1, -1),
+    );
+    let hi = _mm256_extract_epi64(r, 0) as u64;
+    let lo = _mm256_extract_epi64(r, 2) as u64;
+    (((hi as u128) << 64) | lo as u128, ok)
+}
+
+/// The full value of a Hex id given as a slice, or None when it is not Hex. Reads only `b`.
+#[inline(always)]
+fn hex_full(b: &[u8]) -> Option<(u64, u128)> {
+    if b.len() != 33 || CODE[b[0] as usize] == 0 {
+        return None;
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        // SAFETY: b[1..33] is 32 readable bytes
+        let (f, ok) = unsafe { hex32(b.as_ptr().add(1)) };
+        ok.then(|| (hex_key(CODE[b[0] as usize], f), f))
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        let (k, f, c) = idk_ref(b);
+        (c == 1).then_some((k, f))
+    }
+}
+
+/// Class, key and full value of one id of `n >= 1` bytes at `p` (as idk_ref). Reads 16 bytes
+/// at p, and 33 when n == 33; the caller guarantees they are readable.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn idk_x(p: *const u8, n: usize) -> (u64, u128, u8) {
+    let (k, ok) = pack6x1(p, n);
+    if ok {
+        return (k, 0, 0);
+    }
+    if n == 33 {
+        let c0 = CODE[*p as usize];
+        let (f, okh) = hex32(p.add(1));
+        if okh & (c0 != 0) {
+            return (hex_key(c0, f), f, 1);
+        }
+    }
+    (0, 0, 2)
+}
+
+/// `idk_x` of two ids (event_id and user_id), same contract per id.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn idk_x2(pa: *const u8, na: usize, pb: *const u8, nb: usize) -> ((u64, u128, u8), (u64, u128, u8)) {
+    let (ka, oka, kb, okb) = pack6x2(pa, na, pb, nb);
+    let one = |p: *const u8, n: usize, k: u64, ok: bool| {
+        if ok {
+            return (k, 0u128, 0u8);
+        }
+        if n == 33 {
+            let c0 = CODE[*p as usize];
+            let (f, okh) = hex32(p.add(1));
+            if okh & (c0 != 0) {
+                return (hex_key(c0, f), f, 1);
+            }
+        }
+        (0, 0, 2)
+    };
+    (one(pa, na, ka, oka), one(pb, nb, kb, okb))
+}
+
 /// `pack6x1` stays for the event-id miss path; this is the hot-path fused pass.
 /// Per `n & 15`: the shuffle that right-aligns an event id's body (bytes 1..n) in bytes 0..8 of a
 /// lane (0x80 = zero byte), and the identity shuffle that keeps the first `n` bytes of a user id.
@@ -5783,6 +5894,92 @@ mod tests {
         }
         fn chance(&mut self, pct: u64) -> bool {
             self.below(100) < pct
+        }
+    }
+
+    /// One id class check on `b` placed at the start of a 64-byte buffer padded with `pad`.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    fn idk_check(b: &[u8], pad: u8, other: &[u8]) {
+        let r = idk_ref(b);
+        let mut buf = [pad; 128];
+        buf[..b.len()].copy_from_slice(b);
+        let mut buf2 = [pad; 128];
+        buf2[..other.len()].copy_from_slice(other);
+        let norm = |x: (u64, u128, u8)| if x.2 == 2 { (0, 0, 2) } else { x };
+        let x = unsafe { idk_x(buf.as_ptr(), b.len()) };
+        assert_eq!(norm(x), norm(r), "idk_x {:?}", String::from_utf8_lossy(b));
+        let (xa, xb) = unsafe { idk_x2(buf.as_ptr(), b.len(), buf2.as_ptr(), other.len()) };
+        assert_eq!(norm(xa), norm(r));
+        assert_eq!(norm(xb), norm(idk_ref(other)));
+        let (xa, xb) = unsafe { idk_x2(buf2.as_ptr(), other.len(), buf.as_ptr(), b.len()) };
+        assert_eq!(norm(xb), norm(r));
+        assert_eq!(norm(xa), norm(idk_ref(other)));
+        match r.2 {
+            0 => assert_eq!(Some(r.0), pack6(b)),
+            1 => {
+                assert_eq!(hex_full(b), Some((r.0, r.1)));
+                assert_eq!(r.0 >> 62, 3);
+                assert_eq!((r.0 >> 56) & 63, CODE[b[0] as usize] as u64);
+            }
+            _ => assert_eq!(hex_full(b), None),
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    fn idk_classes_match_ref() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let alpha: Vec<u8> = (0u8..=255).filter(|&c| CODE[c as usize] != 0).collect();
+        let hexd = b"0123456789abcdef";
+        let mut cases: Vec<Vec<u8>> = vec![
+            b"u".to_vec(),
+            b"u0123456789abcdef0123456789abcdef".to_vec(),
+            b"uffffffffffffffffffffffffffffffff".to_vec(),
+            b"u00000000000000000000000000000000".to_vec(),
+            b"_ffffffffffffffffffffffffffffffff".to_vec(),
+            b"zffffffffffffffffffffffffffffffff".to_vec(),
+            b"u0123456789ABCDEF0123456789abcdef".to_vec(),
+            b"-0123456789abcdef0123456789abcdef".to_vec(),
+            b"u0123456789abcdef0123456789abcdeg".to_vec(),
+            b"u0123456789abcdef0123456789abcde/".to_vec(),
+            b"u0123456789abcdef0123456789abcde:".to_vec(),
+            b"u0123456789abcdef0123456789abcde`".to_vec(),
+            b"u0123456789abcdef0123456789abcde\xe1".to_vec(),
+            b"u0123456789abcdef0123456789abcde".to_vec(),
+            b"u0123456789abcdef0123456789abcdef0".to_vec(),
+            b"0123456789abcdef0123456789abcdef0".to_vec(),
+        ];
+        for n in 1..=12 {
+            for _ in 0..50 {
+                cases.push((0..n).map(|_| alpha[rng.below(alpha.len() as u64) as usize]).collect());
+            }
+        }
+        for _ in 0..3000 {
+            let mut v: Vec<u8> = vec![alpha[rng.below(alpha.len() as u64) as usize]];
+            v.extend((0..32).map(|_| hexd[rng.below(16) as usize]));
+            if rng.chance(30) {
+                let i = rng.below(33) as usize;
+                v[i] = rng.below(256) as u8;
+            }
+            if rng.chance(5) {
+                let n = 31 + rng.below(5) as usize;
+                v.resize(n, b'a');
+            }
+            cases.push(v);
+        }
+        for c in &cases {
+            for pad in [0u8, b'a', b',', 0xff] {
+                let other = &cases[rng.below(cases.len() as u64) as usize];
+                idk_check(c, pad, other);
+            }
+        }
+        // key order equals byte order within Hex ids of one prefix length
+        let mut hx: Vec<&Vec<u8>> = cases.iter().filter(|c| idk_ref(c).2 == 1).collect();
+        assert!(hx.len() > 1500);
+        hx.sort();
+        for w in hx.windows(2) {
+            let (a, b) = (idk_ref(w[0]), idk_ref(w[1]));
+            assert!((a.0, a.1) <= (b.0, b.1));
         }
     }
 
