@@ -6588,7 +6588,9 @@ fn main() {
     let nf = 16usize;
     let mut files: Vec<Vec<&Vec<UD>>> = (0..nf).map(|_| vec![]).collect();
     let mut load = vec![0usize; nf];
+    utl("wr rows+alloc done");
     ud_groups.sort_by_key(|g| std::cmp::Reverse(g.len()));
+    utl("wr ud sort done");
     for g in ud_groups {
         let k = (0..nf).min_by_key(|&k| load[k]).unwrap();
         load[k] += g.len();
