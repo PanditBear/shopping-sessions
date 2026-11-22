@@ -2225,15 +2225,31 @@ const TSB: u32 = 22;
 /// a multi-key range a stable split by key and the same fixup. Returns false when the fields do
 /// not fit in 64 bits.
 fn sort_evs_ts<E: Ev>(evs: &mut Vec<E>, tmp: &mut Vec<E>, h: &mut Vec<u32>, span: i64) -> bool {
-    let n = evs.len();
-    if span < 0 {
+    if !sort_ts_into(&[&evs[..]], evs.len(), tmp, h, span) {
+        return false;
+    }
+    std::mem::swap(evs, tmp);
+    true
+}
+
+/// `sort_evs_ts` over the concatenation of the non-empty slices `sl` (n records in all), written
+/// into `out`: the index field holds slice number << ob | offset, which orders like the index in
+/// the concatenation, so the result is the one `sort_evs_ts` gives on the concatenated records.
+/// Returns false (and touches nothing) when the fields do not fit in 64 bits.
+fn sort_ts_into<E: Ev>(sl: &[&[E]], n: usize, out: &mut Vec<E>, h: &mut Vec<u32>, span: i64) -> bool {
+    if span < 0 || n == 0 {
         return false;
     }
     let sb = 64 - (span as u64).leading_zeros();
-    let ib = (64 - ((n - 1) as u64).leading_zeros()).max(1);
+    let tb = if sl.len() > 1 { 64 - ((sl.len() - 1) as u64).leading_zeros() } else { 0 };
+    let ml = sl.iter().map(|s| s.len()).max().unwrap_or(1).max(1);
+    let ob = (64 - ((ml - 1) as u64).leading_zeros()).max(1);
+    let ib = tb + ob;
     if ib + TSB + NBK > 64 {
         return false;
     }
+    let om = (1u64 << ob) - 1;
+    let bp: Vec<*const E> = sl.iter().map(|s| s.as_ptr()).collect();
     let q = sb.saturating_sub(TSB);
     let ds = ib + TSB;
     let im = (1u64 << ib) - 1;
@@ -2252,17 +2268,24 @@ fn sort_evs_ts<E: Ev>(evs: &mut Vec<E>, tmp: &mut Vec<E>, h: &mut Vec<u32>, span
             ka.set_len(n);
             kb.set_len(n);
         }
-        for (i, e) in evs.iter().enumerate() {
-            let t = e.rts() >> q;
-            let d = dg(e.key()) as u64;
-            // SAFETY: i < n = ka.len(); the indexes are masked below the histogram sizes.
-            unsafe {
-                *ka.get_unchecked_mut(i) = (d << ds) | (t << ib) | i as u64;
-                *h.get_unchecked_mut((t & 2047) as usize) += 1;
-                *h.get_unchecked_mut(2048 + ((t >> 11) & 2047) as usize) += 1;
-                *h.get_unchecked_mut(4096 + d as usize) += 1;
+        let mut i = 0usize;
+        for (si, s) in sl.iter().enumerate() {
+            let sx = (si as u64) << ob;
+            for (j, e) in s.iter().enumerate() {
+                let t = e.rts() >> q;
+                let d = dg(e.key()) as u64;
+                // SAFETY: i < n = ka.len() (the slices hold n records); the indexes are masked
+                // below the histogram sizes.
+                unsafe {
+                    *ka.get_unchecked_mut(i) = (d << ds) | (t << ib) | sx | j as u64;
+                    *h.get_unchecked_mut((t & 2047) as usize) += 1;
+                    *h.get_unchecked_mut(2048 + ((t >> 11) & 2047) as usize) += 1;
+                    *h.get_unchecked_mut(4096 + d as usize) += 1;
+                }
+                i += 1;
             }
         }
+        debug_assert_eq!(i, n);
         let (mut src, mut dst) = (&mut ka[..], &mut kb[..]);
         for (off, sh) in [(0usize, ib), (2048, ib + 11)] {
             let hj = &mut h[off..off + 2048];
@@ -2293,26 +2316,27 @@ fn sort_evs_ts<E: Ev>(evs: &mut Vec<E>, tmp: &mut Vec<E>, h: &mut Vec<u32>, span
             *x = s;
             s += c;
         }
-        tmp.clear();
-        tmp.reserve(n);
+        out.clear();
+        out.reserve(n);
         // SAFETY: the scatter below writes each of the n slots exactly once.
-        unsafe { tmp.set_len(n) };
+        unsafe { out.set_len(n) };
         for &k in src.iter() {
             let d = (k >> ds) as usize;
-            // SAFETY: k & im < n; d < 2^NBK; positions stay below n.
+            let x = k & im;
+            // SAFETY: x >> ob < sl.len() and x & om < that slice's length; d < 2^NBK;
+            // positions stay below n.
             unsafe {
-                let e = *evs.get_unchecked((k & im) as usize);
+                let e = *bp.get_unchecked((x >> ob) as usize).add((x & om) as usize);
                 let p = hj.get_unchecked_mut(d);
-                *tmp.get_unchecked_mut(*p as usize) = e;
+                *out.get_unchecked_mut(*p as usize) = e;
                 *p += 1;
             }
         }
-        std::mem::swap(evs, tmp);
         let mut s = 0usize;
         for &e in hj.iter() {
             let e = e as usize;
             if e - s > 1 {
-                let r = &mut evs[s..e];
+                let r = &mut out[s..e];
                 let k0 = r[0].key();
                 let mut mk = false;
                 let mut ok = true;
@@ -2413,6 +2437,20 @@ fn sort_evs<E: Ev>(evs: &mut Vec<E>, tmp: &mut Vec<E>, cnt: &mut Vec<u32>, span:
         }
         st = en;
     }
+}
+
+/// `sort_evs` of the concatenation of the non-empty slices `sl`, into `evs`. The fast path reads
+/// the slices in place; otherwise they are copied into `evs` and sorted there.
+fn sort_evs_parts<E: Ev>(sl: &[&[E]], evs: &mut Vec<E>, tmp: &mut Vec<E>, cnt: &mut Vec<u32>, span: i64) {
+    let n: usize = sl.iter().map(|s| s.len()).sum();
+    if n >= 256 && sort_ts_into(sl, n, evs, cnt, span) {
+        return;
+    }
+    evs.clear();
+    for s in sl {
+        evs.extend_from_slice(s);
+    }
+    sort_evs(evs, tmp, cnt, span);
 }
 
 /// Orders `r` (2 <= len < RADIX_MIN, every rts below 2^sb) into `out` by (key, rts) when it holds
@@ -2711,6 +2749,7 @@ fn sort_one_clicker(src: &[ClickRec], out: &mut [ClickRec], pk: &mut Vec<u64>) -
 
 #[allow(clippy::too_many_arguments)]
 fn process_bucket<E: Ev>(
+    sl: &[&[E]],
     evs: &mut Vec<E>,
     tmp: &mut Vec<E>,
     cnt: &mut Vec<u32>,
@@ -2724,7 +2763,7 @@ fn process_bucket<E: Ev>(
     span: i64,
 ) {
     let mut tm = now();
-    sort_evs(evs, tmp, cnt, span);
+    sort_evs_parts(sl, evs, tmp, cnt, span);
     pt(7, &mut tm);
     sort_clicks(clicks, ctmp, cnt);
     pt(11, &mut tm);
@@ -4577,9 +4616,9 @@ fn ev_after<E: Ev>(
     let offs: Vec<&[u32]> = parts.iter().map(|x| &x.1[..]).collect();
     let cost = pb_cost(&offs, click_out);
     lpt_run(&cost, || SsW::new(ncamp, d0, nd), |p, w: &mut SsW<E>| {
-        w.gather(p, &parts, click_out);
+        let sl = w.gather(p, &parts, click_out);
         let mut uds = Vec::new();
-        process_bucket(&mut w.evs, &mut w.tmp, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut uds, &mut w.cm, ws, we.wrapping_sub(ws));
+        process_bucket(&sl, &mut w.evs, &mut w.tmp, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut uds, &mut w.cm, ws, we.wrapping_sub(ws));
         w.out.push(uds);
     })
     .into_iter()
@@ -4620,18 +4659,17 @@ impl<E: Ev> SsW<E> {
             ctmp: vec![],
         }
     }
-    /// Collects person bucket p's lines and clicks from every chunk.
-    fn gather(&mut self, p: usize, parts: &[(Vec<E>, Vec<u32>)], click_out: &[(Vec<ClickRec>, Vec<u32>)]) {
+    /// Collects person bucket p's clicks from every chunk; returns its non-empty line slices in
+    /// chunk order (the sort reads them in place).
+    fn gather<'a>(&mut self, p: usize, parts: &'a [(Vec<E>, Vec<u32>)], click_out: &[(Vec<ClickRec>, Vec<u32>)]) -> Vec<&'a [E]> {
         let mut tm = now();
         self.cl.clear();
         for (v, o) in click_out.iter() {
             self.cl.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
         }
-        self.evs.clear();
-        for (v, o) in parts.iter() {
-            self.evs.extend_from_slice(&v[o[p] as usize..o[p + 1] as usize]);
-        }
+        let sl: Vec<&[E]> = parts.iter().map(|(v, o)| &v[o[p] as usize..o[p + 1] as usize]).filter(|s| !s.is_empty()).collect();
         pt(6, &mut tm);
+        sl
     }
 
     /// Dense path: collects person bucket p's clicks and run descriptors, orders the runs by
