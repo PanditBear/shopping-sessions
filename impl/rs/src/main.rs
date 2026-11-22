@@ -84,6 +84,123 @@ fn pt(i: usize, t: &mut Option<std::time::Instant>) {
     }
 }
 
+// SHOP_SKEW=1 probe: start/end of every task of each parallel phase, per worker thread
+static SKEW: AtomicBool = AtomicBool::new(false);
+static SK0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static SKV: std::sync::Mutex<Vec<(u8, u8, u32, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+static SKM: std::sync::Mutex<Vec<(u8, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+const SK_PH: [&str; 9] = ["lk.parse", "ev+links", "movers", "clicks", "dedup", "pbcost", "sess", "write", "idxfind"];
+const SK_KN: [&[&str]; 9] = [
+    &["chunk"],
+    &["links-arm", "ev-chunk"],
+    &["chunk"],
+    &["moverf(main)", "click-chunk", "fbn(main)"],
+    &["dense-grp", "hash-grp", "hash-tail"],
+    &["blk"],
+    &["gather", "proc"],
+    &["ud-file", "camp-file", "prep(main)"],
+    &["-"],
+];
+fn sk_ns() -> u64 {
+    SK0.get().map_or(0, |t| t.elapsed().as_nanos() as u64)
+}
+struct SkT(u8, u8, u64);
+impl Drop for SkT {
+    fn drop(&mut self) {
+        let e = sk_ns();
+        let th = rayon::current_thread_index().map_or(255, |i| i as u32);
+        SKV.lock().unwrap().push((self.0, self.1, th, self.2, e));
+    }
+}
+#[inline]
+fn skt(p: u8, k: u8) -> Option<SkT> {
+    if SKEW.load(Relaxed) {
+        Some(SkT(p, k, sk_ns()))
+    } else {
+        None
+    }
+}
+struct SkP(u8, u64);
+impl Drop for SkP {
+    fn drop(&mut self) {
+        SKM.lock().unwrap().push((self.0, self.1, sk_ns()));
+    }
+}
+#[inline]
+fn skp(p: u8) -> Option<SkP> {
+    if SKEW.load(Relaxed) {
+        Some(SkP(p, sk_ns()))
+    } else {
+        None
+    }
+}
+fn sk_report(wall: u64) {
+    let nt = rayon::current_num_threads();
+    let v = SKV.lock().unwrap().clone();
+    let m = SKM.lock().unwrap().clone();
+    let ms = |x: u64| x as f64 / 1e6;
+    let (mut ttail, mut tidle) = (0u64, 0u64);
+    eprintln!("skew threads={nt} wall_ms={:.1}", ms(wall));
+    for &(p, s, e) in &m {
+        let span = e - s;
+        let ts: Vec<_> = v.iter().filter(|x| x.0 == p).collect();
+        let busy: u64 = ts.iter().map(|x| x.4 - x.3).sum();
+        let mut ends = vec![s; nt];
+        for x in &ts {
+            if (x.2 as usize) < nt {
+                ends[x.2 as usize] = ends[x.2 as usize].max(x.4);
+            }
+        }
+        let mx = *ends.iter().max().unwrap();
+        let mean = ends.iter().sum::<u64>() / nt as u64;
+        let tail = mx.saturating_sub(mean);
+        let idle = (span * nt as u64).saturating_sub(busy) / nt as u64;
+        if p != 8 {
+            ttail += tail;
+            tidle += idle;
+        }
+        let last = ts.iter().max_by_key(|x| x.4);
+        let big = ts.iter().max_by_key(|x| x.4 - x.3);
+        eprintln!(
+            "skew P{p} {:<8} span {:.1} busy/nt {:.1} tail {:.1} ({:.2}%) idle {:.1} ({:.2}%) last: {} th{} start+{:.1} dur {:.1} | biggest: {} dur {:.1} start+{:.1}",
+            SK_PH[p as usize],
+            ms(span),
+            ms(busy / nt as u64),
+            ms(tail),
+            100.0 * tail as f64 / wall as f64,
+            ms(idle),
+            100.0 * idle as f64 / wall as f64,
+            last.map_or("-", |x| SK_KN[p as usize].get(x.1 as usize).copied().unwrap_or("?")),
+            last.map_or(0, |x| x.2),
+            last.map_or(0.0, |x| ms(x.3 - s)),
+            last.map_or(0.0, |x| ms(x.4 - x.3)),
+            big.map_or("-", |x| SK_KN[p as usize].get(x.1 as usize).copied().unwrap_or("?")),
+            big.map_or(0.0, |x| ms(x.4 - x.3)),
+            big.map_or(0.0, |x| ms(x.3 - s)),
+        );
+        for (k, kn) in SK_KN[p as usize].iter().enumerate() {
+            let d: Vec<u64> = ts.iter().filter(|x| x.1 as usize == k).map(|x| x.4 - x.3).collect();
+            if d.is_empty() {
+                continue;
+            }
+            let lst = ts.iter().filter(|x| x.1 as usize == k).map(|x| x.3).max().unwrap();
+            eprintln!(
+                "skew   {kn:<12} n {} mean {:.2} max {:.2} sum {:.1} last-start+{:.1}",
+                d.len(),
+                ms(d.iter().sum::<u64>() / d.len() as u64),
+                ms(*d.iter().max().unwrap()),
+                ms(d.iter().sum()),
+                ms(lst - s)
+            );
+        }
+        // worker end spread
+        let mut es: Vec<f64> = ends.iter().map(|&x| ms(x - s)).collect();
+        es.sort_by(f64::total_cmp);
+        eprintln!("skew   thread-ends {}", es.iter().map(|x| format!("{x:.1}")).collect::<Vec<_>>().join(" "));
+    }
+    eprintln!("skew TOTAL tail {:.1} ms ({:.2}% wall) idle {:.1} ms ({:.2}% wall)", ms(ttail), 100.0 * ttail as f64 / wall as f64, ms(tidle), 100.0 * tidle as f64 / wall as f64);
+}
+
 #[inline(always)]
 fn prefetch<T>(p: *const T) {
     #[cfg(target_arch = "x86_64")]
@@ -4289,6 +4406,7 @@ fn pb_cost(offs: &[&[u32]], click_out: &[(Vec<ClickRec>, Vec<u32>)]) -> Vec<u64>
     const BLK: usize = 64;
     let mut cost = vec![0u64; PB];
     cost.par_chunks_mut(BLK).enumerate().for_each(|(b, c)| {
+        let _g = skt(5, 0);
         let lo = b * BLK;
         for o in offs.iter() {
             for (i, x) in c.iter_mut().enumerate() {
@@ -4405,6 +4523,7 @@ fn ev_after_idx<E: Ev>(
     cfg: IdxCfg,
 ) -> Vec<(Vec<Vec<UD>>, CampAcc)> {
     let _ = we;
+    let skp4 = skp(4);
     let ndb = cfg.ndb;
     let mut mbase: Vec<u32> = Vec::with_capacity(ev_out.len() + 1);
     let mut acc = 0usize;
@@ -4457,6 +4576,7 @@ fn ev_after_idx<E: Ev>(
                 (0..ndb.div_ceil(G))
                     .into_par_iter()
                     .map(|g| {
+                        let _g = skt(4, 0);
                         let mut tm = now();
                         let mut t: Vec<u64> = vec![u64::MAX; span];
                         let mut lb: Vec<E> = Vec::new();
@@ -4616,6 +4736,7 @@ fn ev_after_idx<E: Ev>(
                 let hb: Vec<Vec<E>> = (0..EB / DDG)
                     .into_par_iter()
                     .map(|g| {
+                        let _g = skt(4, 1);
                         let mut tm = now();
                         let mut em: Vec<E> = Vec::new();
                         let totals: [usize; DDG] = std::array::from_fn(|i| {
@@ -4673,6 +4794,7 @@ fn ev_after_idx<E: Ev>(
                         em
                     })
                     .collect();
+                let _g = skt(4, 2);
                 let mut tm = now();
                 let mut m: AHashMap<B, (i64, u32)> = AHashMap::new();
                 for (ci, c) in ev_out.iter().enumerate() {
@@ -4709,19 +4831,25 @@ fn ev_after_idx<E: Ev>(
         )
     };
     drop(ev_out);
+    drop(skp4);
     tick("dedup done");
 
+    let skp5 = skp(5);
     let offs: Vec<&[u32]> = dparts.iter().map(|x| &x.3[..]).chain(std::iter::once(&rest.1[..])).collect();
     let cost = pb_cost(&offs, click_out);
-    lpt_run(&cost, || SsW::new(ncamp, d0, nd), |p, w: &mut SsW<E>| {
+    drop(skp5);
+    let skp6 = skp(6);
+    let r = lpt_run(&cost, || SsW::new(ncamp, d0, nd), |p, w: &mut SsW<E>| {
+        let g = skt(6, 0);
         w.gather_rd(p, &dparts, &rest, click_out);
+        drop(g);
+        let _g = skt(6, 1);
         let mut uds = Vec::new();
         process_runs(&w.evs_s, &mut w.tmp_s, &w.runs, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut uds, &mut w.cm, ws);
         w.out.push(uds);
-    })
-    .into_iter()
-    .map(|w| (w.out, w.cm))
-    .collect()
+    });
+    drop(skp6);
+    r.into_iter().map(|w| (w.out, w.cm)).collect()
 }
 
 /// A stretch of one person's lines in a bucket: digit, person key, start, length, ts sorted.
@@ -5129,7 +5257,10 @@ fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
 }
 
 fn ev_parse<E: Ev>(ev_chunks: &[B], cx: &EvCtx) -> Vec<EvChunk<E>> {
-    ev_chunks.par_iter().map(|&c| ev_chunk_parse(c, cx)).collect()
+    ev_chunks.par_iter().map(|&c| {
+        let _g = skt(1, 1);
+        ev_chunk_parse(c, cx)
+    }).collect()
 }
 
 /// measurement aid: order-sensitive checksum of one parsed chunk, chained on h
@@ -5251,6 +5382,11 @@ fn main() {
     let data = std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into());
     let outd = std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into());
     let ncpu: usize = std::env::var("NCPU").ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(0);
+    let ncpu: usize = std::env::var("SHOP_NT").ok().and_then(|s| s.parse().ok()).unwrap_or(ncpu);
+    if std::env::var_os("SHOP_SKEW").is_some() {
+        SKEW.store(true, Relaxed);
+        let _ = SK0.set(std::time::Instant::now());
+    }
     let mut tb = rayon::ThreadPoolBuilder::new().stack_size(8 << 20);
     if ncpu > 0 {
         tb = tb.num_threads(ncpu);
@@ -5329,9 +5465,11 @@ fn main() {
     let rs = hasher();
 
     let link_chunks = all_chunks(&csv_files(&data.join("links")), CHUNK);
+    let skp0 = skp(0);
     let link_pairs: Vec<Vec<[u64; 4]>> = link_chunks
         .par_iter()
         .map(|&c| {
+            let _g = skt(0, 0);
             let mut v = vec![];
             scan::<2>(c, |&[a, b]| {
                 if !a.is_empty() && !b.is_empty() {
@@ -5341,10 +5479,13 @@ fn main() {
             v
         })
         .collect();
+    drop(skp0);
     tick("links parsed");
+    let skp1 = skp(1);
     // links (serial union-find) overlaps the parallel event parse; events do not need the id table
     let ((mut tab, root, bk, nl, nroot, mut names_map), ev_out) = rayon::join(
         || {
+            let _g = skt(1, 0);
             let occ: usize = link_pairs.iter().map(|v| v.len()).sum::<usize>() * 2;
             let mut names_map: AHashMap<u64, u64> = AHashMap::new();
             let (mut t, root, bk, nl, nroot) = {
@@ -5474,6 +5615,7 @@ fn main() {
         || {
             let ev_files = csv_files(&data.join("events"));
             let ev_chunks = all_chunks(&ev_files, ev_chunk(&ev_files));
+            let skp8 = skp(8);
             let _ = IDXC.set(idx_find(&ev_files, &ev_chunks));
             match idx_cfg() {
                 Some(c) => tick(&format!("idx key found=1 lim={} sh={} ndb={}", c.lim, c.sh, c.ndb)),
@@ -5481,6 +5623,7 @@ fn main() {
             }
             let _ = UKEYC.set(idx_cfg().and_then(|c| ukey_find(&ev_chunks, c.key)));
             tick(&format!("user key found={}", UKEYC.get().copied().flatten().is_some() as u8));
+            drop(skp8);
             let cx = EvCtx { prod: &prod, unknown_cat, ws, we, ibase: ws.div_euclid(1000), rs: &rs };
             if std::env::var_os("SHOP_PARSE").is_some() {
                 if lean {
@@ -5584,10 +5727,13 @@ fn main() {
         },
     );
 
+    drop(skp1);
+    let skp2 = skp(2);
     // the insert table becomes the id table in place (a slot's index turns into its person key), with the whole pool
     {
         let (root, bk) = (&root[..], &bk[..]);
         tab.s.par_chunks_mut(1 << 14).for_each(|c| {
+            let _g = skt(2, 0);
             let n = c.len();
             for i in 0..n {
                 if i + 2 * PFD < n {
@@ -5608,16 +5754,21 @@ fn main() {
     }
     tab.mov = nl - nroot;
     drop((root, bk));
+    drop(skp2);
     tick(&format!("links table movers {}", tab.mov));
+    let skp3 = skp(3);
 
     // clicks
     let click_chunks = all_chunks(&csv_files(&data.join("clicks")), CHUNK);
     let mut tm = now();
+    let g = skt(3, 0);
     let mf = MoverF::build(&tab);
+    drop(g);
     pt(4, &mut tm);
     let click_out: Vec<(Vec<ClickRec>, Vec<u32>)> = click_chunks
         .par_iter()
         .map(|&c| {
+            let _g = skt(3, 1);
             let mut tmp: Vec<ClickRec> = Vec::with_capacity(c.len() / 40);
             let mut tm = now();
             parse_clicks(c, &camp, &rs, ws, we, &mut tmp);
@@ -5655,11 +5806,14 @@ fn main() {
         })
         .collect();
     tick("clicks parsed");
+    let g = skt(3, 2);
     match &ev_out {
         Evs::L(v) => fbn_merge(v, &mut names_map),
         Evs::W(v) => fbn_merge(v, &mut names_map),
     }
 
+    drop(g);
+    drop(skp3);
     // person buckets
     let d0 = ws.div_euclid(DAY);
     let nd = if we > ws { ((we - 1).div_euclid(DAY) - d0 + 1) as usize } else { 0 };
@@ -5670,6 +5824,8 @@ fn main() {
     tick("sessionized");
 
     // outputs
+    let skp7 = skp(7);
+    let g = skt(7, 2);
     let names = Names { map: names_map };
     let ud_dir = outd.join("user_daily");
     let cd_dir = outd.join("campaign_daily");
@@ -5692,15 +5848,24 @@ fn main() {
         files[k].push(g);
     }
     let any_rows = files.iter().any(|g| g.iter().any(|x| !x.is_empty()));
+    drop(g);
     rayon::join(
         || {
             files.par_iter().enumerate().filter(|(i, g)| g.iter().any(|x| !x.is_empty()) || (*i == 0 && !any_rows)).for_each(|(i, g)| {
+                let _g = skt(7, 0);
                 write_user_daily(&ud_dir.join(format!("part-{i}.parquet")), g, &cat_names, &names);
             })
         },
-        || write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows, &camp_names, &channels),
+        || {
+            let _g = skt(7, 1);
+            write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows, &camp_names, &channels)
+        },
     );
+    drop(skp7);
     tick("written");
+    if SKEW.load(Relaxed) {
+        sk_report(sk_ns());
+    }
     if timing {
         let v: Vec<String> = (0..PROF.len()).map(|i| format!("{}={:.2}", PROF_NAMES[i], PROF[i].load(Relaxed) as f64 / 1e9)).collect();
         eprintln!("prof(cpu s): {}", v.join(" "));
