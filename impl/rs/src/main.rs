@@ -129,7 +129,7 @@ fn ts_on() -> bool {
                 return true;
             }
         }
-        false
+        true
     })
 }
 
