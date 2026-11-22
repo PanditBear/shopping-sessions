@@ -3065,12 +3065,32 @@ impl Bs {
     fn put(&mut self, v: u32) {
         self.acc |= (v as u64) << self.nb;
         self.nb += self.w;
-        while self.nb >= 8 {
-            self.o.push(self.acc as u8);
-            self.acc >>= 8;
-            self.nb -= 8;
+        if self.nb >= 32 {
+            self.o.extend_from_slice(&(self.acc as u32).to_le_bytes());
+            self.acc >>= 32;
+            self.nb -= 32;
         }
         self.n += 1;
+    }
+    /// The values put so far (the slow path of AdCol).
+    fn values(&self) -> Vec<u32> {
+        let mut by = self.o.clone();
+        let (mut a, mut k) = (self.acc, self.nb);
+        while k > 0 {
+            by.push(a as u8);
+            a >>= 8;
+            k = k.saturating_sub(8);
+        }
+        by.extend_from_slice(&[0u8; 8]);
+        let w = self.w as usize;
+        let m = (1u64 << w) - 1;
+        (0..self.n)
+            .map(|i| {
+                let bit = i * w;
+                let x = u64::from_le_bytes(by[bit / 8..bit / 8 + 8].try_into().unwrap());
+                ((x >> (bit % 8)) & m) as u32
+            })
+            .collect()
     }
     /// Appends `pre`, the run header and the packed values to `b`, then resets.
     fn drain_to(&mut self, b: &mut Vec<u8>, pre: &[u8]) {
@@ -3080,6 +3100,10 @@ impl Bs {
         b.extend_from_slice(pre);
         uvar(b, ((self.n / 8) as u64) << 1 | 1);
         b.extend_from_slice(&self.o);
+        // n is a multiple of 8, so the bits left are whole bytes
+        for i in 0..self.nb / 8 {
+            b.push((self.acc >> (8 * i)) as u8);
+        }
         self.o.clear();
         self.acc = 0;
         self.nb = 0;
@@ -3122,13 +3146,101 @@ fn int_col<T: Copy + Into<i64>>(f: &mut Pqf, c: &mut Cm, vals: &[T], lo: i64, hi
     }
 }
 
+/// An integer column bit-packed as rows arrive: indices `v - b` at width `w`, so no second pass
+/// at the row group end. A value outside `b..b + 2^w` repacks the rows so far (rebase or widen,
+/// rare: the base and width carry over to the next row group); past 16 bits the column keeps raw
+/// values and is written by `int_col`. Dictionary page = `b..=b + mx`.
+struct AdCol {
+    b: i64,
+    mx: u32,
+    bs: Bs,
+    plain: bool,
+    raw: Vec<i64>,
+    lo: i64,
+    hi: i64,
+}
+impl AdCol {
+    fn new(b: i64, w: u32) -> Self {
+        AdCol { b, mx: 0, bs: Bs::new(w), plain: false, raw: vec![], lo: i64::MAX, hi: i64::MIN }
+    }
+    #[inline(always)]
+    fn put(&mut self, v: i64) {
+        let x = v.wrapping_sub(self.b) as u64;
+        if x < (1u64 << self.bs.w) && !self.plain {
+            self.mx = self.mx.max(x as u32);
+            self.bs.put(x as u32);
+        } else {
+            self.slow(v);
+        }
+    }
+    #[cold]
+    #[inline(never)]
+    fn slow(&mut self, v: i64) {
+        if !self.plain {
+            let old: Vec<i64> = self.bs.values().into_iter().map(|x| x as i64 + self.b).collect();
+            let (mut lo, mut hi) = (v, v);
+            for &o in &old {
+                lo = lo.min(o);
+                hi = hi.max(o);
+            }
+            let nb = if old.is_empty() { lo } else { self.b.min(lo) };
+            let w = bwid((hi - nb) as u64) + 1;
+            if w <= 16 {
+                let mut bs = Bs::new(w);
+                bs.o.reserve(self.bs.o.capacity());
+                for &o in &old {
+                    bs.put((o - nb) as u32);
+                }
+                bs.put((v - nb) as u32);
+                self.bs = bs;
+                self.b = nb;
+                self.mx = (hi - nb) as u32;
+                return;
+            }
+            self.plain = true;
+            self.lo = lo;
+            self.hi = hi;
+            self.raw = old;
+            self.bs = Bs::new(1);
+        }
+        self.raw.push(v);
+        self.lo = self.lo.min(v);
+        self.hi = self.hi.max(v);
+    }
+    /// Writes the column chunk of the `n` rows put since the last call.
+    fn page(&mut self, f: &mut Pqf, c: &mut Cm, n: usize) {
+        if self.plain {
+            let raw = std::mem::take(&mut self.raw);
+            int_col(f, c, &raw, self.lo, self.hi);
+            *self = AdCol::new(0, 1);
+            return;
+        }
+        let int32 = c.ty == 1;
+        let k = self.mx as i64 + 1;
+        let mut d: Vec<u8> = Vec::with_capacity((k * 8) as usize);
+        for v in self.b..self.b + k {
+            if int32 {
+                d.extend_from_slice(&(v as i32).to_le_bytes());
+            } else {
+                d.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        f.page(c, true, k as usize, 0, &d);
+        let w = self.bs.w as u8;
+        let mut b: Vec<u8> = Vec::with_capacity(self.bs.o.len() + 24);
+        self.bs.drain_to(&mut b, &[w]);
+        f.page(c, false, n, 8, &b);
+        self.mx = 0;
+    }
+}
+
 /// What every user_daily encoder shares.
 struct UdCtx<'a> {
     names: &'a AHashMap<u64, u64>,
     /// PLAIN dictionary page of the category list
     cats_dict: Vec<u8>,
     ncats: usize,
-    /// close a row group at the first bucket end at or past this many rows
+    /// close a row group at the first person boundary at or past this many rows
     target: usize,
     /// bit i set = compress column i's pages
     zm: u32,
@@ -3175,15 +3287,9 @@ struct UdEnc {
     run: u64,
     uid_dict: Vec<u8>,
     uid_idx: Vec<u8>,
-    day: Vec<i32>,
-    dlo: i32,
-    dhi: i32,
-    ses: Vec<u32>,
-    shi: u32,
-    slo: u32,
-    evn: Vec<u32>,
-    ehi: u32,
-    elo: u32,
+    day: AdCol,
+    ses: AdCol,
+    evn: AdCol,
     rev: Vec<u32>,
     side: Vec<(u32, u64)>,
     defs: Bs,
@@ -3203,15 +3309,9 @@ impl UdEnc {
             run: 0,
             uid_dict: vec![],
             uid_idx: vec![],
-            day: vec![],
-            dlo: i32::MAX,
-            dhi: i32::MIN,
-            ses: vec![],
-            shi: 0,
-            slo: u32::MAX,
-            evn: vec![],
-            ehi: 0,
-            elo: u32::MAX,
+            day: AdCol::new(0, 1),
+            ses: AdCol::new(1, 4),
+            evn: AdCol::new(1, 6),
             rev: vec![],
             side: vec![],
             defs: Bs::new(1),
@@ -3223,9 +3323,10 @@ impl UdEnc {
     }
     fn reserve(&mut self, cx: &UdCtx) {
         let c = cx.target.min(1 << 20) + 4096;
-        self.day.reserve(c);
-        self.ses.reserve(c);
-        self.evn.reserve(c);
+        self.day.bs.o.reserve(c * 3 / 8);
+        self.ses.bs.o.reserve(c * 3 / 8);
+        self.evn.bs.o.reserve(c);
+        self.defs.o.reserve(c / 8 + 8);
         self.rev.reserve(c);
     }
     #[inline(always)]
@@ -3240,11 +3341,47 @@ impl UdEnc {
     /// Encodes one bucket's rows (a person's rows are adjacent).
     fn push(&mut self, uds: &[UD], cx: &UdCtx) {
         let mut tm = now();
+        // names of the hashed keys in dictionary form, found by one pass of independent lookups
+        // (their cache misses overlap) and copied in address order (the name bytes lie scattered
+        // over the input; in address order the reads go forward through it)
+        let mut hk: Vec<(u64, u32)> = Vec::new();
+        let mut ord: Vec<(u64, u32)> = Vec::new();
+        let mut pk = 0u64;
+        let mut tot = 0u32;
+        for r in uds {
+            if r.key & HBIT != 0 && r.key != pk {
+                let v = *cx.names.get(&r.key).expect("name for hashed key");
+                ord.push((v, hk.len() as u32));
+                hk.push((r.key, tot));
+                tot += 4 + (v >> 48) as u32;
+            }
+            pk = r.key;
+        }
+        hk.push((0, tot));
+        pt(12, &mut tm);
+        ord.sort_unstable_by_key(|x| x.0 & ((1u64 << 48) - 1));
+        let mut hb: Vec<u8> = vec![0u8; tot as usize];
+        for &(v, i) in &ord {
+            let s = unpack(v);
+            let o = hk[i as usize].1 as usize;
+            hb[o..o + 4].copy_from_slice(&(s.len() as u32).to_le_bytes());
+            hb[o + 4..o + 4 + s.len()].copy_from_slice(s);
+        }
+        let mut j = 0usize;
+        pt(14, &mut tm);
         for r in uds {
             if self.n >= UD_HARD {
+                pt(13, &mut tm);
                 self.close(cx);
+                tm = now();
             }
             if !self.has_last || r.key != self.last {
+                // row groups end at a person boundary at or past the target
+                if self.n >= cx.target {
+                    pt(13, &mut tm);
+                    self.close(cx);
+                    tm = now();
+                }
                 self.end_run();
                 self.last = r.key;
                 self.has_last = true;
@@ -3260,21 +3397,18 @@ impl UdEnc {
                     }
                     self.uid_dict.extend_from_slice(&cb[..4 + ln]);
                 } else {
-                    let s = unpack(*cx.names.get(&r.key).expect("name for hashed key"));
-                    self.uid_dict.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                    self.uid_dict.extend_from_slice(s);
+                    // a person split by a row group close comes back with the same entry
+                    if hk[j].0 != r.key {
+                        j += 1;
+                    }
+                    debug_assert_eq!(hk[j].0, r.key);
+                    self.uid_dict.extend_from_slice(&hb[hk[j].1 as usize..hk[j + 1].1 as usize]);
                 }
             }
             self.run += 1;
-            self.day.push(r.day);
-            self.dlo = self.dlo.min(r.day);
-            self.dhi = self.dhi.max(r.day);
-            self.ses.push(r.sessions);
-            self.slo = self.slo.min(r.sessions);
-            self.shi = self.shi.max(r.sessions);
-            self.evn.push(r.events);
-            self.elo = self.elo.min(r.events);
-            self.ehi = self.ehi.max(r.events);
+            self.day.put(r.day as i64);
+            self.ses.put(r.sessions as i64);
+            self.evn.put(r.events as i64);
             if r.rev <= i32::MAX as u64 {
                 self.rev.push(r.rev as u32);
             } else {
@@ -3290,9 +3424,6 @@ impl UdEnc {
             self.n += 1;
         }
         pt(13, &mut tm);
-        if self.n >= cx.target {
-            self.close(cx);
-        }
     }
     /// Closes the open row group, if it has rows.
     fn close(&mut self, cx: &UdCtx) {
@@ -3313,11 +3444,11 @@ impl UdEnc {
         f.page(&mut cols[0], true, self.persons, 0, &self.uid_dict);
         f.page(&mut cols[0], false, n, 8, &self.uid_idx);
         bufs.push(std::mem::take(&mut f.out));
-        int_col(f, &mut cols[1], &self.day, self.dlo as i64, self.dhi as i64);
+        self.day.page(f, &mut cols[1], n);
         bufs.push(std::mem::take(&mut f.out));
-        int_col(f, &mut cols[2], &self.ses, self.slo as i64, self.shi as i64);
+        self.ses.page(f, &mut cols[2], n);
         bufs.push(std::mem::take(&mut f.out));
-        int_col(f, &mut cols[3], &self.evn, self.elo as i64, self.ehi as i64);
+        self.evn.page(f, &mut cols[3], n);
         bufs.push(std::mem::take(&mut f.out));
         pt(14, &mut tm);
         // revenue: PLAIN INT32 (wide range, mostly zeros); rebuilt as INT64 if any file overflows
@@ -3344,11 +3475,7 @@ impl UdEnc {
         self.uid_dict.clear();
         self.uid_idx.clear();
         self.uid_idx.push(0);
-        self.day.clear();
-        self.ses.clear();
-        self.evn.clear();
         self.reserve(cx);
-        (self.dlo, self.dhi, self.slo, self.shi, self.elo, self.ehi) = (i32::MAX, i32::MIN, u32::MAX, 0, u32::MAX, 0);
         pt(12, &mut tm);
     }
 }
@@ -4679,12 +4806,12 @@ fn ev_after<E: Ev>(
     let cost = pb_cost(&offs, click_out);
     lpt_run(&cost, || SsW::new(ncamp, d0, nd, ux), |p, w: &mut SsW<E>| {
         w.gather(p, &parts, click_out);
-        w.uds.clear();
         process_bucket(&mut w.evs, &mut w.tmp, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut w.uds, &mut w.cm, ws, we.wrapping_sub(ws));
-        w.enc.push(&w.uds, ux);
     })
     .into_par_iter()
     .map(|mut w| {
+        w.enc.push(&w.uds, ux);
+        w.uds = vec![];
         w.enc.close(ux);
         (w.enc, w.cm)
     })
@@ -5462,12 +5589,12 @@ fn ev_after_idx<E: Ev>(
     let cost = pb_cost(&offs, click_out);
     lpt_run(&cost, || SsW::new(ncamp, d0, nd, ux), |p, w: &mut SsW<E>| {
         w.gather_rd(p, &dparts, &rest, click_out);
-        w.uds.clear();
         process_runs(&w.evs_s, &mut w.tmp_s, &w.runs, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut w.uds, &mut w.cm, ws);
-        w.enc.push(&w.uds, ux);
     })
     .into_par_iter()
     .map(|mut w| {
+        w.enc.push(&w.uds, ux);
+        w.uds = vec![];
         w.enc.close(ux);
         (w.enc, w.cm)
     })
