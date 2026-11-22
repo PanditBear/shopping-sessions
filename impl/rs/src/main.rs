@@ -94,6 +94,37 @@ mod bim {
             kv(&ss, "nonvoluntary_ctxt_switches:")
         )
     }
+    pub static SP: Mutex<Vec<(&'static str, f64, f64, u16)>> = Mutex::new(Vec::new());
+    pub fn sp(n: &'static str, s: f64) {
+        let e = t();
+        let h = th();
+        SP.lock().unwrap().push((n, s, e, h));
+    }
+    pub fn join2<A, B, RA, RB>(na: &'static str, nb: &'static str, a: A, b: B) -> (RA, RB)
+    where
+        A: FnOnce() -> RA + Send,
+        B: FnOnce() -> RB + Send,
+        RA: Send,
+        RB: Send,
+    {
+        let j = t();
+        let r = rayon::join(
+            move || {
+                let s = t();
+                let r = a();
+                sp(na, s);
+                r
+            },
+            move || {
+                let s = t();
+                let r = b();
+                sp(nb, s);
+                r
+            },
+        );
+        sp(na, j);
+        r
+    }
     pub fn dump(prof: &str) {
         let tk = TK.lock().unwrap().clone();
         let at = |n: &str| tk.iter().find(|x| x.0 == n).map_or(0.0, |x| x.1);
@@ -138,6 +169,10 @@ mod bim {
         }
         for s in SN.lock().unwrap().iter() {
             o += &format!(" | {}", s);
+        }
+        o += " | sp";
+        for (n, s, e, h) in SP.lock().unwrap().iter() {
+            o += &format!(" {}={:.3}-{:.3}/{}", n, s, e, h);
         }
         o += &format!(" | @end:{} | {}", snap(), prof);
         println!("{}", o);
@@ -1334,7 +1369,7 @@ impl MoverF {
             .collect();
         let mut w = vec![0u64; nw];
         let mut ge = vec![0u64; 2 * gn];
-        rayon::join(
+        bim::join2("mw", "mg", 
             || {
                 w.par_chunks_mut(1 << WR).enumerate().for_each(|(r, ws)| {
                     for ((hv, ho), _) in &parts {
@@ -4558,9 +4593,9 @@ fn ev_after<E: Ev>(
         // does line g (ingest key k) beat line og (key ok) for the same event_id: smaller ingest, then exact ingest
         let better = |g: u32, k: u32, og: u32, ok: u32| k < ok || (k == ok && side_any && exact(g, k) < exact(og, ok));
         let (ndb, dsh) = idx_cfg().map_or((0, 0), |c| (c.ndb, c.sh));
-        rayon::join(
+        bim::join2("n4o", "n4e", 
             || {
-                rayon::join(
+                bim::join2("n4a", "n4b", 
                     || {
                         // dense buckets: one slot per index, a full slot is a duplicate event_id
                         const G: usize = 4;
@@ -5187,7 +5222,7 @@ fn ev_after_idx<E: Ev>(
             let c = mbase.partition_point(|&b| b <= g) - 1;
             ev_out[c].m[(g - mbase[c]) as usize]
         };
-        rayon::join(
+        bim::join2("d5a", "d5b", 
             || {
                 // dense buckets: one slot per index; the slot keeps the winning copy (smallest
                 // ingest), then the slots are read in index order
@@ -5427,6 +5462,7 @@ fn ev_after_idx<E: Ev>(
                     })
                     .collect();
                 let mut tm = now();
+                bim::sp("d5tail", bim::t());
                 let mut em: Vec<E> = hb.into_iter().flatten().collect();
                 pt(3, &mut tm);
                 let mut pc = PkCache { k: [0; 4], p: [0; 4], n: 0 };
@@ -6438,7 +6474,7 @@ fn main() {
     pt(4, &mut tm);
     // the names of hashed user keys (one map insert per such line, serial) merge on one thread
     // while the others parse the clicks; the map is read only by the writers
-    let (click_out, ()) = rayon::join(
+    let (click_out, ()) = bim::join2("c6a", "c6b", 
         || -> Vec<(Vec<ClickRec>, Vec<u32>)> {
             click_chunks
             .par_iter()
@@ -6522,7 +6558,7 @@ fn main() {
     // one revenue width for every file of the table, so all part files share a schema
     let rev32 = std::env::var_os("SHOP_REV64").is_none()
         && files.par_iter().all(|g| g.iter().all(|x| x.iter().all(|r| r.rev <= i32::MAX as u64)));
-    rayon::join(
+    bim::join2("w6a", "w6b", 
         || {
             files.par_iter().enumerate().filter(|(i, g)| g.iter().any(|x| !x.is_empty()) || (*i == 0 && !any_rows)).for_each(|(i, g)| {
                 write_user_daily(&ud_dir.join(format!("part-{i}.parquet")), g, &cat_names, &names, rev32);
