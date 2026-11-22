@@ -43,9 +43,21 @@ for spec in "$@"; do
   sha=$(git rev-parse --short "$r^{commit}" 2>/dev/null || git rev-parse --short "origin/$r")
   if [ ! -f $W/bin-$sha ]; then
     rm -rf $W/w$i; git worktree add -q --detach $W/w$i "$sha"
+    if [ -f $W/w$i/impl/rs/build.sh ]; then
+      # the ref builds itself the way its Dockerfile does (PGO): training on its committed set, or on $W/data
+      # when its build.sh defaults SHOP_PGO_TRAIN=bench
+      rustup component add llvm-tools >/dev/null 2>&1 || true
+      bt=$(date +%s)
+      (cd $W/w$i/impl/rs && CARGO_TARGET_DIR=$W/tgt SHOP_BENCH_DATA=$W/data sh build.sh $W/bin-$sha) > $W/build-$sha.log 2>&1 \
+        || { tail -50 $W/build-$sha.log; exit 1; }
+      echo "== build.sh $sha: $(($(date +%s) - bt)) s"; grep '^build.sh:' $W/build-$sha.log || true
+      echo "build.sh $sha: out-of-date/mismatch warnings $(grep -v '^build.sh:' $W/build-$sha.log | grep -Eic 'out of date|mismatch|inconsistent' || true) (must be 0);" \
+        "$(grep '^build.sh: pgo warnings' $W/build-$sha.log | sed 's/^build.sh: pgo warnings: //')" | tee -a ${GITHUB_STEP_SUMMARY:-/dev/null}
+    else
     (cd $W/w$i/impl/rs && CC_x86_64_unknown_linux_musl=musl-gcc RUSTFLAGS="-C target-cpu=x86-64-v3" CARGO_TARGET_DIR=$W/tgt \
        cargo build --release --locked -q --target x86_64-unknown-linux-musl)
     cp $W/tgt/x86_64-unknown-linux-musl/release/shop $W/bin-$sha
+    fi
   fi
   echo "== image bench$i: $sha ($(git log -1 --format=%s $sha)) env [${envs//@/ }]"
   cp $W/bin-$sha $W/img/shop
