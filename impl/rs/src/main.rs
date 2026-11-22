@@ -1047,6 +1047,11 @@ struct IdLookup {
     prefix: &'static [u8],
     arr: Vec<u32>,
     map: AHashMap<B, u32>,
+    /// canonical ids of at most 8 bytes: slot (key * cmul) >> cshift holds [key, len | value << 32],
+    /// key = the id bytes as a little-endian word, zero above the id; free slots never match
+    ct: Vec<[u64; 2]>,
+    cmul: u64,
+    cshift: u32,
 }
 impl IdLookup {
     fn new(prefix: &'static [u8], items: &[(B, u32)]) -> Self {
@@ -1067,7 +1072,86 @@ impl IdLookup {
                 }
             }
         }
-        IdLookup { prefix, arr, map }
+        let (ct, cmul, cshift) = Self::canon_tab(prefix, &arr);
+        IdLookup { prefix, arr, map, ct, cmul, cshift }
+    }
+    /// The table for `get_tab`: every n with arr[n] set whose id fits in 8 bytes, hashed by a
+    /// multiplier picked from a fixed list for the fewest collisions; an id that collides is left
+    /// out and found by `get` instead.
+    fn canon_tab(prefix: &[u8], arr: &[u32]) -> (Vec<[u64; 2]>, u64, u32) {
+        const FREE: [u64; 2] = [u64::MAX, u32::MAX as u64];
+        let mut keys: Vec<(u64, u64)> = vec![];
+        if prefix.len() == 2 {
+            for (n, &v) in arr.iter().enumerate() {
+                if v == u32::MAX || n == 0 {
+                    continue;
+                }
+                let mut id = prefix.to_vec();
+                id.extend_from_slice(n.to_string().as_bytes());
+                if id.len() > 8 {
+                    break;
+                }
+                let mut b = [0u8; 8];
+                b[..id.len()].copy_from_slice(&id);
+                keys.push((u64::from_le_bytes(b), id.len() as u64 | (v as u64) << 32));
+            }
+        }
+        if keys.is_empty() {
+            return (vec![FREE], 0, 63);
+        }
+        let bits = (keys.len().next_power_of_two().trailing_zeros() + 3).min(20);
+        let shift = 64 - bits;
+        let size = 1usize << bits;
+        let mut seen = vec![0u32; size];
+        let mut best = (usize::MAX, 0u64);
+        let mut z = 0x243f_6a88_85a3_08d3u64;
+        for t in 1..=64u32 {
+            z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut m = z;
+            m = (m ^ (m >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            m = (m ^ (m >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            let mul = (m ^ (m >> 31)) | 1;
+            let mut col = 0;
+            for &(k, _) in &keys {
+                let h = (k.wrapping_mul(mul) >> shift) as usize;
+                if seen[h] == t {
+                    col += 1;
+                } else {
+                    seen[h] = t;
+                }
+            }
+            if col < best.0 {
+                best = (col, mul);
+                if col == 0 {
+                    break;
+                }
+            }
+        }
+        let mul = best.1;
+        let mut ct = vec![FREE; size];
+        for &(k, lv) in &keys {
+            let h = (k.wrapping_mul(mul) >> shift) as usize;
+            if ct[h] == FREE {
+                ct[h] = [k, lv];
+            }
+        }
+        (ct, mul, shift)
+    }
+    /// Same result as `get` when it returns Some; None means "ask `get`". `p` has 8 readable bytes.
+    #[inline(always)]
+    fn get_tab(&self, p: *const u8, n: usize) -> Option<u32> {
+        use core::arch::x86_64::_bzhi_u64;
+        // SAFETY: the caller guarantees [p, p + 8) is readable; BMI2 is enabled for this build
+        let w = unsafe { std::ptr::read_unaligned(p as *const u64) };
+        let k = unsafe { _bzhi_u64(w, (n as u32).wrapping_mul(8)) };
+        let h = (k.wrapping_mul(self.cmul) >> self.cshift) as usize;
+        // SAFETY: cshift = 64 - log2(ct.len()), so h < ct.len()
+        let e = unsafe { self.ct.get_unchecked(h) };
+        if (e[0] == k) & (e[1] as u32 as usize == n) {
+            Some((e[1] >> 32) as u32)
+        } else {
+            None
+        }
     }
     #[inline]
     fn get(&self, b: B) -> Option<u32> {
@@ -1874,7 +1958,10 @@ fn parse_clicks(c: B, camp: &IdLookup, rs: &RandomState, ws: i64, we: i64, out: 
                 continue 'ln;
             }
             let (pm, nm) = fld(xq[2], e1 + 1, e2);
-            let Some(ci) = camp.get_fast2(sl(pm, nm), lo) else { continue 'ln };
+            // SAFETY (get_tab): the field starts at or before e2, so e2 + 8 <= win keeps 8 bytes
+            // from pm inside the window
+            let ct = if e2 + 8 <= win { camp.get_tab(pm, nm) } else { None };
+            let Some(ci) = ct.or_else(|| camp.get_fast2(sl(pm, nm), lo)) else { continue 'ln };
             let (pt, nt) = fld(xq[3], e2 + 1, l);
             // SAFETY (ldp, day_get, hms, ts25): a 20- or 25-byte field lies inside the window.
             // ts13: the time is the fourth field and both ids are not empty, so the 3 bytes
