@@ -34,7 +34,7 @@ mod hpa {
         let f = |k: &str| {
             r.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
         };
-        eprintln!("thp {label}: anon {} MB, anonhuge {} MB, rss {} MB", f("Anonymous:") >> 10, f("AnonHugePages:") >> 10, f("Rss:") >> 10);
+        eprintln!("thp {label}: anon {} MB, anonhuge {} MB, filepmd {} MB, rss {} MB", f("Anonymous:") >> 10, f("AnonHugePages:") >> 10, f("FilePmdMapped:") >> 10, f("Rss:") >> 10);
     }
 }
 
@@ -873,6 +873,35 @@ fn leak_file(p: &Path) -> Option<B> {
     let len = f.metadata().ok()?.len();
     if len == 0 {
         return None;
+    }
+    // SHOP_MAPAL=1 (probe): map the file at a 2 MiB aligned address with MADV_HUGEPAGE, so large
+    // page-cache folios can be PMD-mapped; not registered for drop_inputs
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("SHOP_MAPAL").is_some() {
+        use std::os::fd::AsRawFd;
+        extern "C" {
+            fn mmap(a: *mut std::ffi::c_void, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut std::ffi::c_void;
+            fn munmap(a: *mut std::ffi::c_void, l: usize) -> i32;
+            fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+        }
+        const HP: usize = 2 << 20;
+        let len = len as usize;
+        unsafe {
+            let r = mmap(std::ptr::null_mut(), len + HP, 0, 0x22, -1, 0); // PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS
+            if r as isize != -1 {
+                let a = (r as usize + HP - 1) & !(HP - 1);
+                let q = mmap(a as *mut _, len, 1, 0x12, f.as_raw_fd(), 0); // PROT_READ, MAP_PRIVATE|MAP_FIXED
+                if q as usize == a {
+                    let head = a - r as usize;
+                    if head > 0 {
+                        munmap(r, head);
+                    }
+                    madvise(q, len, 14);
+                    madvise(q, len, 2);
+                    return Some(std::slice::from_raw_parts(q as *const u8, len));
+                }
+            }
+        }
     }
     let m = unsafe { memmap2::Mmap::map(&f).ok()? };
     #[cfg(target_os = "linux")]
