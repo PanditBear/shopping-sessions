@@ -94,6 +94,41 @@ mod bim {
             kv(&ss, "nonvoluntary_ctxt_switches:")
         )
     }
+    pub fn ru() -> (u64, u64) {
+        extern "C" {
+            fn getrusage(who: i32, ru: *mut [i64; 18]) -> i32;
+        }
+        let mut r = [0i64; 18];
+        unsafe { getrusage(1, &mut r) };
+        ((r[0] * 1_000_000 + r[1]) as u64 * 1000, (r[2] * 1_000_000 + r[3]) as u64 * 1000)
+    }
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    // 0 ud user,1 ud sys,2 ud write user,3 ud write sys,4 ud kick user,5 ud kick sys,6 ud bytes,7 ud files,8 cd user,9 cd sys,10 cd bytes
+    pub static ACC: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+    pub static CDW: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    pub fn acc(i: usize, v: u64) {
+        ACC[i].fetch_add(v, Relaxed);
+    }
+    pub struct CW(pub std::fs::File);
+    impl std::io::Write for CW {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            CDW.lock().unwrap().push(b.len());
+            self.0.write(b)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.flush()
+        }
+    }
+    pub fn wrline() -> String {
+        let g = |i: usize| ACC[i].load(Relaxed) as f64 / 1e9;
+        let mut v = CDW.lock().unwrap().clone();
+        v.sort();
+        let (mn, md, mx) = if v.is_empty() { (0, 0, 0) } else { (v[0], v[v.len() / 2], v[v.len() - 1]) };
+        format!(
+            " | wr ud_u={:.3} ud_s={:.3} udw_u={:.3} udw_s={:.3} udk_u={:.3} udk_s={:.3} ud_MB={:.1} ud_n={} cd_u={:.3} cd_s={:.3} cd_calls={} cd_min/med/max={}/{}/{} cd_MB={:.2}",
+            g(0), g(1), g(2), g(3), g(4), g(5), ACC[6].load(Relaxed) as f64 / 1e6, ACC[7].load(Relaxed), g(8), g(9), v.len(), mn, md, mx, ACC[10].load(Relaxed) as f64 / 1e6
+        )
+    }
     pub static SP: Mutex<Vec<(&'static str, f64, f64, u16)>> = Mutex::new(Vec::new());
     pub fn sp(n: &'static str, s: f64) {
         let e = t();
@@ -170,6 +205,7 @@ mod bim {
         for s in SN.lock().unwrap().iter() {
             o += &format!(" | {}", s);
         }
+        o += &wrline();
         o += " | sp";
         for (n, s, e, h) in SP.lock().unwrap().iter() {
             o += &format!(" {}={:.3}-{:.3}/{}", n, s, e, h);
@@ -3469,8 +3505,22 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names,
     f.out.extend_from_slice(&(t.b.len() as u32).to_le_bytes());
     f.out.extend_from_slice(b"PAR1");
     pt(12, &mut tm);
+    #[cfg(target_os = "linux")]
+    let (a0, a1) = bim::ru();
     std::fs::write(path, &f.out).unwrap();
+    #[cfg(target_os = "linux")]
+    let (b0, b1) = bim::ru();
     out_kick(path);
+    #[cfg(target_os = "linux")]
+    {
+        let (c0, c1) = bim::ru();
+        bim::acc(2, b0 - a0);
+        bim::acc(3, b1 - a1);
+        bim::acc(4, c0 - b0);
+        bim::acc(5, c1 - b1);
+        bim::acc(6, f.out.len() as u64);
+        bim::acc(7, 1);
+    }
     pt(16, &mut tm);
 }
 
@@ -3481,7 +3531,7 @@ fn write_campaign_daily(path: &Path, rows: &[(u32, i32, [u64; 4])], names: &[B],
         )
         .unwrap(),
     );
-    let f = File::create(path).unwrap();
+    let f = bim::CW(File::create(path).unwrap());
     let mut w = SerializedFileWriter::new(f, schema, props()).unwrap();
     {
         let mut rg = w.next_row_group().unwrap();
@@ -3506,6 +3556,9 @@ fn write_campaign_daily(path: &Path, rows: &[(u32, i32, [u64; 4])], names: &[B],
         rg.close().unwrap();
     }
     w.close().unwrap();
+    if let Ok(m) = std::fs::metadata(path) {
+        bim::acc(10, m.len());
+    }
     out_kick(path);
 }
 
@@ -6561,10 +6614,20 @@ fn main() {
     bim::join2("w6a", "w6b", 
         || {
             files.par_iter().enumerate().filter(|(i, g)| g.iter().any(|x| !x.is_empty()) || (*i == 0 && !any_rows)).for_each(|(i, g)| {
+                let (a0, a1) = bim::ru();
                 write_user_daily(&ud_dir.join(format!("part-{i}.parquet")), g, &cat_names, &names, rev32);
+                let (b0, b1) = bim::ru();
+                bim::acc(0, b0 - a0);
+                bim::acc(1, b1 - a1);
             })
         },
-        || write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows, &camp_names, &channels),
+        || {
+            let (a0, a1) = bim::ru();
+            write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows, &camp_names, &channels);
+            let (b0, b1) = bim::ru();
+            bim::acc(8, b0 - a0);
+            bim::acc(9, b1 - a1);
+        },
     );
     tick("written");
     if timing {
