@@ -1,4 +1,6 @@
 use ahash::{AHashMap, RandomState};
+#[cfg(all(target_os = "linux", target_env = "musl", target_arch = "x86_64", target_feature = "avx2"))]
+mod fastmem;
 use memchr::memchr;
 use rayon::prelude::*;
 use std::fs::File;
