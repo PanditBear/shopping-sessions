@@ -40,6 +40,110 @@ mod hpa {
     }
 }
 
+// measurement ref only: one stdout summary line per run when SHOP_TIMING is set
+mod bim {
+    use std::sync::{Mutex, OnceLock};
+    pub static T0: OnceLock<std::time::Instant> = OnceLock::new();
+    pub static TK: Mutex<Vec<(String, f64, u16)>> = Mutex::new(Vec::new());
+    pub static CK: Mutex<Vec<(u8, u16, f64, f64, u32)>> = Mutex::new(Vec::new());
+    pub static SN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    pub fn t() -> f64 {
+        T0.get().map_or(0.0, |s| s.elapsed().as_secs_f64())
+    }
+    pub fn th() -> u16 {
+        rayon::current_thread_index().map_or(99, |i| i as u16)
+    }
+    pub fn rec(kind: u8, s: f64, x: u32) {
+        let e = t();
+        let h = th();
+        CK.lock().unwrap().push((kind, h, s, e, x));
+    }
+    fn short(l: &str) -> String {
+        l.split_whitespace().take(2).collect::<Vec<_>>().join("_")
+    }
+    pub fn tk(l: &str) {
+        let x = t();
+        TK.lock().unwrap().push((short(l), x, th()));
+        if l == "events parsed" || l == "links done" || l == "dedup done" {
+            let v = snap();
+            SN.lock().unwrap().push(format!("@{}:{}", short(l), v));
+        }
+    }
+    fn rd(p: &str) -> String {
+        std::fs::read_to_string(p).unwrap_or_default()
+    }
+    fn kv(r: &str, k: &str) -> u64 {
+        r.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
+    }
+    pub fn snap() -> String {
+        let st = rd("/proc/self/stat");
+        let rest: Vec<&str> = st.rsplit_once(')').map_or("", |x| x.1).split_whitespace().collect();
+        let g = |i: usize| rest.get(i).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        let sm = rd("/proc/self/smaps_rollup");
+        let ss = rd("/proc/self/status");
+        format!(
+            "minflt={} majflt={} ut={} st={} hwmMB={} anonMB={} ahpMB={} vcs={} ivcs={}",
+            g(7),
+            g(9),
+            g(11),
+            g(12),
+            kv(&ss, "VmHWM:") >> 10,
+            kv(&sm, "Anonymous:") >> 10,
+            kv(&sm, "AnonHugePages:") >> 10,
+            kv(&ss, "voluntary_ctxt_switches:"),
+            kv(&ss, "nonvoluntary_ctxt_switches:")
+        )
+    }
+    pub fn dump(prof: &str) {
+        let tk = TK.lock().unwrap().clone();
+        let at = |n: &str| tk.iter().find(|x| x.0 == n).map_or(0.0, |x| x.1);
+        let (lp, ld) = (at("links_parsed"), at("links_done"));
+        let ck = CK.lock().unwrap().clone();
+        let mut o = String::from("BIM");
+        for (n, x, h) in &tk {
+            o += &format!(" {}={:.3}/{}", n, x, h);
+        }
+        for k in 0..2u8 {
+            let v: Vec<_> = ck.iter().filter(|c| c.0 == k).collect();
+            if v.is_empty() {
+                continue;
+            }
+            let fs = v.iter().map(|c| c.2).fold(f64::MAX, f64::min);
+            let le = v.iter().map(|c| c.3).fold(0.0, f64::max);
+            let sum: f64 = v.iter().map(|c| c.3 - c.2).sum();
+            let x: u64 = v.iter().map(|c| c.4 as u64).sum();
+            o += &format!(" | k{} n={} first={:.3} last={:.3} busy={:.3} x={}", k, v.len(), fs, le, sum, x);
+            let mut th: Vec<(u16, usize, f64)> = vec![];
+            for c in &v {
+                match th.iter_mut().find(|t| t.0 == c.1) {
+                    Some(t) => {
+                        t.1 += 1;
+                        t.2 += c.3 - c.2;
+                    }
+                    None => th.push((c.1, 1, c.3 - c.2)),
+                }
+            }
+            th.sort_by_key(|t| t.0);
+            for t in th {
+                o += &format!(" t{}:{}/{:.3}", t.0, t.1, t.2);
+            }
+            if k == 0 {
+                let w = [(0.0, lp), (lp, ld), (ld, f64::MAX)];
+                for (i, (a, b)) in w.iter().enumerate() {
+                    let u: Vec<f64> = v.iter().filter(|c| c.2 >= *a && c.2 < *b).map(|c| c.3 - c.2).collect();
+                    let m = if u.is_empty() { 0.0 } else { u.iter().sum::<f64>() / u.len() as f64 };
+                    o += &format!(" w{}:{}/{:.2}ms", i, u.len(), m * 1e3);
+                }
+            }
+        }
+        for s in SN.lock().unwrap().iter() {
+            o += &format!(" | {}", s);
+        }
+        o += &format!(" | @end:{} | {}", snap(), prof);
+        println!("{}", o);
+    }
+}
+
 type B = &'static [u8];
 
 const DAY: i64 = 86_400_000;
@@ -5765,6 +5869,7 @@ fn ukey_find(ev_chunks: &[B], ekey: u64) -> Option<u64> {
 /// Parses one chunk: dense records go straight to their buckets, the rest are grouped by event_id
 /// hash bucket.
 fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
+    let bs = bim::t();
     let mut dz = Dz::new(idx_cfg(), c.len());
     let cap = if dz.on { c.len() / 4096 } else { c.len() / 64 };
     let mut m: Vec<E> = Vec::with_capacity(cap);
@@ -5783,6 +5888,7 @@ fn ev_chunk_parse<E: Ev>(c: B, cx: &EvCtx) -> EvChunk<E> {
     fb.x = Vec::new();
     dz.finish();
     pt(1, &mut tm);
+    bim::rec(0, bs, dz.on as u32);
     EvChunk { m, d, doff, dz, fb, dx, dxoff, fbn, side }
 }
 
@@ -5925,7 +6031,11 @@ fn main() {
     let timing = std::env::var("SHOP_TIMING").is_ok();
     TIMING.store(timing, Relaxed);
     let t0 = std::time::Instant::now();
+    let _ = bim::T0.set(t0);
     let tick = |s: &str| {
+        if timing {
+            bim::tk(s);
+        }
         if timing {
             eprintln!("[{:.2}s] {}", t0.elapsed().as_secs_f64(), s);
         }
@@ -6017,12 +6127,14 @@ fn main() {
             let link_pairs: Vec<Vec<[u64; 4]>> = link_chunks
                 .par_iter()
                 .map(|&c| {
+                    let bs = bim::t();
                     let mut v = vec![];
                     scan::<2>(c, |&[a, b]| {
                         if !a.is_empty() && !b.is_empty() {
                             v.push([ukey(&rs, a), pack(a), ukey(&rs, b), pack(b)]);
                         }
                     });
+                    bim::rec(1, bs, 0);
                     v
                 })
                 .collect();
@@ -6386,6 +6498,7 @@ fn main() {
     if timing {
         let v: Vec<String> = (0..PROF.len()).map(|i| format!("{}={:.2}", PROF_NAMES[i], PROF[i].load(Relaxed) as f64 / 1e9)).collect();
         eprintln!("prof(cpu s): {}", v.join(" "));
+        bim::dump(&v.join(" "));
     }
     if timing {
         eprintln!("epoch main={:.3} end={:.3}", ep0, ep());
