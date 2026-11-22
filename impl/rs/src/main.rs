@@ -3271,7 +3271,7 @@ fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names
 // Default plain (mask 16). The first out_kick that takes longer than the threshold (slow disk: bytes are the
 // cost) sets ZA_SLOW; every file that has not started encoding by then is compressed (mask 25). Monotone.
 // SHOP_ZAUTO=on (default) adaptive; =plain all plain; =zstd all compressed. SHOP_ZCOLS overrides everything.
-// SHOP_ZAUTO_MS overrides the threshold (default 6 ms).
+// SHOP_ZAUTO_MS overrides the threshold (default 12 ms).
 static ZA_SLOW: AtomicBool = AtomicBool::new(false);
 static ZA_NEXT: AtomicU64 = AtomicU64::new(0); // kicks completed
 static ZA_FIRST: AtomicU64 = AtomicU64::new(u64::MAX); // index of the first slow kick
@@ -3298,7 +3298,7 @@ fn za_kick(us: u64) {
     if i < 16 {
         ZA_K[i].store(us, Relaxed);
     }
-    let ms: u64 = std::env::var("SHOP_ZAUTO_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+    let ms: u64 = std::env::var("SHOP_ZAUTO_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(12);
     if us >= ms * 1000 {
         ZA_FIRST.fetch_min(i as u64, Relaxed);
         ZA_SLOW.store(true, std::sync::atomic::Ordering::Release);
