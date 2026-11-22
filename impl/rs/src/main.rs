@@ -1161,8 +1161,16 @@ impl IdTab {
         }
     }
     #[inline(always)]
+    fn pf_slot(&self, i: usize) {
+        prefetch(unsafe { self.s.as_ptr().add(i) });
+    }
+    #[inline(always)]
     fn get(&self, k: u64) -> u64 {
-        let mut i = self.slot(k);
+        self.get_from(k, self.slot(k))
+    }
+    /// `get` with the home slot `i = slot(k)` already computed
+    #[inline(always)]
+    fn get_from(&self, k: u64, mut i: usize) -> u64 {
         loop {
             let e = unsafe { *self.s.get_unchecked(i) };
             if e[0] == k {
@@ -4956,16 +4964,43 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
         let mut tm = now();
         let mut cnt = vec![0u32; PB + 1];
         // person keys set in place: same lookups as a line-by-line pass, with this region of
-        // the table in cache
-        for s in rl.iter_mut() {
-            let l = s.len();
-            for j in 0..l {
-                if j + PD < l {
-                    tab.pf(s[j + PD].key());
+        // the table in cache. The region's hit lists (one per chunk) are one stream for the
+        // prefetch: a second cursor runs PD lines ahead across list ends, computes each home slot
+        // once, prefetches it and parks it in a ring for the lookup.
+        {
+            let ls: Vec<(*mut E, usize)> = rl.iter_mut().filter(|s| !s.is_empty()).map(|s| (s.as_mut_ptr(), s.len())).collect();
+            let tot: usize = ls.iter().map(|x| x.1).sum();
+            let mut ring = [0usize; 32];
+            let mut pc = (0usize, 0usize);
+            let adv = |pc: &mut (usize, usize)| -> usize {
+                let (p, n) = ls[pc.0];
+                // SAFETY: pc.1 < n, the length of the list at p
+                let k = unsafe { (*p.add(pc.1)).key() };
+                pc.1 += 1;
+                if pc.1 == n {
+                    pc.0 += 1;
+                    pc.1 = 0;
                 }
-                let p = tab.get(s[j].key());
-                s[j].set_key(p);
-                cnt[pbk(p) + 1] += 1;
+                let sl = tab.slot(k);
+                tab.pf_slot(sl);
+                sl
+            };
+            for t in 0..tot.min(PD) {
+                ring[t] = adv(&mut pc);
+            }
+            let mut t = 0usize;
+            for &(p, n) in &ls {
+                for j in 0..n {
+                    if t + PD < tot {
+                        ring[(t + PD) & 31] = adv(&mut pc);
+                    }
+                    // SAFETY: j < n; the look-ahead cursor only reads lines after this one
+                    let e = unsafe { &mut *p.add(j) };
+                    let pk = tab.get_from(e.key(), ring[t & 31]);
+                    e.set_key(pk);
+                    cnt[pbk(pk) + 1] += 1;
+                    t += 1;
+                }
             }
         }
         pt(4, &mut tm);
