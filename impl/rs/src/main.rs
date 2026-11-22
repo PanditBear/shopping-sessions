@@ -69,15 +69,16 @@ fn ebb() -> u32 {
     EBB_RT.load(Relaxed)
 }
 /// event_id bucket bits for `bytes` of event files: EBB up to ~24M lines (88 bytes a line), above
-/// that the fewest bits that keep a bucket at most EBP lines, so one dedup table stays L2-sized
+/// that the fewest bits that keep a bucket at most EBP lines
 fn ebb_for(bytes: usize) -> u32 {
-    const EBP: usize = 2_600;
+    const EBP: usize = 83_000;
     let est = bytes / 88;
-    let mut b = EBB;
-    if est > 24_000_000 {
-        while b < 15 && est >> b > EBP {
-            b += 1;
-        }
+    if est <= 24_000_000 {
+        return EBB;
+    }
+    let mut b = 2;
+    while b < 15 && est >> b > EBP {
+        b += 1;
     }
     b
 }
