@@ -878,6 +878,13 @@ fn leak_file(p: &Path) -> Option<B> {
     #[cfg(target_os = "linux")]
     {
         let _ = m.advise(memmap2::Advice::Sequential);
+        // SHOP_POP=1: map every page of the input up front (MADV_POPULATE_READ), one call per file
+        if std::env::var_os("SHOP_POP").is_some() {
+            extern "C" {
+                fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+            }
+            unsafe { madvise(m.as_ptr() as *mut _, m.len(), 22) };
+        }
     }
     let m: &'static memmap2::Mmap = Box::leak(Box::new(m));
     #[cfg(target_os = "linux")]
@@ -5210,6 +5217,38 @@ enum Evs {
     W(Vec<EvChunk<EvW>>),
 }
 
+// SHOP_RUSAGE=1: process utime, stime and minor faults (getrusage) at each phase tick (Linux only)
+mod ru {
+    #[cfg(target_os = "linux")]
+    extern "C" {
+        fn getrusage(who: i32, usage: *mut [i64; 18]) -> i32;
+        pub fn _exit(code: i32) -> !;
+    }
+    pub fn line(label: &str) {
+        #[cfg(target_os = "linux")]
+        {
+            if std::env::var_os("SHOP_RUSAGE").is_none() {
+                return;
+            }
+            let mut r = [0i64; 18];
+            unsafe { getrusage(0, &mut r) };
+            let t = |s: i64, u: i64| s as f64 + u as f64 * 1e-6;
+            eprintln!("ru {label}: utime {:.3} stime {:.3} minflt {} majflt {} maxrss_mb {}", t(r[0], r[1]), t(r[2], r[3]), r[8], r[9], r[4] >> 10);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = label;
+    }
+    /// exit_group right away: no atexit handlers (mimalloc's process-done collect), no stdio flush
+    pub fn fast_exit() -> ! {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            _exit(0)
+        }
+        #[cfg(not(target_os = "linux"))]
+        std::process::exit(0)
+    }
+}
+
 fn main() {
     hpa::init();
     let ep = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
@@ -5232,6 +5271,7 @@ fn main() {
             eprintln!("[{:.2}s] {}", t0.elapsed().as_secs_f64(), s);
         }
         hpa::diag(s);
+        ru::line(s);
     };
 
     let mf = std::fs::read_to_string(data.join("manifest.json")).unwrap_or_default();
@@ -5681,7 +5721,11 @@ fn main() {
             eprintln!("dropin end {:.3}s", ep() - t);
         }
     }
+    ru::line("exit");
     // all output files are written and closed; skip freeing the large tables
+    if std::env::var_os("SHOP_FASTEXIT").is_some() {
+        ru::fast_exit();
+    }
     std::process::exit(0);
 }
 
