@@ -52,7 +52,7 @@ step instrumented
 
 # 2. training
 sets=""
-if [ "${SHOP_PGO_TRAIN:-}" = bench ] && [ -f "${SHOP_BENCH_DATA:-/nonexistent}/manifest.json" ]; then
+if [ "${SHOP_PGO_TRAIN:-bench}" = bench ] && [ -f "${SHOP_BENCH_DATA:-/nonexistent}/manifest.json" ]; then
   sets=$SHOP_BENCH_DATA
   say "training on $SHOP_BENCH_DATA ($(du -sh "$SHOP_BENCH_DATA" | cut -f1))"
 else
