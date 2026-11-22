@@ -49,8 +49,27 @@ const CHUNK: usize = 4 << 20;
 const EBB: u32 = 11;
 const EB: usize = 1 << EBB; // event dedup buckets (by event_id)
 const DDG: usize = 4; // event_id buckets per dedup task
-const PBB: u32 = 10;
-const PB: usize = 1 << PBB; // person buckets
+/// Person buckets: 1 << PBB, set once from the event bytes before any line is bucketed (see
+/// set_pbb). Kept as a mask so `pbk_h` is one load and one and.
+static PBM: AtomicUsize = AtomicUsize::new((1 << 10) - 1);
+/// Target events per person bucket on large inputs (a bucket's lines, runs and clicks stay
+/// cache-sized as the input grows).
+const PBT: usize = 19_500;
+#[inline(always)]
+fn pb_n() -> usize {
+    PBM.load(Relaxed) + 1
+}
+/// Picks the person bucket count from the event bytes (about 90 bytes a line): 1 << 10 below
+/// about 28M lines (as before), else the power of two nearest lines / PBT, at most 1 << 15 (the
+/// resolve pass keeps a bucket in a u16, and the in-bucket digit uses hash bits 36 and up, so
+/// bucket bits 20..20+PBB stay disjoint from it). SHOP_PBB overrides. Any count is exact: a
+/// person's records share one bucket for every count, and output row order does not count.
+fn set_pbb(ev_bytes: usize) {
+    let lines = ev_bytes / 90;
+    let auto = if lines < 28_000_000 { 10 } else { ((lines as f64 / PBT as f64).log2().round() as u32).clamp(11, 15) };
+    let b = std::env::var("SHOP_PBB").ok().and_then(|s| s.parse::<u32>().ok()).map_or(auto, |b| b.clamp(6, 15));
+    PBM.store((1usize << b) - 1, Relaxed);
+}
 
 fn hasher() -> RandomState {
     RandomState::with_seeds(0x243f6a8885a308d3, 0x13198a2e03707344, 0xa4093822299f31d0, 0x082efa98ec4e6c89)
@@ -1988,7 +2007,7 @@ fn pbk(key: u64) -> usize {
 /// `pbk` of a key whose mix is h
 #[inline(always)]
 fn pbk_h(h: u64) -> usize {
-    (h >> 20) as usize & (PB - 1)
+    (h >> 20) as usize & PBM.load(Relaxed)
 }
 
 // ---------- per-bucket processing ----------
@@ -4778,14 +4797,14 @@ type RdPart<S> = (Vec<S>, Vec<RunD>, Vec<u32>, Vec<u32>);
 /// Groups run descriptors by person bucket (order kept inside a bucket). Returns the grouped
 /// descriptors, their bucket offsets, and prefix sums of the lines per bucket.
 fn rd_scatter(ds: &[RunD]) -> (Vec<RunD>, Vec<u32>, Vec<u32>) {
-    let mut cnt = vec![0u32; PB + 1];
-    let mut eo = vec![0u32; PB + 1];
+    let mut cnt = vec![0u32; pb_n() + 1];
+    let mut eo = vec![0u32; pb_n() + 1];
     for r in ds {
         let p = pbk(r.k);
         cnt[p + 1] += 1;
         eo[p + 1] += r.lk >> 1;
     }
-    for p in 0..PB {
+    for p in 0..pb_n() {
         cnt[p + 1] += cnt[p];
         eo[p + 1] += eo[p];
     }
@@ -4807,7 +4826,7 @@ fn rd_scatter(ds: &[RunD]) -> (Vec<RunD>, Vec<u32>, Vec<u32>) {
 /// costs about two lines: radix sort plus window upkeep).
 fn pb_cost(offs: &[&[u32]], click_out: &[(Vec<ClickRec>, Vec<u32>)]) -> Vec<u64> {
     const BLK: usize = 64;
-    let mut cost = vec![0u64; PB];
+    let mut cost = vec![0u64; pb_n()];
     cost.par_chunks_mut(BLK).enumerate().for_each(|(b, c)| {
         let lo = b * BLK;
         for o in offs.iter() {
@@ -4933,14 +4952,14 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
         let mb = mbase[ci] as usize;
         let m = c.m;
         let n = m.len();
-        let mut cnt = vec![0u32; PB + 1];
+        let mut cnt = vec![0u32; pb_n() + 1];
         // Without data-dependent branches: a live line (key set, not a dedup loser) that misses
         // the filter sets its bit in `km` and counts in its person bucket; a live line that hits
         // it lists its index in `hi`. Every other line adds 0 to a count and lists nothing. m is
         // only read.
         let mut km = vec![0u64; n.div_ceil(64)];
         let mut hi: Vec<u32> = Vec::with_capacity(n);
-        // person bucket of every line, kept for the scatter (PB <= 65536)
+        // person bucket of every line, kept for the scatter (pb_n() <= 65536)
         let mut pb = vec![0u16; n];
         {
             let hs = hi.spare_capacity_mut();
@@ -4988,10 +5007,10 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
         }
         drop(hi);
         pt(4, &mut tm);
-        for p in 0..PB {
+        for p in 0..pb_n() {
             cnt[p + 1] += cnt[p];
         }
-        let tot = cnt[PB] as usize;
+        let tot = cnt[pb_n()] as usize;
         let mut out: Vec<E> = Vec::with_capacity(tot);
         {
             let mut w = cnt.clone();
@@ -5026,7 +5045,7 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
     let hp: Vec<(Vec<E>, Vec<u32>)> = lpt_map(regs, &rcost, |_, mut rl: Vec<Vec<E>>| {
         const PD: usize = 16;
         let mut tm = now();
-        let mut cnt = vec![0u32; PB + 1];
+        let mut cnt = vec![0u32; pb_n() + 1];
         // person keys set in place: same lookups as a line-by-line pass, with this region of
         // the table in cache. The region's hit lists (one per chunk) are one stream for the
         // prefetch: a second cursor runs PD lines ahead across list ends, computes each home slot
@@ -5068,10 +5087,10 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
             }
         }
         pt(4, &mut tm);
-        for p in 0..PB {
+        for p in 0..pb_n() {
             cnt[p + 1] += cnt[p];
         }
-        let tot = cnt[PB] as usize;
+        let tot = cnt[pb_n()] as usize;
         let mut out: Vec<E> = Vec::with_capacity(tot);
         {
             let mut w = cnt.clone();
@@ -5116,14 +5135,14 @@ fn pk_of(c: &mut PkCache, k: u64, tab: &IdTab, mf: &MoverF) -> u64 {
 
 /// Groups kept lines (person keys set) by person bucket, keeping their order inside a bucket.
 fn pb_scatter<E: Ev>(em: &[E]) -> (Vec<E>, Vec<u32>) {
-    let mut cnt = vec![0u32; PB + 1];
+    let mut cnt = vec![0u32; pb_n() + 1];
     for e in em {
         cnt[pbk(e.key()) + 1] += 1;
     }
-    for p in 0..PB {
+    for p in 0..pb_n() {
         cnt[p + 1] += cnt[p];
     }
-    let tot = cnt[PB] as usize;
+    let tot = cnt[pb_n()] as usize;
     let mut out: Vec<E> = Vec::with_capacity(tot);
     {
         let mut w = cnt.clone();
@@ -6095,6 +6114,7 @@ fn main() {
     let ev_dir = data.join("events");
     let ev_setup = std::thread::spawn(move || {
         let ev_files = csv_files(&ev_dir);
+        set_pbb(ev_files.iter().map(|f| f.len()).sum());
         let ev_chunks = all_chunks(&ev_files, ev_chunk(&ev_files));
         let _ = IDXC.set(idx_find(&ev_files, &ev_chunks));
         let _ = UKEYC.set(idx_cfg().and_then(|c| ukey_find(&ev_chunks, c.key)));
@@ -6460,7 +6480,7 @@ fn main() {
                 // those, and both count the person buckets of the final keys on the way.
                 let n = tmp.len();
                 let mut hit = vec![0u32; n + 1];
-                let mut cnt = vec![0u32; PB + 1];
+                let mut cnt = vec![0u32; pb_n() + 1];
                 let mut m = 0usize;
                 let (mw, mmask) = (&mf.w[..], mf.mask);
                 let mut ring = [0u64; RPD];
