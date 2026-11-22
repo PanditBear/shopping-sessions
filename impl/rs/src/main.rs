@@ -84,6 +84,33 @@ fn pt(i: usize, t: &mut Option<std::time::Instant>) {
     }
 }
 
+// SHOP_TIMING: wall and summed task time (PROF plus WLX) per segment, printed as "wl <seg>: ..."
+static WLX: AtomicU64 = AtomicU64::new(0);
+fn wl_sum() -> u64 {
+    PROF.iter().map(|p| p.load(Relaxed)).sum::<u64>() + WLX.load(Relaxed)
+}
+struct Wl(Option<(std::time::Instant, u64)>);
+fn wl() -> Wl {
+    Wl(if TIMING.load(Relaxed) { Some((std::time::Instant::now(), wl_sum())) } else { None })
+}
+impl Wl {
+    fn lap(&mut self, name: &str) {
+        if let Some((t, c)) = self.0 {
+            let n = std::time::Instant::now();
+            let s = wl_sum();
+            let w = (n - t).as_secs_f64();
+            let k = (s - c) as f64 / 1e9;
+            eprintln!("wl {name}: wall {w:.4} task {k:.4} util {:.2} idle {:.4}", k / w.max(1e-9), w - k / rayon::current_num_threads() as f64);
+            self.0 = Some((n, s));
+        }
+    }
+}
+fn wlx_add(t: Option<std::time::Instant>) {
+    if let Some(s) = t {
+        WLX.fetch_add(s.elapsed().as_nanos() as u64, Relaxed);
+    }
+}
+
 #[inline(always)]
 fn prefetch<T>(p: *const T) {
     #[cfg(target_arch = "x86_64")]
@@ -1218,6 +1245,7 @@ impl MoverF {
             .s
             .par_chunks(1 << 15)
             .map(|c| {
+                let t0 = now();
                 let (mut h, mut g) = (Vec::new(), Vec::new());
                 for e in c {
                     if e[0] != 0 && e[0] != e[1] {
@@ -1233,7 +1261,9 @@ impl MoverF {
                         }
                     }
                 }
-                (bucketize(&h, nwr, |&x| (x as usize & (nw - 1)) >> WR), bucketize(&g, ngr, |x| (x[1] >> (4 + GR)) as usize))
+                let r = (bucketize(&h, nwr, |&x| (x as usize & (nw - 1)) >> WR), bucketize(&g, ngr, |x| (x[1] >> (4 + GR)) as usize));
+                wlx_add(t0);
+                r
             })
             .collect();
         let mut w = vec![0u64; nw];
@@ -1241,15 +1271,18 @@ impl MoverF {
         rayon::join(
             || {
                 w.par_chunks_mut(1 << WR).enumerate().for_each(|(r, ws)| {
+                    let t0 = now();
                     for ((hv, ho), _) in &parts {
                         for &h in &hv[ho[r] as usize..ho[r + 1] as usize] {
                             ws[h as usize & (nw - 1) & ((1 << WR) - 1)] |= Self::bits(h);
                         }
                     }
+                    wlx_add(t0);
                 })
             },
             || {
                 ge.par_chunks_mut(2 << GR).enumerate().for_each(|(r, gs)| {
+                    let t0 = now();
                     for (_, (gv, go)) in &parts {
                         for x in &gv[go[r] as usize..go[r + 1] as usize] {
                             let l = 2 * ((x[1] >> 4) as usize & ((1 << GR) - 1));
@@ -1261,6 +1294,7 @@ impl MoverF {
                             gs[l + 1] = m | mixed | (1 << (x[1] & 15));
                         }
                     }
+                    wlx_add(t0);
                 })
             },
         );
@@ -4451,6 +4485,7 @@ fn ev_after<E: Ev>(
     if let Some(cfg) = idx_cfg() {
         return ev_after_idx(ev_out, tab, mf, click_out, ws, we, ncamp, d0, nd, tick, cfg);
     }
+    let mut wlt = wl();
     // dedup on event_id: every line has a global index (chunk base + its index in the chunk);
     // each event_id's losers are marked in the dead bitmap. Each task takes DDG consecutive
     // event_id buckets, one small (L2-sized) table at a time.
@@ -4463,6 +4498,7 @@ fn ev_after<E: Ev>(
     assert!(acc < u32::MAX as usize);
     mbase.push(acc as u32);
     let dead: Vec<AtomicU64> = (0..acc / 64 + 1).map(|_| AtomicU64::new(0)).collect();
+    wlt.lap("dd.prep");
     let kill = |g: u32| {
         dead[(g >> 6) as usize].fetch_or(1u64 << (g & 63), Relaxed);
     };
@@ -4591,14 +4627,17 @@ fn ev_after<E: Ev>(
             },
             || {},
         );
+        wlt.lap("dd.table");
         if TIMING.load(Relaxed) {
             let dense: usize = ev_out.iter().map(|c| c.doff[ndb] as usize).sum();
             let all: usize = ev_out.iter().map(|c| c.d.len() + c.fb.v.len() + c.dx.len()).sum();
             tick(&format!("idx dense records {dense} of {all} ({:.5})", dense as f64 / all.max(1) as f64));
         }
     }
+    wlt.lap("dd.tick");
     let parts = resolve_parts(ev_out, &mbase, &dead, tab, mf);
     drop(dead);
+    wlt.lap("dd.resolve_all");
     tick("dedup done");
 
     let offs: Vec<&[u32]> = parts.iter().map(|x| &x.1[..]).collect();
@@ -4883,11 +4922,13 @@ fn lpt_map<I: Send, T: Send>(items: Vec<I>, cost: &[u64], f: impl Fn(usize, I) -
     let slots: Vec<std::sync::Mutex<Option<I>>> = items.into_iter().map(|x| std::sync::Mutex::new(Some(x))).collect();
     let next = AtomicUsize::new(0);
     let nt = rayon::current_num_threads().clamp(1, n.max(1));
+    let lt0 = now();
+    let fin: Vec<AtomicU64> = (0..nt).map(|_| AtomicU64::new(0)).collect();
     let r: Vec<Vec<(u32, T)>> = (0..nt)
         .into_par_iter()
         .with_min_len(1)
         .with_max_len(1)
-        .map(|_| {
+        .map(|wi| {
             let mut v = Vec::new();
             loop {
                 let i = next.fetch_add(1, Relaxed);
@@ -4898,9 +4939,19 @@ fn lpt_map<I: Send, T: Send>(items: Vec<I>, cost: &[u64], f: impl Fn(usize, I) -
                 let x = slots[p as usize].lock().unwrap().take().unwrap();
                 v.push((p, f(p as usize, x)));
             }
+            if let Some(t) = lt0 {
+                fin[wi].store(t.elapsed().as_nanos() as u64, Relaxed);
+            }
             v
         })
         .collect();
+    if let Some(t) = lt0 {
+        let w = t.elapsed().as_secs_f64();
+        let f: Vec<f64> = fin.iter().map(|x| x.load(Relaxed) as f64 / 1e9).collect();
+        let lo = f.iter().cloned().fold(f64::MAX, f64::min);
+        let hi = f.iter().cloned().fold(0.0, f64::max);
+        eprintln!("wl lpt_map n={n} wall {w:.4} worker finish first {lo:.4} last {hi:.4} spread {:.4}", hi - lo);
+    }
     let mut out: Vec<Option<T>> = (0..n).map(|_| None).collect();
     for v in r {
         for (p, t) in v {
@@ -4927,6 +4978,7 @@ fn lpt_map<I: Send, T: Send>(items: Vec<I>, cost: &[u64], f: impl Fn(usize, I) -
 /// before and every miss maps to itself as before; only the order of lines inside a person
 /// bucket changes, and the sessionizer orders each person's lines by ts (equal ts share a session).
 fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU64], tab: &IdTab, mf: &MoverF) -> Vec<(Vec<E>, Vec<u32>)> {
+    let mut wlr = wl();
     let rb = (tab.s.len() >> 16).clamp(1, 512).trailing_zeros();
     let nr = 1usize << rb;
     assert!(dead.len() * 64 >= *mbase.last().unwrap() as usize);
@@ -5026,6 +5078,7 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
         pt(5, &mut tm);
         (out, cnt, h)
     });
+    wlr.lap("rs.filter");
     // regroup the hit lists by region (chunk order kept inside a region)
     let mut a0: Vec<(Vec<E>, Vec<u32>)> = Vec::with_capacity(a.len() + nr);
     let mut regs: Vec<Vec<Vec<E>>> = (0..nr).map(|_| Vec::with_capacity(a.len())).collect();
@@ -5035,6 +5088,7 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
             regs[r].push(v);
         }
     }
+    wlr.lap("rs.regroup");
     let rcost: Vec<u64> = regs.iter().map(|rl| rl.iter().map(|s| s.len() as u64).sum()).collect();
     let hp: Vec<(Vec<E>, Vec<u32>)> = lpt_map(regs, &rcost, |_, mut rl: Vec<Vec<E>>| {
         const PD: usize = 16;
@@ -5102,6 +5156,8 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
         pt(5, &mut tm);
         (out, cnt)
     });
+    wlr.lap("rs.hits");
+    eprintln!("wl rs.nchunks {} nr {}", a0.len() - nr, nr);
     a0.extend(hp);
     a0
 }
@@ -6489,9 +6545,9 @@ fn main() {
 
     // clicks
     let click_chunks = all_chunks(&csv_files(&data.join("clicks")), CHUNK);
-    let mut tm = now();
+    let mut wlm = wl();
     let mf = MoverF::build(&tab);
-    pt(4, &mut tm);
+    wlm.lap("mf.build");
     // the names of hashed user keys are built in shards on the spare threads while the clicks parse; the map is read only by the writers
     let (click_out, names) = rayon::join(
         || -> Vec<(Vec<ClickRec>, Vec<u32>)> {
