@@ -3224,7 +3224,7 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
             }
             match pack6(eid) {
                 Some(k) => d.push(DRec { eid: k, ing: ik, loc }),
-                None => fb.push((pack(eid), ingest, loc)),
+                None => fb_put(cx.rs, d, fb, eid, ingest, ik, loc),
             }
         }
     });
@@ -3281,8 +3281,16 @@ fn ev_line<E: Ev>(f: &[B; 7], cx: &EvCtx, c0: usize, tci: &mut TsCache, tct: &mu
     }
     match k6 {
         Some(k) => d.push(DRec { eid: k, ing: ik, loc }),
-        None => fb.push((pack(eid), ingest, loc)),
+        None => fb_put(cx.rs, d, fb, eid, ingest, ik, loc),
     }
+}
+
+/// An event_id that pack6 rejects: its record goes to the hash buckets with key hash | HBIT (pack6 keys
+/// keep bits 63..60 clear), and its bytes stay in `fb` (in loc order) for the exact compare on key matches.
+#[inline(never)]
+fn fb_put(rs: &RandomState, d: &mut Vec<DRec>, fb: &mut Vec<(u64, i64, u32)>, eid: B, ingest: i64, ik: u32, loc: u32) {
+    d.push(DRec { eid: rs.hash_one(eid) | HBIT, ing: ik, loc });
+    fb.push((pack(eid), ingest, loc));
 }
 
 /// Person key of a valid line's user id: the packed id, or else a hash with HBIT set (noted in
@@ -3738,7 +3746,7 @@ fn parse_events_sol<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, 
             if okk {
                 d.push(DRec { eid: ke, ing: ik, loc });
             } else {
-                fb.push((pack(sl(pe, ne)), ingest, loc));
+                fb_put(cx.rs, d, fb, sl(pe, ne), ingest, ik, loc);
             }
             continue 'ln;
         }
@@ -3905,6 +3913,13 @@ fn ev_after<E: Ev>(
                 Err(_) => (k as i64 - IOFF + ibase) * 1000,
             }
         };
+        // the bytes of line g's event_id when pack6 rejected it (its record sits in `fb`, loc order)
+        let fbb = |g: u32| -> B {
+            let c = mbase.partition_point(|&b| b <= g) - 1;
+            let loc = g - mbase[c];
+            let f = &ev_out[c].fb;
+            unpack(f[f.binary_search_by_key(&loc, |x| x.2).unwrap()].0)
+        };
         let (ndb, dsh) = idx_cfg().map_or((0, 0), |c| (c.ndb, c.sh));
         rayon::join(
             || {
@@ -3979,6 +3994,10 @@ fn ev_after<E: Ev>(
                                         break;
                                     }
                                     if o[0] == r.eid {
+                                        if r.eid & HBIT != 0 && fbb(gi) != fbb(o[1] as u32) {
+                                            p = (p + 1) & mask;
+                                            continue;
+                                        }
                                         let ok = (o[1] >> 32) as u32;
                                         let og = o[1] as u32;
                                         let win = r.ing < ok || (r.ing == ok && side_any && exact(gi, r.ing) < exact(og, ok));
@@ -4000,30 +4019,7 @@ fn ev_after<E: Ev>(
                     },
                 );
             },
-            || {
-                // events whose event_id has no packed key: exact byte comparison
-                let mut tm = now();
-                let mut m: AHashMap<B, (i64, u32)> = AHashMap::new();
-                for (ci, c) in ev_out.iter().enumerate() {
-                    for &(e, ing, loc) in &c.fb {
-                        let gi = mbase[ci] + loc;
-                        match m.get_mut(unpack(e)) {
-                            Some(o) => {
-                                if ing < o.0 {
-                                    kill(o.1);
-                                    *o = (ing, gi);
-                                } else {
-                                    kill(gi);
-                                }
-                            }
-                            None => {
-                                m.insert(unpack(e), (ing, gi));
-                            }
-                        }
-                    }
-                }
-                pt(3, &mut tm);
-            },
+            || {},
         );
         if TIMING.load(Relaxed) {
             let dense: usize = ev_out.iter().map(|c| c.doff[ndb] as usize).sum();
@@ -4465,6 +4461,13 @@ fn ev_after_idx<E: Ev>(
                 Err(_) => (k as i64 - IOFF + ibase) * 1000,
             }
         };
+        // the bytes of line g's event_id when pack6 rejected it (its record sits in `fb`, loc order)
+        let fbb = |g: u32| -> B {
+            let c = mbase.partition_point(|&b| b <= g) - 1;
+            let loc = g - mbase[c];
+            let f = &ev_out[c].fb;
+            unpack(f[f.binary_search_by_key(&loc, |x| x.2).unwrap()].0)
+        };
         let line = |g: u32| -> E {
             let c = mbase.partition_point(|&b| b <= g) - 1;
             ev_out[c].m[(g - mbase[c]) as usize]
@@ -4674,6 +4677,10 @@ fn ev_after_idx<E: Ev>(
                                             break;
                                         }
                                         if o[0] == r.eid {
+                                            if r.eid & HBIT != 0 && fbb(gi) != fbb(o[1] as u32) {
+                                                p = (p + 1) & mask;
+                                                continue;
+                                            }
                                             let ok = (o[1] >> 32) as u32;
                                             let og = o[1] as u32;
                                             if r.ing < ok || (r.ing == ok && side_any && exact(gi, r.ing) < exact(og, ok)) {
@@ -4696,24 +4703,7 @@ fn ev_after_idx<E: Ev>(
                     })
                     .collect();
                 let mut tm = now();
-                let mut m: AHashMap<B, (i64, u32)> = AHashMap::new();
-                for (ci, c) in ev_out.iter().enumerate() {
-                    for &(e, ing, loc) in &c.fb {
-                        let gi = mbase[ci] + loc;
-                        match m.get_mut(unpack(e)) {
-                            Some(o) => {
-                                if ing < o.0 {
-                                    *o = (ing, gi);
-                                }
-                            }
-                            None => {
-                                m.insert(unpack(e), (ing, gi));
-                            }
-                        }
-                    }
-                }
                 let mut em: Vec<E> = hb.into_iter().flatten().collect();
-                em.extend(m.values().map(|&(_, g)| line(g)));
                 pt(3, &mut tm);
                 let mut pc = PkCache { k: [0; 4], p: [0; 4], n: 0 };
                 em.retain_mut(|e| {
