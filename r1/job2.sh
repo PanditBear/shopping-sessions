@@ -54,10 +54,10 @@ run_img() { # IMAGE OUTDIR -> RUN_WALL RUN_INT RUN_PEAK_MB RUN_RC ; peak = cgrou
   pid=$!; echo 0 > $W/peak.txt
   ( while kill -0 $pid 2>/dev/null; do
       id=$(docker inspect -f '{{.Id}}' $nm 2>/dev/null)
-      if [ -n "$id" ]; then cg=/sys/fs/cgroup/system.slice/docker-$id.scope; [ -f $cg/memory.peak ] && cat $cg/memory.peak > $W/peak.txt; fi
+      if [ -n "$id" ]; then cg=/sys/fs/cgroup/system.slice/docker-$id.scope; if v=$(cat $cg/memory.peak 2>/dev/null) && [ -n "$v" ]; then echo $v > $W/peak.tmp && mv -f $W/peak.tmp $W/peak.txt; fi; fi
       sleep 0.02; done ) &
-  wait $pid; RUN_RC=$?; t1=$(date +%s.%N); docker rm $nm >/dev/null 2>&1
-  RUN_WALL=$(printf '%.3f' $(echo "$t1 - $t0" | bc)); RUN_PEAK_MB=$(( $(cat $W/peak.txt)/1048576 ))
+  wait $pid; RUN_RC=$?; wait; t1=$(date +%s.%N); docker rm $nm >/dev/null 2>&1
+  RUN_WALL=$(printf '%.3f' $(echo "$t1 - $t0" | bc)); pk=$(cat $W/peak.txt 2>/dev/null); RUN_PEAK_MB=$(( ${pk:-0}/1048576 ))
   em=$(grep -o 'main=[0-9.]*' $W/err.txt | cut -d= -f2); ee=$(grep -o 'end=[0-9.]*' $W/err.txt | cut -d= -f2)
   RUN_INT=$(printf '%.3f' $(echo "${ee:-0} - ${em:-0}" | bc)); wipe $scr
 }
