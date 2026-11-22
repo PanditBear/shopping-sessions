@@ -1854,6 +1854,89 @@ fn scatter_counted<T: Copy>(v: &[T], mut cnt: Vec<u32>, bk: impl Fn(&T) -> usize
     (out, cnt)
 }
 
+thread_local! {
+    /// a thread's staging lines for `scatter_wc`, reused from call to call
+    static WCS: std::cell::Cell<Vec<MaybeUninit<Line>>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+static WC_USED: AtomicUsize = AtomicUsize::new(0);
+
+/// `scatter_counted` that writes the output as whole lines: each bucket's records are staged WK
+/// at a time (in L2) and copied out with streaming stores, so the scattered output lines are
+/// never read in. A bucket's first records up to a line boundary, and its last partial stage,
+/// are stored directly. Falls back to `scatter_counted` when WK records are not whole lines or
+/// the output is not aligned enough to reach a line boundary.
+fn scatter_wc<T: Copy>(v: &[T], mut cnt: Vec<u32>, bk: impl Fn(&T) -> usize) -> (Vec<T>, Vec<u32>) {
+    let sz = std::mem::size_of::<T>();
+    let nb = cnt.len() - 1;
+    let mut out: Vec<T> = Vec::with_capacity(v.len());
+    let base = out.as_ptr() as usize;
+    let gs = 1usize << (sz | 64).trailing_zeros();
+    if sz == 0 || (WK * sz) % 64 != 0 || base % gs != 0 || v.len() < 4096 {
+        return scatter_counted(v, cnt, bk);
+    }
+    #[cfg(test)]
+    WC_USED.fetch_add(1, Relaxed);
+    for i in 0..nb {
+        cnt[i + 1] += cnt[i];
+    }
+    assert_eq!(cnt[nb] as usize, v.len());
+    // first line-aligned position of each bucket (may lie past its end)
+    let fa: Vec<u32> = (0..nb)
+        .map(|b| {
+            let mut p = cnt[b] as usize;
+            while (base + p * sz) % 64 != 0 {
+                p += 1;
+            }
+            p as u32
+        })
+        .collect();
+    let bl = WK * sz / 64;
+    let mut wc = WCS.take();
+    if wc.len() < nb * bl {
+        wc = Vec::with_capacity(nb * bl);
+        // SAFETY: MaybeUninit needs no init
+        unsafe { wc.set_len(nb * bl) };
+    }
+    let mut w = cnt.clone();
+    {
+        let op = out.as_mut_ptr();
+        let wp = wc.as_mut_ptr() as *mut T;
+        for x in v {
+            let b = bk(x);
+            let p = w[b];
+            w[b] = p + 1;
+            let f = fa[b];
+            // SAFETY: p < cnt[b + 1] <= v.len(); stage slots are inside wc (nb * WK records)
+            unsafe {
+                if p < f {
+                    op.add(p as usize).write(*x);
+                } else {
+                    let k = (p - f) as usize % WK;
+                    wp.add(b * WK + k).write(*x);
+                    if k == WK - 1 {
+                        // positions p + 1 - WK ..= p: all of bucket b, starting on a line
+                        stream_lines(wp.add(b * WK) as *const Line, op.add(p as usize + 1 - WK) as *mut Line, bl);
+                    }
+                }
+            }
+        }
+        for b in 0..nb {
+            let (e, f) = (w[b], fa[b]);
+            if e > f {
+                let r = (e - f) as usize % WK;
+                // SAFETY: the last r staged records of b go to its last r positions
+                unsafe { std::ptr::copy_nonoverlapping(wp.add(b * WK), op.add(e as usize - r), r) };
+            }
+        }
+        sfence();
+    }
+    WCS.set(wc);
+    unsafe { out.set_len(v.len()) };
+    (out, cnt)
+}
+
 #[inline(always)]
 fn pbk(key: u64) -> usize {
     (mix(key) >> 20) as usize & (PB - 1)
@@ -5590,7 +5673,7 @@ fn main() {
                 cnt[pbk(k) + 1] += 1;
             }
             drop(hit);
-            let r = scatter_counted(&tmp, cnt, |x| pbk(x.key));
+            let r = scatter_wc(&tmp, cnt, |x| pbk(x.key));
             pt(10, &mut tm);
             r
         })
@@ -6241,6 +6324,30 @@ mod tests {
         }
         eprintln!("sol test random: {recs} records, {purch} priced");
         assert!(recs > 1_000_000 && purch > 10_000);
+    }
+    #[test]
+    fn scatter_wc_matches_scatter_counted() {
+        fn chk<T: Copy + PartialEq + std::fmt::Debug>(r: &mut Rng, mk: impl Fn(u64, u32) -> T, key: impl Fn(&T) -> u64) {
+            for case in 0..60 {
+                let nb = 1usize << (r.below(11) as u32);
+                let n = r.below(if case % 3 == 0 { 120_000 } else { 9_000 }) as usize;
+                let v: Vec<T> = (0..n).map(|i| mk(r.next(), i as u32)).collect();
+                let bk = |x: &T| (mix(key(x)) >> 20) as usize & (nb - 1);
+                let mut cnt = vec![0u32; nb + 1];
+                for x in &v {
+                    cnt[bk(x) + 1] += 1;
+                }
+                let (a, ao) = scatter_counted(&v, cnt.clone(), bk);
+                let (b, bo) = scatter_wc(&v, cnt, bk);
+                assert_eq!(ao, bo);
+                assert!(a == b, "nb={nb} n={n}");
+            }
+        }
+        let mut r = Rng(0x5eed_0bad_cafe_f00e);
+        chk(&mut r, |k, i| (k, i), |x| x.0);
+        chk(&mut r, |k, i| [k, i as u64, !k], |x| x[0]);
+        chk(&mut r, |k, i| [k, i as u64, !k, k ^ 7], |x| x[0]);
+        assert!(WC_USED.load(Relaxed) >= 30, "streaming path used {} times", WC_USED.load(Relaxed));
     }
     #[test]
     fn scatter_counted_matches_bucketize() {
