@@ -64,6 +64,22 @@ fn mix(k: u64) -> u64 {
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 static TIMING: AtomicBool = AtomicBool::new(false);
+// measurement aid: tail task spans (kind, start s, end s) relative to TT0, kept when SHOP_TIMING is set
+static TT0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static TSPANS: std::sync::Mutex<Vec<(u8, f64, f64, u64)>> = std::sync::Mutex::new(Vec::new());
+fn tspan<R>(k: u8, f: impl FnOnce() -> R) -> R {
+    if !TIMING.load(Relaxed) {
+        return f();
+    }
+    let t0 = *TT0.get().unwrap();
+    let a = t0.elapsed().as_secs_f64();
+    let c0 = thread_cycles();
+    let r = f();
+    let c1 = thread_cycles();
+    let b = t0.elapsed().as_secs_f64();
+    TSPANS.lock().unwrap().push((k, a, b, c1 - c0));
+    r
+}
 static PROF: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
 const PROF_NAMES: [&str; 17] =
     ["ev.scan", "ev.bucket", "dd.table", "dd.collect", "dd.resolve", "dd.bucket", "ss.gather", "ss.sort", "ss.proc", "ck.scan", "ck.res", "ss.csort", "wr.ud", "ud.idx", "ud.int", "ud.revtop", "ud.write"];
@@ -4575,7 +4591,7 @@ fn lpt_run<S: Send>(cost: &[u64], init: impl Fn() -> S + Sync, f: impl Fn(usize,
                 if i >= ord.len() {
                     break;
                 }
-                f(ord[i] as usize, &mut s);
+                tspan(1, || f(ord[i] as usize, &mut s));
             }
             (s, t0.map_or(0.0, |t| t.elapsed().as_secs_f64()))
         })
@@ -5542,6 +5558,23 @@ fn hash_chunk<E: Ev>(mut h: u64, r: &EvChunk<E>) -> u64 {
     h
 }
 
+/// measurement aid: cycles all threads of the process have run (Windows; 0 elsewhere)
+fn proc_cycles() -> u64 {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn QueryProcessCycleTime(h: isize, c: *mut u64) -> i32;
+        }
+        let mut c = 0u64;
+        unsafe { QueryProcessCycleTime(GetCurrentProcess(), &mut c) };
+        c
+    }
+    #[cfg(not(windows))]
+    0
+}
+
 /// measurement aid: cycles this thread has run (Windows; 0 elsewhere), unaffected by preemption
 fn thread_cycles() -> u64 {
     #[cfg(windows)]
@@ -5627,9 +5660,10 @@ fn main() {
     let timing = std::env::var("SHOP_TIMING").is_ok();
     TIMING.store(timing, Relaxed);
     let t0 = std::time::Instant::now();
+    TT0.set(t0).ok();
     let tick = |s: &str| {
         if timing {
-            eprintln!("[{:.2}s] {}", t0.elapsed().as_secs_f64(), s);
+            eprintln!("[{:.4}s] {} pc={} tsc={}", t0.elapsed().as_secs_f64(), s, proc_cycles(), unsafe { core::arch::x86_64::_rdtsc() });
         }
         hpa::diag(s);
     };
@@ -6057,6 +6091,7 @@ fn main() {
         load[k] += g.len();
         files[k].push(g);
     }
+    tick("write start");
     let any_rows = files.iter().any(|g| g.iter().any(|x| !x.is_empty()));
     // one revenue width for every file of the table, so all part files share a schema
     let rev32 = std::env::var_os("SHOP_REV64").is_none()
@@ -6064,15 +6099,20 @@ fn main() {
     rayon::join(
         || {
             files.par_iter().enumerate().filter(|(i, g)| g.iter().any(|x| !x.is_empty()) || (*i == 0 && !any_rows)).for_each(|(i, g)| {
-                write_user_daily(&ud_dir.join(format!("part-{i}.parquet")), g, &cat_names, &names, rev32);
+                tspan(2, || write_user_daily(&ud_dir.join(format!("part-{i}.parquet")), g, &cat_names, &names, rev32));
             })
         },
-        || write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows, &camp_names, &channels),
+        || tspan(3, || write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows, &camp_names, &channels)),
     );
     tick("written");
     if timing {
         let v: Vec<String> = (0..PROF.len()).map(|i| format!("{}={:.2}", PROF_NAMES[i], PROF[i].load(Relaxed) as f64 / 1e9)).collect();
         eprintln!("prof(cpu s): {}", v.join(" "));
+    }
+    if timing {
+        for (k, a, b, c) in TSPANS.lock().unwrap().iter() {
+            eprintln!("span {k} {a:.5} {b:.5} {c}");
+        }
     }
     if timing {
         eprintln!("epoch main={:.3} end={:.3}", ep0, ep());
