@@ -4351,7 +4351,7 @@ fn lpt_run<S: Send>(cost: &[u64], init: impl Fn() -> S + Sync, f: impl Fn(usize,
 /// before and every miss maps to itself as before; only the order of lines inside a person
 /// bucket changes, and the sessionizer orders each person's lines by ts (equal ts share a session).
 fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU64], tab: &IdTab, mf: &MoverF) -> Vec<(Vec<E>, Vec<u32>)> {
-    let rb = (tab.s.len() >> 16).clamp(1, 512).trailing_zeros();
+    let rb = (tab.s.len() >> 15).clamp(1, 1024).trailing_zeros();
     let nr = 1usize << rb;
     let reg = move |k: u64| -> usize {
         if rb == 0 {
@@ -4432,7 +4432,7 @@ fn resolve_parts<E: Ev>(ev_out: Vec<EvChunk<E>>, mbase: &[u32], dead: &[AtomicU6
                     pk.push(p);
                 }
             }
-            pt(4, &mut tm);
+            pt(3, &mut tm); // timed apart (dd.collect slot, unused on this path)
             for p in 0..PB {
                 cnt[p + 1] += cnt[p];
             }
