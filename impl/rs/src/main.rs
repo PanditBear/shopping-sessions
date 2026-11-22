@@ -2850,10 +2850,6 @@ fn ba(b: &[u8]) -> ByteArray {
     ByteArray::from(b.to_vec())
 }
 
-struct Names {
-    map: AHashMap<u64, u64>,
-}
-
 // ---------- user_daily: a small direct parquet encoder ----------
 //
 // user_daily is most of the output, and a general writer spends its time hashing values into
@@ -3053,10 +3049,49 @@ impl Pqf {
     }
 }
 
+/// Bit-packed values with no run header yet (the count is known only at the end).
+struct Bs {
+    o: Vec<u8>,
+    acc: u64,
+    nb: u32,
+    w: u32,
+    n: usize,
+}
+impl Bs {
+    fn new(w: u32) -> Self {
+        Bs { o: vec![], acc: 0, nb: 0, w, n: 0 }
+    }
+    #[inline(always)]
+    fn put(&mut self, v: u32) {
+        self.acc |= (v as u64) << self.nb;
+        self.nb += self.w;
+        while self.nb >= 8 {
+            self.o.push(self.acc as u8);
+            self.acc >>= 8;
+            self.nb -= 8;
+        }
+        self.n += 1;
+    }
+    /// Appends `pre`, the run header and the packed values to `b`, then resets.
+    fn drain_to(&mut self, b: &mut Vec<u8>, pre: &[u8]) {
+        while self.n % 8 != 0 {
+            self.put(0);
+        }
+        b.extend_from_slice(pre);
+        uvar(b, ((self.n / 8) as u64) << 1 | 1);
+        b.extend_from_slice(&self.o);
+        self.o.clear();
+        self.acc = 0;
+        self.nb = 0;
+        self.n = 0;
+    }
+}
+
 /// An integer column as a range dictionary (`lo..=hi`) with bit-packed `v - lo` indices when the
 /// range is small, else PLAIN. `c.ty` 1 = INT32, 2 = INT64.
-fn int_col(f: &mut Pqf, c: &mut Cm, rows: &[&[UD]], n: usize, get: impl Fn(&UD) -> i64, lo: i64, hi: i64) {
+fn int_col<T: Copy + Into<i64>>(f: &mut Pqf, c: &mut Cm, vals: &[T], lo: i64, hi: i64) {
     let int32 = c.ty == 1;
+    let n = vals.len();
     if n > 0 && (hi - lo) < (1 << 16) {
         let mut d: Vec<u8> = Vec::with_capacity(((hi - lo + 1) * 8) as usize);
         for v in lo..=hi {
@@ -3069,187 +3104,288 @@ fn int_col(f: &mut Pqf, c: &mut Cm, rows: &[&[UD]], n: usize, get: impl Fn(&UD) 
         f.page(c, true, (hi - lo + 1) as usize, 0, &d);
         let w = bwid((hi - lo) as u64);
         let mut bp = Bp::new(w, n, &[w as u8]);
-        for g in rows {
-            for r in g.iter() {
-                bp.put((get(r) - lo) as u32);
-            }
+        for &v in vals {
+            bp.put((v.into() - lo) as u32);
         }
         let b = bp.finish();
         f.page(c, false, n, 8, &b);
     } else {
         let mut b: Vec<u8> = Vec::with_capacity(n * 8);
-        for g in rows {
-            for r in g.iter() {
-                if int32 {
-                    b.extend_from_slice(&(get(r) as i32).to_le_bytes());
-                } else {
-                    b.extend_from_slice(&get(r).to_le_bytes());
-                }
+        for &v in vals {
+            if int32 {
+                b.extend_from_slice(&(v.into() as i32).to_le_bytes());
+            } else {
+                b.extend_from_slice(&v.into().to_le_bytes());
             }
         }
         f.page(c, false, n, 0, &b);
     }
 }
 
-/// Writes one row group of `rows` (a list of row runs, n rows in all); returns its column chunks.
-fn ud_row_group(f: &mut Pqf, rows: &[&[UD]], n: usize, cats: &[B], names: &Names, rev32: bool) -> Vec<Cm> {
-    let mut t3 = now();
-    // pass 1: ranges and counts
-    let (mut dlo, mut dhi) = (i64::MAX, i64::MIN);
-    let (mut slo, mut shi, mut elo, mut ehi) = (u64::MAX, 0u64, u64::MAX, 0u64);
-    let mut persons = 0usize;
-    let mut nn = 0usize;
-    let mut last = None;
-    for g in rows {
-        for r in g.iter() {
-            dlo = dlo.min(r.day as i64);
-            dhi = dhi.max(r.day as i64);
-            slo = slo.min(r.sessions as u64);
-            shi = shi.max(r.sessions as u64);
-            elo = elo.min(r.events as u64);
-            ehi = ehi.max(r.events as u64);
-            nn += (r.top != u32::MAX) as usize;
-            if last != Some(r.key) {
-                persons += 1;
-                last = Some(r.key);
-            }
-        }
-    }
-    let mut cols = vec![
-        cm(6, "user_id"),
-        cm(1, "day"),
-        cm(2, "sessions"),
-        cm(2, "events"),
-        cm(if rev32 { 1 } else { 2 }, "revenue_cents"),
-        cm(6, "top_category"),
-    ];
-    // which chunks to compress, bit i = column i. Default revenue_cents only: mostly zeros, so zstd
-    // shrinks it about 7x for almost no work; the other chunks are already dictionary/bit-packed
-    let zm: u32 = std::env::var("SHOP_ZCOLS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
-    for (i, c) in cols.iter_mut().enumerate() {
-        c.z = (zm >> i) & 1 == 1;
-    }
-    // user_id: dictionary of the persons in row order, indices as one RLE run per person
-    {
-        let w = bwid(persons.saturating_sub(1) as u64);
-        let vb = ((w + 7) / 8) as usize;
-        let mut dict: Vec<u8> = Vec::with_capacity(persons * 14);
-        let mut idx: Vec<u8> = Vec::with_capacity(1 + persons * (3 + vb));
-        idx.push(w as u8);
-        let mut k = 0u64;
-        let mut run = 0u64;
-        let mut last = None;
-        for g in rows {
-            for r in g.iter() {
-                if last != Some(r.key) {
-                    if run > 0 {
-                        uvar(&mut idx, run << 1);
-                        idx.extend_from_slice(&(k - 1).to_le_bytes()[..vb]);
-                    }
-                    last = Some(r.key);
-                    k += 1;
-                    run = 0;
-                    if r.key & HBIT == 0 {
-                        // the codes are left aligned and end at the first zero code
-                        let kk = r.key;
-                        let ln = if kk == 0 { 0 } else { 10 - (kk.trailing_zeros() as usize) / 6 };
-                        let mut cb = [0u8; 14];
-                        cb[..4].copy_from_slice(&(ln as u32).to_le_bytes());
-                        for i in 0..10 {
-                            cb[4 + i] = DECODE[((kk >> (54 - 6 * i)) & 63) as usize];
-                        }
-                        dict.extend_from_slice(&cb[..4 + ln]);
-                    } else {
-                        let s = unpack(*names.map.get(&r.key).expect("name for hashed key"));
-                        dict.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                        dict.extend_from_slice(s);
-                    }
-                }
-                run += 1;
-            }
-        }
-        if run > 0 {
-            uvar(&mut idx, run << 1);
-            idx.extend_from_slice(&(k - 1).to_le_bytes()[..vb]);
-        }
-        f.page(&mut cols[0], true, persons, 0, &dict);
-        f.page(&mut cols[0], false, n, 8, &idx);
-    }
-    pt(13, &mut t3);
-    int_col(f, &mut cols[1], rows, n, |r| r.day as i64, dlo, dhi);
-    int_col(f, &mut cols[2], rows, n, |r| r.sessions as i64, slo as i64, shi as i64);
-    int_col(f, &mut cols[3], rows, n, |r| r.events as i64, elo as i64, ehi as i64);
-    pt(14, &mut t3);
-    // revenue: PLAIN (wide range, mostly zeros), INT32 when every value of the file fits
-    {
-        let mut b: Vec<u8> = Vec::with_capacity(n * 8);
-        for g in rows {
-            for r in g.iter() {
-                if rev32 {
-                    b.extend_from_slice(&(r.rev as i32).to_le_bytes());
-                } else {
-                    b.extend_from_slice(&(r.rev as i64).to_le_bytes());
-                }
-            }
-        }
-        f.page(&mut cols[4], false, n, 0, &b);
-    }
-    // top_category: dictionary = the category list; definition levels, then the non-null indices
-    {
-        let mut dict: Vec<u8> = Vec::with_capacity(cats.iter().map(|c| c.len() + 4).sum());
+/// What every user_daily encoder shares.
+struct UdCtx<'a> {
+    names: &'a AHashMap<u64, u64>,
+    /// PLAIN dictionary page of the category list
+    cats_dict: Vec<u8>,
+    ncats: usize,
+    /// close a row group at the first bucket end at or past this many rows
+    target: usize,
+    /// bit i set = compress column i's pages
+    zm: u32,
+}
+impl<'a> UdCtx<'a> {
+    fn new(names: &'a AHashMap<u64, u64>, cats: &[B]) -> Self {
+        let mut cats_dict = Vec::with_capacity(cats.iter().map(|c| c.len() + 4).sum());
         for c in cats {
-            dict.extend_from_slice(&(c.len() as u32).to_le_bytes());
-            dict.extend_from_slice(c);
+            cats_dict.extend_from_slice(&(c.len() as u32).to_le_bytes());
+            cats_dict.extend_from_slice(c);
         }
-        f.page(&mut cols[5], true, cats.len(), 0, &dict);
-        let mut defs = Bp::new(1, n, &[0, 0, 0, 0]);
-        let w = bwid(cats.len().saturating_sub(1) as u64);
-        let mut vals = Bp::new(w, nn, &[w as u8]);
-        for g in rows {
-            for r in g.iter() {
-                if r.top == u32::MAX {
-                    defs.put(0);
-                } else {
-                    defs.put(1);
-                    vals.put(r.top);
-                }
-            }
-        }
-        let mut b = defs.finish();
-        let dl = (b.len() - 4) as u32;
-        b[..4].copy_from_slice(&dl.to_le_bytes());
-        b.extend_from_slice(&vals.finish());
-        f.page(&mut cols[5], false, n, 8, &b);
+        let target = std::env::var("SHOP_RG").ok().and_then(|v| v.parse().ok()).unwrap_or(1usize << 18).clamp(1, UD_HARD);
+        // default revenue_cents only: mostly zeros, so zstd shrinks it about 7x for almost no work
+        let zm = std::env::var("SHOP_ZCOLS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+        UdCtx { names, cats_dict, ncats: cats.len(), target, zm }
     }
-    pt(15, &mut t3);
-    cols
 }
 
-fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names, rev32: bool) {
-    let mut tm = now();
-    const RG: usize = 1 << 20;
-    let total: usize = groups.iter().map(|g| g.len()).sum();
-    let mut f = Pqf::new(total * 6 + 4096);
-    // split the groups into row groups of at most RG rows
-    let mut rgs: Vec<(Vec<Cm>, usize)> = vec![];
-    let mut cur: Vec<&[UD]> = vec![];
-    let mut n = 0usize;
-    for g in groups {
-        let mut s: &[UD] = g;
-        while !s.is_empty() {
-            let k = s.len().min(RG - n);
-            cur.push(&s[..k]);
-            n += k;
-            s = &s[k..];
-            if n == RG {
-                rgs.push((ud_row_group(&mut f, &cur, n, cats, names, rev32), n));
-                cur.clear();
-                n = 0;
-            }
+/// Row group hard cap: keeps the persons of a row group under 2^24, the 3-byte user_id indices.
+const UD_HARD: usize = 1 << 22;
+
+/// A finished row group: column chunks with offsets relative to their own start.
+struct UdRg {
+    cols: Vec<Cm>,
+    bufs: Vec<Vec<u8>>,
+    n: usize,
+    rev: Vec<u32>,
+    // rows whose revenue does not fit INT32: (row, revenue)
+    side: Vec<(u32, u64)>,
+}
+
+/// Streaming user_daily encoder of one sessionize worker. Each bucket's rows are encoded while
+/// they are still in cache: the user_id dictionary and its runs, the top_category levels and
+/// indices go straight to their streams; day, sessions, events and revenue to flat columns that
+/// are bit-packed (or paged) when the row group closes. Format as before: data page v1,
+/// RLE/bit-packed hybrid indices, uncompressed pages except revenue (zstd).
+struct UdEnc {
+    f: Pqf,
+    rgs: Vec<UdRg>,
+    n: usize,
+    persons: usize,
+    last: u64,
+    has_last: bool,
+    run: u64,
+    uid_dict: Vec<u8>,
+    uid_idx: Vec<u8>,
+    day: Vec<i32>,
+    dlo: i32,
+    dhi: i32,
+    ses: Vec<u32>,
+    shi: u32,
+    slo: u32,
+    evn: Vec<u32>,
+    ehi: u32,
+    elo: u32,
+    rev: Vec<u32>,
+    side: Vec<(u32, u64)>,
+    defs: Bs,
+    vals: Bs,
+}
+impl UdEnc {
+    fn new(cx: &UdCtx) -> Self {
+        let mut f = Pqf::new(0);
+        f.out.clear();
+        let mut e = UdEnc {
+            f,
+            rgs: vec![],
+            n: 0,
+            persons: 0,
+            last: 0,
+            has_last: false,
+            run: 0,
+            uid_dict: vec![],
+            uid_idx: vec![],
+            day: vec![],
+            dlo: i32::MAX,
+            dhi: i32::MIN,
+            ses: vec![],
+            shi: 0,
+            slo: u32::MAX,
+            evn: vec![],
+            ehi: 0,
+            elo: u32::MAX,
+            rev: vec![],
+            side: vec![],
+            defs: Bs::new(1),
+            vals: Bs::new(bwid(cx.ncats.saturating_sub(1) as u64)),
+        };
+        e.uid_idx.push(0);
+        e.reserve(cx);
+        e
+    }
+    fn reserve(&mut self, cx: &UdCtx) {
+        let c = cx.target.min(1 << 20) + 4096;
+        self.day.reserve(c);
+        self.ses.reserve(c);
+        self.evn.reserve(c);
+        self.rev.reserve(c);
+    }
+    #[inline(always)]
+    fn end_run(&mut self) {
+        if self.run > 0 {
+            uvar(&mut self.uid_idx, self.run << 1);
+            let k = (self.persons - 1) as u32;
+            self.uid_idx.extend_from_slice(&k.to_le_bytes()[..3]);
+            self.run = 0;
         }
     }
-    if n > 0 {
-        rgs.push((ud_row_group(&mut f, &cur, n, cats, names, rev32), n));
+    /// Encodes one bucket's rows (a person's rows are adjacent).
+    fn push(&mut self, uds: &[UD], cx: &UdCtx) {
+        let mut tm = now();
+        for r in uds {
+            if self.n >= UD_HARD {
+                self.close(cx);
+            }
+            if !self.has_last || r.key != self.last {
+                self.end_run();
+                self.last = r.key;
+                self.has_last = true;
+                self.persons += 1;
+                if r.key & HBIT == 0 {
+                    // the codes are left aligned and end at the first zero code
+                    let kk = r.key;
+                    let ln = if kk == 0 { 0 } else { 10 - (kk.trailing_zeros() as usize) / 6 };
+                    let mut cb = [0u8; 14];
+                    cb[..4].copy_from_slice(&(ln as u32).to_le_bytes());
+                    for i in 0..10 {
+                        cb[4 + i] = DECODE[((kk >> (54 - 6 * i)) & 63) as usize];
+                    }
+                    self.uid_dict.extend_from_slice(&cb[..4 + ln]);
+                } else {
+                    let s = unpack(*cx.names.get(&r.key).expect("name for hashed key"));
+                    self.uid_dict.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    self.uid_dict.extend_from_slice(s);
+                }
+            }
+            self.run += 1;
+            self.day.push(r.day);
+            self.dlo = self.dlo.min(r.day);
+            self.dhi = self.dhi.max(r.day);
+            self.ses.push(r.sessions);
+            self.slo = self.slo.min(r.sessions);
+            self.shi = self.shi.max(r.sessions);
+            self.evn.push(r.events);
+            self.elo = self.elo.min(r.events);
+            self.ehi = self.ehi.max(r.events);
+            if r.rev <= i32::MAX as u64 {
+                self.rev.push(r.rev as u32);
+            } else {
+                self.side.push((self.n as u32, r.rev));
+                self.rev.push(0);
+            }
+            if r.top == u32::MAX {
+                self.defs.put(0);
+            } else {
+                self.defs.put(1);
+                self.vals.put(r.top);
+            }
+            self.n += 1;
+        }
+        pt(13, &mut tm);
+        if self.n >= cx.target {
+            self.close(cx);
+        }
+    }
+    /// Closes the open row group, if it has rows.
+    fn close(&mut self, cx: &UdCtx) {
+        let n = self.n;
+        if n == 0 {
+            return;
+        }
+        let mut tm = now();
+        self.end_run();
+        let mut cols = vec![cm(6, "user_id"), cm(1, "day"), cm(2, "sessions"), cm(2, "events"), cm(1, "revenue_cents"), cm(6, "top_category")];
+        for (i, c) in cols.iter_mut().enumerate() {
+            c.z = (cx.zm >> i) & 1 == 1;
+        }
+        let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(6);
+        let f = &mut self.f;
+        // user_id: values are 3 bytes, so the declared width is 17..=24
+        self.uid_idx[0] = bwid(self.persons.saturating_sub(1) as u64).max(17) as u8;
+        f.page(&mut cols[0], true, self.persons, 0, &self.uid_dict);
+        f.page(&mut cols[0], false, n, 8, &self.uid_idx);
+        bufs.push(std::mem::take(&mut f.out));
+        int_col(f, &mut cols[1], &self.day, self.dlo as i64, self.dhi as i64);
+        bufs.push(std::mem::take(&mut f.out));
+        int_col(f, &mut cols[2], &self.ses, self.slo as i64, self.shi as i64);
+        bufs.push(std::mem::take(&mut f.out));
+        int_col(f, &mut cols[3], &self.evn, self.elo as i64, self.ehi as i64);
+        bufs.push(std::mem::take(&mut f.out));
+        pt(14, &mut tm);
+        // revenue: PLAIN INT32 (wide range, mostly zeros); rebuilt as INT64 if any file overflows
+        // SAFETY: u32 has no padding and the target is little endian, the parquet byte order
+        let rb = unsafe { std::slice::from_raw_parts(self.rev.as_ptr() as *const u8, n * 4) };
+        f.page(&mut cols[4], false, n, 0, rb);
+        bufs.push(std::mem::take(&mut f.out));
+        // top_category: dictionary = the category list; definition levels, then the non-null indices
+        f.page(&mut cols[5], true, cx.ncats, 0, &cx.cats_dict);
+        let mut b: Vec<u8> = Vec::with_capacity(self.defs.o.len() + self.vals.o.len() + 32);
+        b.extend_from_slice(&[0, 0, 0, 0]);
+        self.defs.drain_to(&mut b, &[]);
+        let dl = (b.len() - 4) as u32;
+        b[..4].copy_from_slice(&dl.to_le_bytes());
+        let w = self.vals.w as u8;
+        self.vals.drain_to(&mut b, &[w]);
+        f.page(&mut cols[5], false, n, 8, &b);
+        bufs.push(std::mem::take(&mut f.out));
+        pt(15, &mut tm);
+        self.rgs.push(UdRg { cols, bufs, n, rev: std::mem::take(&mut self.rev), side: std::mem::take(&mut self.side) });
+        self.n = 0;
+        self.persons = 0;
+        self.has_last = false;
+        self.uid_dict.clear();
+        self.uid_idx.clear();
+        self.uid_idx.push(0);
+        self.day.clear();
+        self.ses.clear();
+        self.evn.clear();
+        self.reserve(cx);
+        (self.dlo, self.dhi, self.slo, self.shi, self.elo, self.ehi) = (i32::MAX, i32::MIN, u32::MAX, 0, u32::MAX, 0);
+        pt(12, &mut tm);
+    }
+}
+
+/// Writes one worker's user_daily file; `rev32` false rewrites revenue as INT64 first.
+fn write_ud_file(path: &Path, e: &mut UdEnc, rev32: bool) {
+    use std::io::Write;
+    let mut tm = now();
+    if !rev32 {
+        for rg in &mut e.rgs {
+            let mut b: Vec<u8> = Vec::with_capacity(rg.n * 8);
+            for &v in &rg.rev {
+                b.extend_from_slice(&(v as i64).to_le_bytes());
+            }
+            for &(i, v) in &rg.side {
+                b[i as usize * 8..i as usize * 8 + 8].copy_from_slice(&(v as i64).to_le_bytes());
+            }
+            let z = rg.cols[4].z;
+            let mut c = cm(2, "revenue_cents");
+            c.z = z;
+            e.f.page(&mut c, false, rg.n, 0, &b);
+            rg.cols[4] = c;
+            rg.bufs[4] = std::mem::take(&mut e.f.out);
+        }
+    }
+    let mut out = std::io::BufWriter::with_capacity(1 << 16, File::create(path).unwrap());
+    out.write_all(b"PAR1").unwrap();
+    let mut pos = 4i64;
+    let mut total = 0usize;
+    for rg in &mut e.rgs {
+        total += rg.n;
+        for (c, b) in rg.cols.iter_mut().zip(&rg.bufs) {
+            c.dpo += pos;
+            c.dico = c.dico.map(|d| d + pos);
+            out.write_all(b).unwrap();
+            pos += b.len() as i64;
+        }
     }
     // footer (FileMetaData)
     let mut t = Tc::new();
@@ -3283,8 +3419,9 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names,
         t.send();
     }
     t.i64(3, total as i64);
-    t.list(4, 12, rgs.len());
-    for (cols, n) in &rgs {
+    t.list(4, 12, e.rgs.len());
+    for rg in &e.rgs {
+        let cols = &rg.cols;
         t.sbeg();
         t.list(1, 12, cols.len());
         for c in cols {
@@ -3293,13 +3430,13 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names,
             t.sfield(3);
             t.i32(1, c.ty);
             t.list(2, 5, c.encs.len());
-            for &e in &c.encs {
-                uvar(&mut t.b, zz(e as i64));
+            for &en in &c.encs {
+                uvar(&mut t.b, zz(en as i64));
             }
             t.list(3, 8, 1);
             uvar(&mut t.b, c.name.len() as u64);
             t.b.extend_from_slice(c.name.as_bytes());
-            t.i32(4, if c.z { f.codec } else { 0 });
+            t.i32(4, if c.z { e.f.codec } else { 0 });
             t.i64(5, c.nv);
             t.i64(6, c.unc);
             t.i64(7, c.comp);
@@ -3311,18 +3448,18 @@ fn write_user_daily(path: &Path, groups: &[&Vec<UD>], cats: &[B], names: &Names,
             t.send();
         }
         t.i64(2, cols.iter().map(|c| c.unc).sum());
-        t.i64(3, *n as i64);
+        t.i64(3, rg.n as i64);
         t.i64(5, cols[0].dico.unwrap_or(cols[0].dpo));
         t.i64(6, cols.iter().map(|c| c.comp).sum());
         t.send();
     }
     t.bin(6, b"shop");
     t.b.push(0);
-    f.out.extend_from_slice(&t.b);
-    f.out.extend_from_slice(&(t.b.len() as u32).to_le_bytes());
-    f.out.extend_from_slice(b"PAR1");
-    pt(12, &mut tm);
-    std::fs::write(path, &f.out).unwrap();
+    out.write_all(&t.b).unwrap();
+    out.write_all(&(t.b.len() as u32).to_le_bytes()).unwrap();
+    out.write_all(b"PAR1").unwrap();
+    out.flush().unwrap();
+    drop(out);
     out_kick(path);
     pt(16, &mut tm);
 }
@@ -4383,9 +4520,10 @@ fn ev_after<E: Ev>(
     d0: i64,
     nd: usize,
     tick: &dyn Fn(&str),
-) -> Vec<(Vec<Vec<UD>>, CampAcc)> {
+    ux: &UdCtx,
+) -> Vec<(UdEnc, CampAcc)> {
     if let Some(cfg) = idx_cfg() {
-        return ev_after_idx(ev_out, tab, mf, click_out, ws, we, ncamp, d0, nd, tick, cfg);
+        return ev_after_idx(ev_out, tab, mf, click_out, ws, we, ncamp, d0, nd, tick, cfg, ux);
     }
     // dedup on event_id: every line has a global index (chunk base + its index in the chunk);
     // each event_id's losers are marked in the dead bitmap. Each task takes DDG consecutive
@@ -4539,14 +4677,17 @@ fn ev_after<E: Ev>(
 
     let offs: Vec<&[u32]> = parts.iter().map(|x| &x.1[..]).collect();
     let cost = pb_cost(&offs, click_out);
-    lpt_run(&cost, || SsW::new(ncamp, d0, nd), |p, w: &mut SsW<E>| {
+    lpt_run(&cost, || SsW::new(ncamp, d0, nd, ux), |p, w: &mut SsW<E>| {
         w.gather(p, &parts, click_out);
-        let mut uds = Vec::new();
-        process_bucket(&mut w.evs, &mut w.tmp, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut uds, &mut w.cm, ws, we.wrapping_sub(ws));
-        w.out.push(uds);
+        w.uds.clear();
+        process_bucket(&mut w.evs, &mut w.tmp, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut w.uds, &mut w.cm, ws, we.wrapping_sub(ws));
+        w.enc.push(&w.uds, ux);
     })
-    .into_iter()
-    .map(|w| (w.out, w.cm))
+    .into_par_iter()
+    .map(|mut w| {
+        w.enc.close(ux);
+        (w.enc, w.cm)
+    })
     .collect()
 }
 
@@ -4554,7 +4695,8 @@ fn ev_after<E: Ev>(
 struct SsW<E: Ev> {
     cm: CampAcc,
     win: Win,
-    out: Vec<Vec<UD>>,
+    enc: UdEnc,
+    uds: Vec<UD>,
     evs: Vec<E>,
     tmp: Vec<E>,
     evs_s: Vec<E::S>,
@@ -4567,11 +4709,12 @@ struct SsW<E: Ev> {
 }
 
 impl<E: Ev> SsW<E> {
-    fn new(ncamp: usize, d0: i64, nd: usize) -> Self {
+    fn new(ncamp: usize, d0: i64, nd: usize, ux: &UdCtx) -> Self {
         SsW {
             cm: CampAcc::new(ncamp + 1, d0, nd),
             win: Win { cnt: vec![0; ncamp + 1], pos: vec![0; ncamp + 1], active: vec![] },
-            out: vec![],
+            enc: UdEnc::new(ux),
+            uds: vec![],
             evs: vec![],
             tmp: vec![],
             evs_s: vec![],
@@ -5001,7 +5144,8 @@ fn ev_after_idx<E: Ev>(
     nd: usize,
     tick: &dyn Fn(&str),
     cfg: IdxCfg,
-) -> Vec<(Vec<Vec<UD>>, CampAcc)> {
+    ux: &UdCtx,
+) -> Vec<(UdEnc, CampAcc)> {
     let _ = we;
     let ndb = cfg.ndb;
     let mut mbase: Vec<u32> = Vec::with_capacity(ev_out.len() + 1);
@@ -5316,14 +5460,17 @@ fn ev_after_idx<E: Ev>(
 
     let offs: Vec<&[u32]> = dparts.iter().map(|x| &x.3[..]).chain(std::iter::once(&rest.1[..])).collect();
     let cost = pb_cost(&offs, click_out);
-    lpt_run(&cost, || SsW::new(ncamp, d0, nd), |p, w: &mut SsW<E>| {
+    lpt_run(&cost, || SsW::new(ncamp, d0, nd, ux), |p, w: &mut SsW<E>| {
         w.gather_rd(p, &dparts, &rest, click_out);
-        let mut uds = Vec::new();
-        process_runs(&w.evs_s, &mut w.tmp_s, &w.runs, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut uds, &mut w.cm, ws);
-        w.out.push(uds);
+        w.uds.clear();
+        process_runs(&w.evs_s, &mut w.tmp_s, &w.runs, &mut w.cnt, &mut w.cl, &mut w.ctmp, &mut w.win, ncamp as u32, &mut w.uds, &mut w.cm, ws);
+        w.enc.push(&w.uds, ux);
     })
-    .into_iter()
-    .map(|w| (w.out, w.cm))
+    .into_par_iter()
+    .map(|mut w| {
+        w.enc.close(ux);
+        (w.enc, w.cm)
+    })
     .collect()
 }
 
@@ -6280,42 +6427,32 @@ fn main() {
     // person buckets
     let d0 = ws.div_euclid(DAY);
     let nd = if we > ws { ((we - 1).div_euclid(DAY) - d0 + 1) as usize } else { 0 };
+    let ux = UdCtx::new(&names_map, &cat_names);
     let results = match ev_out {
-        Evs::L(v) => ev_after(v, &tab, &mf, &click_out, ws, we, ncamp, d0, nd, &tick),
-        Evs::W(v) => ev_after(v, &tab, &mf, &click_out, ws, we, ncamp, d0, nd, &tick),
+        Evs::L(v) => ev_after(v, &tab, &mf, &click_out, ws, we, ncamp, d0, nd, &tick, &ux),
+        Evs::W(v) => ev_after(v, &tab, &mf, &click_out, ws, we, ncamp, d0, nd, &tick, &ux),
     };
     tick("sessionized");
 
     // outputs
-    let names = Names { map: names_map };
     let ud_dir = outd.join("user_daily");
     let cd_dir = outd.join("campaign_daily");
     std::fs::create_dir_all(&ud_dir).unwrap();
     std::fs::create_dir_all(&cd_dir).unwrap();
     let mut cm = CampAcc::new(ncamp + 1, d0, nd);
-    let mut ud_groups: Vec<&Vec<UD>> = vec![];
-    for (u, m) in &results {
-        ud_groups.extend(u.iter());
-        cm.merge(m);
+    let mut encs: Vec<UdEnc> = Vec::with_capacity(results.len());
+    for (e, m) in results {
+        cm.merge(&m);
+        encs.push(e);
     }
     let rows = cm.rows();
-    let nf = 16usize;
-    let mut files: Vec<Vec<&Vec<UD>>> = (0..nf).map(|_| vec![]).collect();
-    let mut load = vec![0usize; nf];
-    ud_groups.sort_by_key(|g| std::cmp::Reverse(g.len()));
-    for g in ud_groups {
-        let k = (0..nf).min_by_key(|&k| load[k]).unwrap();
-        load[k] += g.len();
-        files[k].push(g);
-    }
-    let any_rows = files.iter().any(|g| g.iter().any(|x| !x.is_empty()));
+    let any_rows = encs.iter().any(|e| !e.rgs.is_empty());
     // one revenue width for every file of the table, so all part files share a schema
-    let rev32 = std::env::var_os("SHOP_REV64").is_none()
-        && files.par_iter().all(|g| g.iter().all(|x| x.iter().all(|r| r.rev <= i32::MAX as u64)));
+    let rev32 = std::env::var_os("SHOP_REV64").is_none() && encs.iter().all(|e| e.rgs.iter().all(|r| r.side.is_empty()));
     rayon::join(
         || {
-            files.par_iter().enumerate().filter(|(i, g)| g.iter().any(|x| !x.is_empty()) || (*i == 0 && !any_rows)).for_each(|(i, g)| {
-                write_user_daily(&ud_dir.join(format!("part-{i}.parquet")), g, &cat_names, &names, rev32);
+            encs.par_iter_mut().enumerate().filter(|(i, e)| !e.rgs.is_empty() || (*i == 0 && !any_rows)).for_each(|(i, e)| {
+                write_ud_file(&ud_dir.join(format!("part-{i}.parquet")), e, rev32);
             })
         },
         || write_campaign_daily(&cd_dir.join("part-0.parquet"), &rows, &camp_names, &channels),
