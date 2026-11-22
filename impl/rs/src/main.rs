@@ -2821,14 +2821,16 @@ use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 
 /// Output page codec. Fewer output bytes means less writeback when the container exits, and the
-/// output is small next to the input, so a fast codec costs little. SHOP_CODEC=none|lz4|zstd[:level].
+/// output is small next to the input, so a fast codec costs little.
+/// SHOP_CODEC=none|lz4|zstd[:level]; default none (plain pages measured faster on the new data).
 fn codec() -> Compression {
     let v = std::env::var("SHOP_CODEC").unwrap_or_default();
     let (name, lvl) = v.split_once(':').unwrap_or((v.as_str(), "1"));
     match name {
         "none" => Compression::UNCOMPRESSED,
         "lz4" => Compression::LZ4_RAW,
-        _ => Compression::ZSTD(parquet::basic::ZstdLevel::try_new(lvl.parse().unwrap_or(1)).unwrap_or_default()),
+        "zstd" => Compression::ZSTD(parquet::basic::ZstdLevel::try_new(lvl.parse().unwrap_or(1)).unwrap_or_default()),
+        _ => Compression::UNCOMPRESSED,
     }
 }
 
@@ -2999,10 +3001,10 @@ struct Pqf {
 }
 impl Pqf {
     fn new(cap: usize) -> Self {
-        // zstd (level 1) on the chunks that shrink a lot for little work; SHOP_CODEC=none|zstd[:level]
+        // plain pages by default; SHOP_CODEC=zstd[:level] compresses the chunks picked by SHOP_ZCOLS
         let v = std::env::var("SHOP_CODEC").unwrap_or_default();
         let (name, lvl) = v.split_once(':').unwrap_or((v.as_str(), "1"));
-        let z = if name == "none" { None } else { Some(zstd::bulk::Compressor::new(lvl.parse().unwrap_or(1)).unwrap()) };
+        let z = if name != "zstd" { None } else { Some(zstd::bulk::Compressor::new(lvl.parse().unwrap_or(1)).unwrap()) };
         let codec = if z.is_some() { 6 } else { 0 };
         let mut out = Vec::with_capacity(cap);
         out.extend_from_slice(b"PAR1");
