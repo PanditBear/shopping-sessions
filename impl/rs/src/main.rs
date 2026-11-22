@@ -4136,14 +4136,15 @@ fn parse_events_sol<E: Ev, const DZ: bool>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: 
             let pb = unsafe { p.add(e2 as usize + 1) };
             let (cb, qb, nb) = masks64(pb);
             let l = nb.trailing_zeros();
-            let e3 = cb.trailing_zeros();
-            let d1 = blsr(cb);
+            let commas = bzhi(cb, l);
+            let e3 = commas.trailing_zeros();
+            let d1 = blsr(commas);
             let e4 = d1.trailing_zeros();
             let d2 = blsr(d1);
             let e5 = d2.trailing_zeros();
             let d3 = blsr(d2);
             let (xb, bad_b) = quote_bad(bzhi(qb, l), cb | nb);
-            if !((nb != 0) & (e5 < l) & (bzhi(d3, l) == 0) & ((bad_a | bad_b) == 0)) {
+            if !((nb != 0) & (e5 < l) & (d3 == 0) & ((bad_a | bad_b) == 0)) {
                 break 'slow;
             }
             pos += (e2 + l + 2) as usize;
