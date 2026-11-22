@@ -1328,7 +1328,9 @@ struct DRec {
     eid: u64,
     ing: u32,
     loc: u32,
+    pay: [u64; 2],
 }
+const _: () = assert!(std::mem::size_of::<DRec>() == 32);
 
 /// Dense dedup record: the generator index of the event_id, the ingest key and the line's record.
 #[derive(Clone, Copy)]
@@ -3466,7 +3468,7 @@ fn parse_events<E: Ev>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: &mut Vec<DRec>, fb: 
                 side.push((loc, ingest));
             }
             match pack6(eid) {
-                Some(k) => d.push(DRec { eid: k, ing: ik, loc }),
+                Some(k) => d.push(DRec { eid: k, ing: ik, loc, pay: [k ^ loc as u64, k] }),
                 None => fb_put(cx.rs, d, fb, eid, ingest, ik, loc),
             }
         }
@@ -3523,7 +3525,7 @@ fn ev_line<E: Ev>(f: &[B; 7], cx: &EvCtx, c0: usize, tci: &mut TsCache, tct: &mu
         side.push((loc, ingest));
     }
     match k6 {
-        Some(k) => d.push(DRec { eid: k, ing: ik, loc }),
+        Some(k) => d.push(DRec { eid: k, ing: ik, loc, pay: [k ^ loc as u64, k] }),
         None => fb_put(cx.rs, d, fb, eid, ingest, ik, loc),
     }
 }
@@ -3547,7 +3549,7 @@ fn fb_put(rs: &RandomState, d: &mut Vec<DRec>, fb: &mut Fb, eid: B, ingest: i64,
 /// An event_id that is neither Short nor (storable) Hex: hash bucket record plus its bytes in `fb.v`.
 #[inline(never)]
 fn fb_put_other(rs: &RandomState, d: &mut Vec<DRec>, fb: &mut Fb, eid: B, ingest: i64, ik: u32, loc: u32) {
-    d.push(DRec { eid: rs.hash_one(eid) | HBIT, ing: ik, loc });
+    d.push({ let h = rs.hash_one(eid) | HBIT; DRec { eid: h, ing: ik, loc, pay: [h ^ loc as u64, h] } });
     fb.v.push((pack(eid), ingest, loc));
 }
 
@@ -4261,7 +4263,7 @@ fn parse_events_sol<E: Ev, const DZ: bool>(c: B, cx: &EvCtx, m: &mut Vec<E>, d: 
                 unsafe { idk_hex(pe, ne) }
             };
             if cls == 0 {
-                d.push(DRec { eid: ke, ing: ik, loc });
+                d.push(DRec { eid: ke, ing: ik, loc, pay: [ke ^ loc as u64, ke] });
             } else if cls == 1 && loc <= DX_LOC {
                 fb.x.push(DX::new(full, (ke >> 56) as u8 & 63, ik, loc));
             } else {
