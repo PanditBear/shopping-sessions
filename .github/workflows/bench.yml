@@ -37,6 +37,12 @@ on:
       seed:
         description: "generator seed"
         default: "7"
+      measure:
+        description: "size list events:clicks:runs; if set, only the cpu and memory measurement of refs runs (ours first, then ext= specs)"
+        default: ""
+      needavx:
+        description: "1 = the measurement stops early on a runner without AVX-512"
+        default: "1"
       content:
         description: "1 = compare output rows of every ref with the first ref (order ignored)"
         default: "0"
@@ -44,7 +50,7 @@ permissions:
   contents: read
 jobs:
   bench:
-    if: ${{ github.event.inputs.perfsha == '' && github.event.inputs.pqrefs == '' }}
+    if: ${{ github.event.inputs.perfsha == '' && github.event.inputs.pqrefs == '' && github.event.inputs.measure == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -150,6 +156,29 @@ jobs:
             done < $W/syms.txt
             sudo find $o $s2 -mindepth 1 -delete; sudo rm -f $R; sudo find $D -mindepth 1 -delete
           done
+  measure:
+    if: ${{ github.event.inputs.measure != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: bench
+      - name: toolchain
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends musl-tools bc
+          rustup target add x86_64-unknown-linux-musl
+      - name: measure
+        env:
+          SPECS: ${{ github.event.inputs.refs }}
+          SIZES: ${{ github.event.inputs.measure }}
+          SEED: ${{ github.event.inputs.seed || '11' }}
+          NEEDAVX: ${{ github.event.inputs.needavx || '1' }}
+        run: bash measure.sh
   pq:
     if: ${{ github.event.inputs.pqrefs != '' }}
     runs-on: ubuntu-latest
